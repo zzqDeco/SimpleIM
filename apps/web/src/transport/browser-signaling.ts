@@ -1,4 +1,7 @@
 import {
+  ContractValidationError,
+  MAX_SIGNAL_FRAME_BYTES,
+  parseClientSignalingFrame,
   parseServerSignalingFrame,
   type ClientSignalingFrame,
   type ServerSignalingFrame,
@@ -8,6 +11,7 @@ import type { SignalingClientPort } from "@simpleim/peer-core";
 export interface BrowserSignalingClientOptions {
   peerId: string;
   wsUrl?: string;
+  maxSignalPayloadBytes?: number;
   initialBackoffMs?: number;
   maxBackoffMs?: number;
   webSocketFactory?: (url: string) => WebSocket;
@@ -29,6 +33,7 @@ export function buildSignalingWebSocketUrl(
 
 export class BrowserSignalingClient implements SignalingClientPort {
   private readonly wsUrl: string;
+  private readonly maxSignalPayloadBytes?: number;
   private readonly initialBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly createWebSocket: (url: string) => WebSocket;
@@ -45,6 +50,7 @@ export class BrowserSignalingClient implements SignalingClientPort {
 
   constructor(options: BrowserSignalingClientOptions) {
     this.wsUrl = buildSignalingWebSocketUrl(options.peerId, options.wsUrl);
+    this.maxSignalPayloadBytes = options.maxSignalPayloadBytes;
     this.initialBackoffMs = options.initialBackoffMs ?? 400;
     this.maxBackoffMs = options.maxBackoffMs ?? 8_000;
     this.createWebSocket =
@@ -77,7 +83,21 @@ export class BrowserSignalingClient implements SignalingClientPort {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return;
     }
-    this.ws.send(JSON.stringify(frame));
+    const validated = parseClientSignalingFrame(
+      frame,
+      this.maxSignalPayloadBytes !== undefined
+        ? { maxFrameBytes: this.maxSignalPayloadBytes }
+        : undefined,
+    );
+    const serialized = JSON.stringify(validated);
+    const maxBytes = this.maxSignalPayloadBytes ?? MAX_SIGNAL_FRAME_BYTES;
+    if (new TextEncoder().encode(serialized).byteLength > maxBytes) {
+      throw new ContractValidationError(
+        `Signaling frame exceeds ${maxBytes}-byte limit`,
+        "payload_too_large",
+      );
+    }
+    this.ws.send(serialized);
   }
 
   disconnect(): void {
@@ -174,7 +194,12 @@ export class BrowserSignalingClient implements SignalingClientPort {
       if (rawText === null) return;
 
       try {
-        const frame = parseServerSignalingFrame(rawText);
+        const frame = parseServerSignalingFrame(
+          rawText,
+          this.maxSignalPayloadBytes !== undefined
+            ? { maxFrameBytes: this.maxSignalPayloadBytes }
+            : undefined,
+        );
         for (const handler of this.frameHandlers) {
           handler(frame);
         }

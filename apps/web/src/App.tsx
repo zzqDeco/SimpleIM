@@ -38,6 +38,62 @@ interface ActiveRoomRuntime {
   roomIdPrefix: string;
 }
 
+export class RoomRuntimeSlot<T> {
+  current: T | null = null;
+  generation = 0;
+
+  beginAttempt(): number {
+    this.generation += 1;
+    return this.generation;
+  }
+
+  isCurrentAttempt(gen: number): boolean {
+    return this.generation === gen;
+  }
+
+  installIfCurrent(gen: number, runtime: T): boolean {
+    if (this.generation !== gen) {
+      return false;
+    }
+    this.current = runtime;
+    return true;
+  }
+
+  clearIfOwned(runtime: T | null): boolean {
+    if (runtime !== null && this.current === runtime) {
+      this.current = null;
+      return true;
+    }
+    return false;
+  }
+
+  takeActiveForTeardown(): T | null {
+    this.generation += 1;
+    const active = this.current;
+    this.current = null;
+    return active;
+  }
+}
+
+async function cleanupRuntimeInstance(rt: ActiveRoomRuntime): Promise<void> {
+  try {
+    await rt.engine.stop();
+  } catch {
+    // Ignore shutdown errors
+  }
+  try {
+    wipeRoomKeys(rt.roomKeys);
+    rt.localSignKeyPair.privateKeyBytes.fill(0);
+  } catch {
+    // Ignore wipe errors
+  }
+  try {
+    await rt.chunkStorage.closeAll();
+  } catch {
+    // Ignore OPFS cleanup errors
+  }
+}
+
 function mergeOrderedMessages(
   existing: ChatMessageEnvelope[],
   incoming: ChatMessageEnvelope[],
@@ -78,8 +134,11 @@ export function App(): ReactElement {
   }
   const authClient = authClientRef.current;
 
-  const runtimeRef = useRef<ActiveRoomRuntime | null>(null);
-  const joinGenRef = useRef(0);
+  const runtimeSlotRef = useRef<RoomRuntimeSlot<ActiveRoomRuntime> | null>(null);
+  if (!runtimeSlotRef.current) {
+    runtimeSlotRef.current = new RoomRuntimeSlot<ActiveRoomRuntime>();
+  }
+  const runtimeSlot = runtimeSlotRef.current;
 
   const [bootstrapping, setBootstrapping] = useState(true);
   const [user, setUser] = useState<UserProfile | null>(null);
@@ -101,9 +160,7 @@ export function App(): ReactElement {
   const [securityNotice, setSecurityNotice] = useState<string | null>(null);
 
   const teardownActiveRoom = useCallback(async (): Promise<void> => {
-    joinGenRef.current += 1;
-    const rt = runtimeRef.current;
-    runtimeRef.current = null;
+    const rt = runtimeSlot.takeActiveForTeardown();
 
     setInRoom(false);
     setJoinPhase("idle");
@@ -117,24 +174,8 @@ export function App(): ReactElement {
     setSecurityNotice(null);
 
     if (!rt) return;
-
-    try {
-      await rt.engine.stop();
-    } catch {
-      // Ignore shutdown errors
-    }
-    try {
-      wipeRoomKeys(rt.roomKeys);
-      rt.localSignKeyPair.privateKeyBytes.fill(0);
-    } catch {
-      // Ignore wipe errors
-    }
-    try {
-      await rt.chunkStorage.closeAll();
-    } catch {
-      // Ignore OPFS cleanup errors
-    }
-  }, []);
+    await cleanupRuntimeInstance(rt);
+  }, [runtimeSlot]);
 
   useEffect(() => {
     let cancelled = false;
@@ -218,7 +259,7 @@ export function App(): ReactElement {
     if (!user) return;
     await teardownActiveRoom();
 
-    const myGen = ++joinGenRef.current;
+    const myGen = runtimeSlot.beginAttempt();
     setJoinError(null);
     setJoinPhase("deriving");
 
@@ -226,10 +267,11 @@ export function App(): ReactElement {
     let signKeyPair: Ed25519KeyPair | null = null;
     let chunkStorage: OpfsChunkStorageAdapter | null = null;
     let engine: RoomPeerEngine | null = null;
+    let createdRuntime: ActiveRoomRuntime | null = null;
 
     try {
       derivedKeys = await deriveRoomKeysOffThread(passphrase);
-      if (joinGenRef.current !== myGen) {
+      if (!runtimeSlot.isCurrentAttempt(myGen)) {
         wipeRoomKeys(derivedKeys);
         return;
       }
@@ -247,13 +289,16 @@ export function App(): ReactElement {
         }),
       ]);
 
-      if (joinGenRef.current !== myGen) {
+      if (!runtimeSlot.isCurrentAttempt(myGen)) {
         wipeRoomKeys(derivedKeys);
         signKeyPair.privateKeyBytes.fill(0);
         return;
       }
 
-      const signaling = new BrowserSignalingClient({ peerId });
+      const signaling = new BrowserSignalingClient({
+        peerId,
+        maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
+      });
       const transportFactory = new BrowserWebRtcTransportFactory();
       chunkStorage = new OpfsChunkStorageAdapter();
 
@@ -264,26 +309,27 @@ export function App(): ReactElement {
         serverSignPubKey: meta.serverSignPubKey,
         roomKeys: derivedKeys,
         iceServers: meta.iceServers,
+        maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
         signaling,
         transportFactory,
         chunkStorage,
         events: {
           onCenterConnectionChange: (connected) => {
-            if (joinGenRef.current !== myGen) return;
+            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
             setCenterConnected(connected);
           },
           onPeersChange: (nextPeers) => {
-            if (joinGenRef.current !== myGen) return;
+            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
             setPeers([...nextPeers]);
           },
           onPeerAuthRejected: (_remotePeerId, reason) => {
-            if (joinGenRef.current !== myGen) return;
+            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
             setSecurityNotice(
               `Quarantined peer failed HELLO_AUTH verification (${reason}) and was disconnected.`,
             );
           },
           onChatMessage: (msg) => {
-            if (joinGenRef.current !== myGen) return;
+            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
             setMessages((prev) =>
               mergeOrderedMessages(prev, [
                 ...activeEngine.getMessages(),
@@ -292,7 +338,7 @@ export function App(): ReactElement {
             );
           },
           onFileAnnounced: (manifest) => {
-            if (joinGenRef.current !== myGen) return;
+            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
             setFiles((prev) =>
               mergeOrderedFiles(prev, [...activeEngine.getFiles(), manifest]),
             );
@@ -306,7 +352,7 @@ export function App(): ReactElement {
             }
           },
           onTransferProgress: (progress) => {
-            if (joinGenRef.current !== myGen) return;
+            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
             setTransfers((prev) => {
               const next = new Map(prev);
               next.set(progress.fileId, { ...progress });
@@ -314,7 +360,7 @@ export function App(): ReactElement {
             });
           },
           onTransferCompleted: (manifest) => {
-            if (joinGenRef.current !== myGen) return;
+            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
             const prog = activeEngine.getTransferProgress(manifest.fileId);
             setTransfers((prev) => {
               const next = new Map(prev);
@@ -339,14 +385,14 @@ export function App(): ReactElement {
             });
           },
           onError: (err) => {
-            if (joinGenRef.current !== myGen) return;
+            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
             setSecurityNotice(err.message);
           },
         },
       });
       engine = activeEngine;
 
-      runtimeRef.current = {
+      createdRuntime = {
         engine: activeEngine,
         roomKeys: derivedKeys,
         localSignKeyPair: signKeyPair,
@@ -354,11 +400,19 @@ export function App(): ReactElement {
         localPeerId: peerId,
         roomIdPrefix: derivedKeys.roomIdPrefix,
       };
+      if (!runtimeSlot.installIfCurrent(myGen, createdRuntime)) {
+        await cleanupRuntimeInstance(createdRuntime);
+        return;
+      }
 
       await activeEngine.start();
 
-      if (joinGenRef.current !== myGen) {
-        await teardownActiveRoom();
+      if (
+        !runtimeSlot.isCurrentAttempt(myGen) ||
+        runtimeSlot.current !== createdRuntime
+      ) {
+        runtimeSlot.clearIfOwned(createdRuntime);
+        await cleanupRuntimeInstance(createdRuntime);
         return;
       }
 
@@ -371,7 +425,7 @@ export function App(): ReactElement {
       setJoinPhase("idle");
       setInRoom(true);
     } catch (err) {
-      runtimeRef.current = null;
+      runtimeSlot.clearIfOwned(createdRuntime);
       if (engine) {
         try {
           await engine.stop();
@@ -393,7 +447,7 @@ export function App(): ReactElement {
         }
       }
 
-      if (joinGenRef.current === myGen) {
+      if (runtimeSlot.isCurrentAttempt(myGen)) {
         setJoinPhase("idle");
         if (
           err instanceof HttpApiError &&
@@ -414,7 +468,7 @@ export function App(): ReactElement {
     body: string,
     replyToMsgId: string | null,
   ): Promise<void> => {
-    const rt = runtimeRef.current;
+    const rt = runtimeSlot.current;
     if (!rt) {
       throw new Error("Room session is not active");
     }
@@ -425,7 +479,7 @@ export function App(): ReactElement {
   };
 
   const handleShareFiles = async (selectedFiles: File[]): Promise<void> => {
-    const rt = runtimeRef.current;
+    const rt = runtimeSlot.current;
     if (!rt) {
       throw new Error("Room session is not active");
     }
@@ -466,7 +520,7 @@ export function App(): ReactElement {
   };
 
   const handleDownloadFile = async (fileId: string): Promise<void> => {
-    const rt = runtimeRef.current;
+    const rt = runtimeSlot.current;
     if (!rt) return;
     await rt.engine.downloadFile(fileId);
     const prog = rt.engine.getTransferProgress(fileId);
@@ -480,7 +534,7 @@ export function App(): ReactElement {
   };
 
   const handleCancelDownload = async (fileId: string): Promise<void> => {
-    const rt = runtimeRef.current;
+    const rt = runtimeSlot.current;
     if (!rt) return;
     await rt.engine.cancelDownload(fileId);
     const prog = rt.engine.getTransferProgress(fileId);
@@ -494,7 +548,7 @@ export function App(): ReactElement {
   };
 
   const handleSaveFile = async (manifest: FileManifest): Promise<void> => {
-    const rt = runtimeRef.current;
+    const rt = runtimeSlot.current;
     if (!rt) return;
     await rt.chunkStorage.triggerBrowserDownload(
       manifest.fileId,
@@ -504,7 +558,7 @@ export function App(): ReactElement {
   };
 
   const canSaveFile = (fileId: string): boolean => {
-    const rt = runtimeRef.current;
+    const rt = runtimeSlot.current;
     return rt ? rt.chunkStorage.isSaveAvailable(fileId) : false;
   };
 
