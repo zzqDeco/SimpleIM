@@ -136,6 +136,13 @@ class BrowserDataChannelAdapter implements DataChannelPort {
 
   onOpen(handler: () => void): void {
     this.openHandlers.add(handler);
+    if (this.dc.readyState === "open") {
+      queueMicrotask(() => {
+        if (this.dc.readyState === "open" && this.openHandlers.has(handler)) {
+          handler();
+        }
+      });
+    }
   }
 
   onClose(handler: () => void): void {
@@ -199,8 +206,12 @@ class BrowserPeerConnectionAdapter implements PeerConnectionPort {
   private localFingerprint: string | null = null;
   private remoteFingerprint: string | null = null;
   private remoteDescriptionReady = false;
+  private deferLocalIce = false;
   private emittedIceEnd = false;
   private closed = false;
+  private readonly bufferedLocalIce: Array<
+    Extract<SignalingInnerPayload, { kind: "ice-candidate" }> | "end"
+  > = [];
   private readonly pendingRemoteCandidates: RTCIceCandidateInit[] = [];
 
   private readonly iceCandidateHandlers = new Set<
@@ -253,9 +264,7 @@ class BrowserPeerConnectionAdapter implements PeerConnectionPort {
       if (!cand || cand.candidate.trim().length === 0) {
         if (!this.emittedIceEnd) {
           this.emittedIceEnd = true;
-          for (const h of this.iceEndHandlers) {
-            h();
-          }
+          this.emitOrBufferLocalIce("end");
         }
         return;
       }
@@ -266,9 +275,7 @@ class BrowserPeerConnectionAdapter implements PeerConnectionPort {
         sdpMid: cand.sdpMid,
         sdpMLineIndex: cand.sdpMLineIndex,
       };
-      for (const h of this.iceCandidateHandlers) {
-        h(payload);
-      }
+      this.emitOrBufferLocalIce(payload);
     });
 
     const syncState = (): void => {
@@ -292,14 +299,20 @@ class BrowserPeerConnectionAdapter implements PeerConnectionPort {
 
   async createOffer(): Promise<string> {
     this.emittedIceEnd = false;
-    const offer = await this.pc.createOffer();
-    await this.pc.setLocalDescription(offer);
-    const sdp = this.pc.localDescription?.sdp ?? offer.sdp ?? "";
-    if (!sdp) {
-      throw new Error("RTCPeerConnection created an empty SDP offer");
+    this.deferLocalIce = true;
+    try {
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+      const sdp = this.pc.localDescription?.sdp ?? offer.sdp ?? "";
+      if (!sdp) {
+        throw new Error("RTCPeerConnection created an empty SDP offer");
+      }
+      this.localFingerprint = extractSdpSha256Fingerprint(sdp);
+      return sdp;
+    } finally {
+      this.deferLocalIce = false;
+      queueMicrotask(() => this.flushBufferedLocalIce());
     }
-    this.localFingerprint = extractSdpSha256Fingerprint(sdp);
-    return sdp;
   }
 
   async acceptOfferAndCreateAnswer(offerSdp: string): Promise<string> {
@@ -312,14 +325,20 @@ class BrowserPeerConnectionAdapter implements PeerConnectionPort {
     this.remoteDescriptionReady = true;
     await this.flushPendingIceCandidates();
 
-    const answer = await this.pc.createAnswer();
-    await this.pc.setLocalDescription(answer);
-    const answerSdp = this.pc.localDescription?.sdp ?? answer.sdp ?? "";
-    if (!answerSdp) {
-      throw new Error("RTCPeerConnection created an empty SDP answer");
+    this.deferLocalIce = true;
+    try {
+      const answer = await this.pc.createAnswer();
+      await this.pc.setLocalDescription(answer);
+      const answerSdp = this.pc.localDescription?.sdp ?? answer.sdp ?? "";
+      if (!answerSdp) {
+        throw new Error("RTCPeerConnection created an empty SDP answer");
+      }
+      this.localFingerprint = extractSdpSha256Fingerprint(answerSdp);
+      return answerSdp;
+    } finally {
+      this.deferLocalIce = false;
+      queueMicrotask(() => this.flushBufferedLocalIce());
     }
-    this.localFingerprint = extractSdpSha256Fingerprint(answerSdp);
-    return answerSdp;
   }
 
   async acceptAnswer(answerSdp: string): Promise<void> {
@@ -411,10 +430,16 @@ class BrowserPeerConnectionAdapter implements PeerConnectionPort {
     ) => void,
   ): void {
     this.iceCandidateHandlers.add(handler);
+    if (!this.deferLocalIce && this.bufferedLocalIce.length > 0) {
+      queueMicrotask(() => this.flushBufferedLocalIce());
+    }
   }
 
   onLocalIceEnd(handler: () => void): void {
     this.iceEndHandlers.add(handler);
+    if (!this.deferLocalIce && this.bufferedLocalIce.length > 0) {
+      queueMicrotask(() => this.flushBufferedLocalIce());
+    }
   }
 
   onStateChange(handler: (state: PeerTransportState) => void): void {
@@ -425,6 +450,7 @@ class BrowserPeerConnectionAdapter implements PeerConnectionPort {
     if (this.closed) return;
     this.closed = true;
     this.pendingRemoteCandidates.length = 0;
+    this.bufferedLocalIce.length = 0;
     this.controlChannel.close();
     this.swarmChannel.close();
     try {
@@ -436,6 +462,52 @@ class BrowserPeerConnectionAdapter implements PeerConnectionPort {
       this.currentState = "closed";
       for (const h of this.stateHandlers) {
         h("closed");
+      }
+    }
+  }
+
+  private emitOrBufferLocalIce(
+    item: Extract<SignalingInnerPayload, { kind: "ice-candidate" }> | "end",
+  ): void {
+    const hasHandlers =
+      item === "end"
+        ? this.iceEndHandlers.size > 0
+        : this.iceCandidateHandlers.size > 0;
+    if (this.deferLocalIce || !hasHandlers) {
+      this.bufferedLocalIce.push(item);
+      return;
+    }
+    if (item === "end") {
+      for (const h of this.iceEndHandlers) {
+        h();
+      }
+    } else {
+      for (const h of this.iceCandidateHandlers) {
+        h(item);
+      }
+    }
+  }
+
+  private flushBufferedLocalIce(): void {
+    if (this.closed || this.deferLocalIce) return;
+    while (this.bufferedLocalIce.length > 0) {
+      const next = this.bufferedLocalIce[0];
+      if (!next) {
+        this.bufferedLocalIce.shift();
+        continue;
+      }
+      if (next === "end") {
+        if (this.iceEndHandlers.size === 0) break;
+        this.bufferedLocalIce.shift();
+        for (const h of this.iceEndHandlers) {
+          h();
+        }
+      } else {
+        if (this.iceCandidateHandlers.size === 0) break;
+        this.bufferedLocalIce.shift();
+        for (const h of this.iceCandidateHandlers) {
+          h(next);
+        }
       }
     }
   }
