@@ -66,12 +66,19 @@ EOF
   chmod 0600 "$ENV_FILE"
 
   EXT_IP_LINE="external-ip=${PUBLIC_HOST_IP}"
+  BIND_IP_LINES="listening-ip=${PUBLIC_HOST_IP}
+listening-ip=127.0.0.1
+relay-ip=${PUBLIC_HOST_IP}"
   if [[ -n "$PRIVATE_IP" && "$PRIVATE_IP" != "$PUBLIC_HOST_IP" ]]; then
     EXT_IP_LINE="external-ip=${PUBLIC_HOST_IP}/${PRIVATE_IP}"
+    BIND_IP_LINES="listening-ip=${PRIVATE_IP}
+listening-ip=127.0.0.1
+relay-ip=${PRIVATE_IP}"
   fi
 
   cat > "$TURN_CONF" <<EOF
 listening-port=3478
+${BIND_IP_LINES}
 fingerprint
 use-auth-secret
 static-auth-secret=${TURN_SECRET}

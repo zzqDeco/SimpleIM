@@ -8,7 +8,11 @@ use-auth-secret
 static-auth-secret=REPLACE_WITH_COTURN_SHARED_SECRET
 realm=simpleim.local
 
-# On cloud VPC 1:1 NAT (e.g. Aliyun ECS), map public IP to private NIC IP:
+# On cloud VPC 1:1 NAT (e.g. Aliyun ECS), pin host NIC + loopback so host-network
+# Coturn never binds neighboring Docker bridge gateways:
+# listening-ip=172.17.0.10
+# listening-ip=127.0.0.1
+# relay-ip=172.17.0.10
 # external-ip=203.0.113.10/172.17.0.10
 
 min-port=49152
