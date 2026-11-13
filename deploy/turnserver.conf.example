@@ -1,0 +1,22 @@
+# Example Coturn configuration for SimpleIM symmetric-NAT WebRTC relay
+# Copy to deploy/turnserver.conf and match static-auth-secret with COTURN_SHARED_SECRET.
+
+listening-port=3478
+tls-listening-port=5349
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_COTURN_SHARED_SECRET
+realm=im.example.com
+
+# Set to your server's public IPv4 address:
+# external-ip=203.0.113.10
+
+min-port=49152
+max-port=65535
+no-multicast-peers
+no-cli
+no-loopback-peers
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255

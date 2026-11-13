@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM"],
+    "types": ["bun"],
+    "paths": {
+      "@simpleim/contracts": ["./packages/contracts/src/index.ts"],
+      "@simpleim/crypto": ["./packages/crypto/src/index.ts"],
+      "@simpleim/peer-core": ["./packages/peer-core/src/index.ts"]
+    }
+  },
+  "include": [
+    "playwright.config.ts",
+    "tests/**/*.ts",
+    "e2e/**/*.ts"
+  ]
+}

@@ -81,6 +81,15 @@ function mapContractIceServers(configs: readonly IceServerConfig[]): MappedIceCo
   return { iceServers, hasStunServer, forceTurnTCP };
 }
 
+const WERIFT_SDP_MAX_MESSAGE_SIZE = 262_144; // 256 KiB so browsers allow 65,582 B Swarm chunk frames
+
+function upgradeSdpMaxMessageSize(sdp: string): string {
+  return sdp.replace(
+    /^a=max-message-size:\d+(\r?)$/gm,
+    `a=max-message-size:${WERIFT_SDP_MAX_MESSAGE_SIZE}$1`,
+  );
+}
+
 function mapDcState(state: string): ChannelReadyState {
   switch (state) {
     case "open":
@@ -370,6 +379,12 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
 
   get state(): PeerTransportState {
     if (this.closed) return "closed";
+    if (
+      this.controlChannel.readyState === "closed" &&
+      this.swarmChannel.readyState === "closed"
+    ) {
+      return "closed";
+    }
     return mapPcState(this.pc.connectionState);
   }
 
@@ -408,7 +423,8 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     try {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
-      const sdp = this.pc.localDescription?.sdp ?? offer.sdp;
+      const rawSdp = this.pc.localDescription?.sdp ?? offer.sdp;
+      const sdp = upgradeSdpMaxMessageSize(rawSdp);
       this.localFingerprintCache = extractSdpSha256Fingerprint(sdp);
       return sdp;
     } finally {
@@ -432,7 +448,8 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     try {
       const answer = await this.pc.createAnswer();
       await this.pc.setLocalDescription(answer);
-      const sdp = this.pc.localDescription?.sdp ?? answer.sdp;
+      const rawSdp = this.pc.localDescription?.sdp ?? answer.sdp;
+      const sdp = upgradeSdpMaxMessageSize(rawSdp);
       this.localFingerprintCache = extractSdpSha256Fingerprint(sdp);
       return sdp;
     } finally {
@@ -583,7 +600,30 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
       for (const h of this.stateChangeHandlers) h("closed");
     }
 
-    void this.pc.close().catch(() => {});
+    // Stop SCTP before pc.close() without racing DCEP RECONFIG, and yield I/O
+    // event-loop turns so Bun/Linux node:dgram flushes SCTP ABORT UDP packets
+    // before pc.close() tears down the underlying UDP socket.
+    void (async () => {
+      try {
+        if (this.pc.sctpTransport) {
+          const rawSctp = this.pc.sctpTransport.sctp as
+            | { abort?: () => Promise<void> }
+            | undefined;
+          if (rawSctp && typeof rawSctp.abort === "function") {
+            await rawSctp.abort().catch(() => {});
+            await new Promise<void>((resolve) => setTimeout(resolve, 20));
+          }
+          await this.pc.sctpTransport.stop();
+          await new Promise<void>((resolve) => setTimeout(resolve, 30));
+        } else {
+          this.controlChannel.close();
+          this.swarmChannel.close();
+        }
+      } catch {
+        // Ignore SCTP stop errors
+      }
+      await this.pc.close().catch(() => {});
+    })();
   }
 
   private emitOrBufferLocalIce(item: LocalIceCandidatePayload | "end"): void {

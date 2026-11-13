@@ -1,0 +1,149 @@
+name: simpleim
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  caddy:
+    image: caddy:2.9-alpine
+    restart: unless-stopped
+    read_only: true
+    mem_limit: 96m
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?HTTPS domain or site address is required}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    networks:
+      - edge
+      - private
+    logging: *logging
+    depends_on:
+      server:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/server.Dockerfile
+    image: ${SERVER_IMAGE:-simpleim-server:latest}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      SQLITE_PATH: /data/simpleim.sqlite
+      SERVER_KEY_ID: ${SERVER_KEY_ID:-srvk_2026_01}
+      SERVER_IDENTITY_PRIVATE_KEY: ${SERVER_IDENTITY_PRIVATE_KEY:?Ed25519 private signing key required}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Comma-separated HTTPS origins required}
+      COTURN_URLS: ${COTURN_URLS:-}
+      COTURN_SHARED_SECRET: ${COTURN_SHARED_SECRET:-}
+      SECURE_COOKIES: "true"
+      TRUST_PROXY: "true"
+    volumes:
+      - server_data:/data
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - private
+    logging: *logging
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "const r = await fetch('http://127.0.0.1:3000/healthz'); if (!r.ok) process.exit(1);",
+        ]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+    image: ${WEB_IMAGE:-simpleim-web:latest}
+    restart: unless-stopped
+    read_only: true
+    mem_limit: 64m
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    tmpfs:
+      - /var/cache/nginx:size=8m,mode=0755
+      - /var/run:size=1m,mode=0755
+      - /tmp:size=8m,mode=1777
+    networks:
+      - private
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    profiles:
+      - turn
+    restart: unless-stopped
+    network_mode: host
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    logging: *logging
+
+networks:
+  edge:
+    driver: bridge
+  private:
+    driver: bridge
+    internal: true
+
+volumes:
+  caddy_data:
+  caddy_config:
+  server_data:

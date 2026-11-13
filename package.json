@@ -8,9 +8,10 @@
     "apps/*"
   ],
   "scripts": {
-    "typecheck": "tsc -p packages/contracts/tsconfig.json --noEmit && tsc -p packages/crypto/tsconfig.json --noEmit && tsc -p packages/peer-core/tsconfig.json --noEmit && tsc -p apps/server/tsconfig.json --noEmit && tsc -p apps/cli/tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json --noEmit",
+    "typecheck": "tsc -p packages/contracts/tsconfig.json --noEmit && tsc -p packages/crypto/tsconfig.json --noEmit && tsc -p packages/peer-core/tsconfig.json --noEmit && tsc -p apps/server/tsconfig.json --noEmit && tsc -p apps/cli/tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json --noEmit && tsc -p tsconfig.e2e.json --noEmit",
     "test": "bun test packages/ apps/server/ apps/cli/ apps/web/ tests/",
     "test:arch": "bun test tests/arch.test.ts",
+    "test:e2e": "bun run build:web && playwright test",
     "build:web": "bun run --cwd apps/web build",
     "build:cli": "bun run --cwd apps/cli build:bin"
   },

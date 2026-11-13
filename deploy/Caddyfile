@@ -1,0 +1,45 @@
+{
+	admin off
+}
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	@backend path /api/* /ws/* /healthz
+	handle @backend {
+		reverse_proxy server:3000 {
+			health_uri /healthz
+			health_interval 5s
+			health_timeout 2s
+			transport http {
+				dial_timeout 2s
+				keepalive 30s
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy web:80 {
+			health_uri /healthz
+			health_interval 10s
+			health_timeout 2s
+			transport http {
+				dial_timeout 2s
+				keepalive 30s
+			}
+		}
+	}
+}
+
+# Internal container liveness endpoint (never published to host network)
+http://:8080 {
+	respond /healthz "ok" 200
+}
