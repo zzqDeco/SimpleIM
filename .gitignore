@@ -23,10 +23,13 @@ simpleim-*
 .env
 .env.*
 !.env.example
+deploy/turnserver.conf
 *.pem
 *.key
 
-# Editor & OS metadata
+# Python bytecode & editor / OS metadata
+__pycache__/
+*.py[cod]
 .DS_Store
 .idea/
 .vscode/

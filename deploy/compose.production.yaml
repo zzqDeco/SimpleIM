@@ -8,10 +8,11 @@ x-logging: &logging
 
 services:
   caddy:
-    image: caddy:2.9-alpine
+    image: ${CADDY_IMAGE:-caddy:2.11.7-alpine}
     restart: unless-stopped
     read_only: true
-    mem_limit: 96m
+    mem_limit: 64m
+    memswap_limit: 64m
     pids_limit: 64
     security_opt:
       - no-new-privileges:true
@@ -21,12 +22,15 @@ services:
       - NET_BIND_SERVICE
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:?HTTPS domain or site address is required}
+      TLS_SERVER_NAME: ${TLS_SERVER_NAME:?Public hostname or IP for default_sni is required}
+      GOMEMLIMIT: 48MiB
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
+      - "${PUBLIC_HTTPS_PORT:-8444}:${CADDY_HTTPS_PORT:-8444}"
+      - "${PUBLIC_HTTPS_PORT:-8444}:${CADDY_HTTPS_PORT:-8444}/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${TLS_CONFIG_FILE:-./tls/acme-domain.caddy}:/etc/caddy/issuer.caddy:ro
+      - ${TLS_CERT_DIR:-./tls}:/etc/caddy/tls:ro
       - caddy_data:/data
       - caddy_config:/config
     tmpfs:
@@ -44,7 +48,7 @@ services:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 15s
       timeout: 3s
-      retries: 5
+      retries: 6
       start_period: 15s
 
   server:
@@ -55,7 +59,8 @@ services:
     restart: unless-stopped
     init: true
     read_only: true
-    mem_limit: 256m
+    mem_limit: 192m
+    memswap_limit: 192m
     pids_limit: 128
     security_opt:
       - no-new-privileges:true
@@ -69,6 +74,7 @@ services:
       SERVER_KEY_ID: ${SERVER_KEY_ID:-srvk_2026_01}
       SERVER_IDENTITY_PRIVATE_KEY: ${SERVER_IDENTITY_PRIVATE_KEY:?Ed25519 private signing key required}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Comma-separated HTTPS origins required}
+      STUN_URLS: ${STUN_URLS:-}
       COTURN_URLS: ${COTURN_URLS:-}
       COTURN_SHARED_SECRET: ${COTURN_SHARED_SECRET:-}
       SECURE_COOKIES: "true"
@@ -90,7 +96,7 @@ services:
         ]
       interval: 15s
       timeout: 3s
-      retries: 5
+      retries: 6
       start_period: 10s
 
   web:
@@ -100,7 +106,8 @@ services:
     image: ${WEB_IMAGE:-simpleim-web:latest}
     restart: unless-stopped
     read_only: true
-    mem_limit: 64m
+    mem_limit: 32m
+    memswap_limit: 32m
     pids_limit: 64
     security_opt:
       - no-new-privileges:true
@@ -122,18 +129,31 @@ services:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
       interval: 15s
       timeout: 3s
-      retries: 5
+      retries: 6
 
   coturn:
-    image: coturn/coturn:4.6-alpine
+    image: ${COTURN_IMAGE:-coturn/coturn:4.6-alpine}
     profiles:
       - turn
     restart: unless-stopped
     network_mode: host
+    read_only: true
+    mem_limit: 64m
+    memswap_limit: 64m
+    pids_limit: 64
+    user: "65534:65534"
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["-c", "/etc/coturn/turnserver.conf"]
     volumes:
-      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ${COTURN_CONFIG_FILE:-./turnserver.conf.example}:/etc/coturn/turnserver.conf:ro
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+      - /var/tmp:size=4m,mode=1777
+      - /var/lib/coturn:size=4m,mode=1777
+      - /var/run:size=2m,mode=1777
     logging: *logging
 
 networks:

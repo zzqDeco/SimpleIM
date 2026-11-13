@@ -1,0 +1,2 @@
+# Default automatic ACME certificate issuance for public DNS hostnames.
+# Caddy manages Let's Encrypt / ZeroSSL issuance and renewal automatically via /data.

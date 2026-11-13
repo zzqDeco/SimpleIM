@@ -34,6 +34,11 @@ jobs:
       - name: Run unit, server SQLite, and 4-peer WebRTC Mesh + Swarm suites
         run: bun test
 
+      - name: Validate ops release manifest & shell delivery scripts
+        run: |
+          python3 -m unittest ops/test_manifest.py
+          bash -n ops/ci-deploy.sh ops/deploy.sh ops/sync-tls-cert.sh ops/backup.sh ops/bootstrap.sh
+
       - name: Build production Web SPA & standalone CLI binary
         run: |
           bun run build:web
@@ -55,28 +60,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate production Docker Compose spec
+      - name: Validate production Docker Compose specs (default & turn profile)
         run: |
           docker compose -f deploy/compose.production.yaml --env-file deploy/.env.example config -q
+          docker compose -f deploy/compose.production.yaml --env-file deploy/.env.example --profile turn config -q
 
-      - name: Validate Caddyfile syntax
+      - name: Validate Caddyfile syntax across domain ACME, IP ACME, and certificate-file TLS modes
         run: |
           docker run --rm --network none \
-            -e SITE_ADDRESS=im.example.com \
+            -e SITE_ADDRESS=https://im.example.com:8444 \
+            -e TLS_SERVER_NAME=im.example.com \
             -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
-            caddy:2.9-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+            -v "$PWD/deploy/tls/acme-domain.caddy:/etc/caddy/issuer.caddy:ro" \
+            caddy:2.11.7-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+          docker run --rm --network none \
+            -e SITE_ADDRESS=https://203.0.113.10:8444 \
+            -e TLS_SERVER_NAME=203.0.113.10 \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -v "$PWD/deploy/tls/acme-ip.caddy:/etc/caddy/issuer.caddy:ro" \
+            caddy:2.11.7-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+          TMP_TLS="$(mktemp -d)"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout "$TMP_TLS/privkey.pem" -out "$TMP_TLS/fullchain.pem" -days 1 \
+            -subj "/CN=203.0.113.10" -addext "subjectAltName=IP:203.0.113.10" 2>/dev/null
+          chmod 0644 "$TMP_TLS/privkey.pem" "$TMP_TLS/fullchain.pem"
+          docker run --rm --network none \
+            -e SITE_ADDRESS=https://203.0.113.10:8444 \
+            -e TLS_SERVER_NAME=203.0.113.10 \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -v "$PWD/deploy/tls/certificate-files.caddy:/etc/caddy/issuer.caddy:ro" \
+            -v "$TMP_TLS:/etc/caddy/tls:ro" \
+            caddy:2.11.7-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          rm -rf "$TMP_TLS"
 
       - name: Build & smoke-test production server and web images
         run: |
           docker build -t simpleim-server:ci -f deploy/server.Dockerfile \
-            --build-arg VERSION=ci --build-arg COMMIT_SHA="${GITHUB_SHA}" .
+            --build-arg VERSION=v0.0.0-ci --build-arg COMMIT_SHA="${GITHUB_SHA}" .
           docker build -t simpleim-web:ci -f deploy/web.Dockerfile \
-            --build-arg VERSION=ci --build-arg COMMIT_SHA="${GITHUB_SHA}" .
+            --build-arg VERSION=v0.0.0-ci --build-arg COMMIT_SHA="${GITHUB_SHA}" .
 
           KEY_SEED="$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=')"
           docker run -d --name simpleim-server-smoke -p 127.0.0.1:13000:3000 \
             -e SERVER_IDENTITY_PRIVATE_KEY="${KEY_SEED}" \
-            -e ALLOWED_ORIGINS="https://im.example.com" \
+            -e ALLOWED_ORIGINS="https://im.example.com:8444" \
+            -e STUN_URLS="stun:203.0.113.10:3478" \
             simpleim-server:ci
           docker run -d --name simpleim-web-smoke -p 127.0.0.1:18080:80 \
             simpleim-web:ci
@@ -91,6 +121,9 @@ jobs:
           done
 
           curl -fsS http://127.0.0.1:13000/healthz | grep -q '"ok":true'
-          curl -fsS http://127.0.0.1:13000/api/v1/meta | grep -q '"serverSignPubKey"'
+          curl -fsS http://127.0.0.1:13000/api/v1/version | grep -q '"version":"v0.0.0-ci"'
+          curl -fsS http://127.0.0.1:13000/api/v1/version | grep -q "\"sha\":\"${GITHUB_SHA}\""
+          curl -fsS http://127.0.0.1:13000/api/v1/meta | grep -q '"stun:203.0.113.10:3478"'
           curl -fsS http://127.0.0.1:18080/healthz | grep -q 'ok'
+          curl -fsS http://127.0.0.1:18080/version.json | grep -q '"version":"v0.0.0-ci"'
           curl -fsS http://127.0.0.1:18080/ | grep -q '<div id="root">'

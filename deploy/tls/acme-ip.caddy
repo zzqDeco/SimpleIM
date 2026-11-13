@@ -1,0 +1,8 @@
+# Public IP certificates require the Let's Encrypt shortlived ACME profile.
+tls {
+	issuer acme {
+		dir https://acme-v02.api.letsencrypt.org/directory
+		test_dir https://acme-v02.api.letsencrypt.org/directory
+		profile shortlived
+	}
+}

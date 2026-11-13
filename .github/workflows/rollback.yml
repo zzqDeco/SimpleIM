@@ -1,0 +1,45 @@
+name: Roll back production images
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Previously deployed version (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      expected_current_sha:
+        description: Full source SHA currently running in production
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  rollback:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    concurrency:
+      group: simpleim-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore previously deployed compatible release
+        run: bash ops/ci-deploy.sh rollback
+        env:
+          ROLLBACK_VERSION: ${{ inputs.version }}
+          EXPECTED_CURRENT_SHA: ${{ inputs.expected_current_sha }}
+          REGISTRY_USERNAME: ${{ secrets.ACR_PULL_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.ACR_PULL_PASSWORD }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          PRODUCTION_SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+          PRODUCTION_SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+          PRODUCTION_SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+          PRODUCTION_SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}

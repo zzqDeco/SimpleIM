@@ -33,6 +33,8 @@ RUN mkdir -p /data && chown -R bun:bun /data /app
 USER bun
 
 ENV NODE_ENV=production \
+    APP_VERSION=$VERSION \
+    COMMIT_SHA=$COMMIT_SHA \
     HOST=0.0.0.0 \
     PORT=3000 \
     SQLITE_PATH=/data/simpleim.sqlite \
