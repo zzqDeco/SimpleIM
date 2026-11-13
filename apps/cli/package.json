@@ -1,0 +1,20 @@
+{
+  "name": "@simpleim/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "simpleim": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "build:bin": "bun build --compile src/main.ts --outfile bin/simpleim",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@simpleim/contracts": "workspace:*",
+    "@simpleim/crypto": "workspace:*",
+    "@simpleim/peer-core": "workspace:*",
+    "werift": "^0.22.2"
+  }
+}

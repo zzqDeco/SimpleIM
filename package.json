@@ -1,0 +1,22 @@
+{
+  "name": "simpleim",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p packages/contracts/tsconfig.json --noEmit && tsc -p packages/crypto/tsconfig.json --noEmit && tsc -p packages/peer-core/tsconfig.json --noEmit && tsc -p apps/server/tsconfig.json --noEmit && tsc -p apps/cli/tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json --noEmit",
+    "test": "bun test packages/ apps/server/ apps/cli/ apps/web/ tests/",
+    "test:arch": "bun test tests/arch.test.ts",
+    "build:web": "bun run --cwd apps/web build",
+    "build:cli": "bun run --cwd apps/cli build:bin"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0",
+    "@types/bun": "latest",
+    "typescript": "^5.8.2"
+  }
+}
