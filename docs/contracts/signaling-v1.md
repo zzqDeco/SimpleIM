@@ -58,7 +58,7 @@ Open self-service registration guarded by per-IP token-bucket rate limiting.
 Requires valid session (`Cookie` + `X-CSRF-Token` for `web`, `Authorization: Bearer <sessionToken>` for `cli`). Deletes the `sessions` row immediately.
 
 ### `GET /api/v1/auth/me`
-Returns `{ ok: true, user: { id, username, displayName, createdAt } }` or `401 unauthorized`.
+Returns `{ ok: true, user: { id, username, displayName, createdAt }, csrfToken? }` or `401 unauthorized`. When authenticated via the browser `HttpOnly` session cookie (`clientKind === "web"`), `csrfToken` is included so single-tab page reloads can recover `X-CSRF-Token` for state-changing requests (`POST /api/v1/auth/peer-cert`, `POST /api/v1/auth/logout`).
 
 ---
 
@@ -106,7 +106,7 @@ Binds the authenticated user to a client-generated ephemeral `Ed25519` keypair f
 
 ## 4. Stateless WebSocket Signaling (`GET /ws/v1/signaling?peerId=<peerId>`)
 
-- **Upgrade Auth**: Session cookie + validated `Origin` (`web`) or `Authorization: Bearer <sessionToken>` (`cli`). Max inbound frame size: `32 KiB`.
+- **Upgrade Auth**: Session cookie + validated `Origin` (`web`) or `Authorization: Bearer <sessionToken>` (`cli`). Max inbound frame size: `limits.maxSignalPayloadBytes` (`32 KiB` default).
 - **In-Memory State Only**: `roomId` (`64` lowercase hex chars) maps exclusively to active `peerId` sockets. No usernames or display names are emitted in signaling membership events.
 
 ### Client → Server Frames

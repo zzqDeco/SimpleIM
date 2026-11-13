@@ -51,22 +51,28 @@ export interface HttpAuthClientOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   enableBroadcastChannel?: boolean;
+  csrfSyncTimeoutMs?: number;
 }
 
 const AUTH_CHANNEL_NAME = "simpleim-auth";
+const DEFAULT_CSRF_SYNC_TIMEOUT_MS = 50;
 
 export class HttpAuthClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly tabId: string;
+  private readonly csrfSyncTimeoutMs: number;
   private csrfToken: string | null = null;
   private currentUser: UserProfile | null = null;
   private channel: BroadcastChannel | null = null;
   private readonly resetListeners = new Set<CrossTabSessionResetListener>();
+  private readonly csrfSyncWaiters = new Set<() => void>();
 
   constructor(options?: HttpAuthClientOptions) {
     this.baseUrl = (options?.baseUrl ?? "").replace(/\/+$/, "");
     this.fetchImpl = options?.fetchImpl ?? ((input, init) => fetch(input, init));
+    this.csrfSyncTimeoutMs =
+      options?.csrfSyncTimeoutMs ?? DEFAULT_CSRF_SYNC_TIMEOUT_MS;
     this.tabId =
       typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
@@ -98,10 +104,41 @@ export class HttpAuthClient {
 
   dispose(): void {
     this.resetListeners.clear();
+    for (const waiter of this.csrfSyncWaiters) {
+      waiter();
+    }
+    this.csrfSyncWaiters.clear();
     if (this.channel) {
       this.channel.close();
       this.channel = null;
     }
+  }
+
+  private notifyCsrfWaiters(): void {
+    for (const waiter of this.csrfSyncWaiters) {
+      waiter();
+    }
+    this.csrfSyncWaiters.clear();
+  }
+
+  private async requestCrossTabCsrfToken(userId: string): Promise<void> {
+    if (!this.channel || this.hasCsrfToken()) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.csrfSyncWaiters.delete(done);
+        resolve();
+      };
+      const timer = setTimeout(done, this.csrfSyncTimeoutMs);
+      this.csrfSyncWaiters.add(done);
+      this.postBroadcast({
+        type: "auth.csrf_request",
+        tabId: this.tabId,
+        userId,
+      });
+    });
   }
 
   async getMeta(): Promise<MetaResponse> {
@@ -118,12 +155,15 @@ export class HttpAuthClient {
       this.currentUser = res.user;
       if (typeof res.csrfToken === "string" && res.csrfToken.length > 0) {
         this.csrfToken = res.csrfToken;
-      } else if (!this.csrfToken) {
-        this.postBroadcast({
-          type: "auth.csrf_request",
-          tabId: this.tabId,
-          userId: res.user.id,
-        });
+        this.notifyCsrfWaiters();
+      } else if (!this.hasCsrfToken() && this.channel) {
+        await this.requestCrossTabCsrfToken(res.user.id);
+      }
+
+      if (!this.hasCsrfToken()) {
+        this.currentUser = null;
+        this.csrfToken = null;
+        return null;
       }
       return res.user;
     } catch (err) {
@@ -267,6 +307,7 @@ export class HttpAuthClient {
         const prevUser = this.currentUser;
         this.currentUser = incomingUser;
         this.csrfToken = raw.csrfToken;
+        this.notifyCsrfWaiters();
 
         if (!prevUser || prevUser.id !== incomingUser.id) {
           for (const listener of this.resetListeners) {
@@ -294,10 +335,12 @@ export class HttpAuthClient {
         if (
           typeof raw.userId === "string" &&
           typeof raw.csrfToken === "string" &&
+          raw.csrfToken.length > 0 &&
           this.currentUser?.id === raw.userId &&
           !this.csrfToken
         ) {
           this.csrfToken = raw.csrfToken;
+          this.notifyCsrfWaiters();
         }
         break;
       }

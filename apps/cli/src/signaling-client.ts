@@ -1,10 +1,12 @@
 import {
+  ContractValidationError,
+  MAX_SIGNAL_FRAME_BYTES,
   parseClientSignalingFrame,
   parseServerSignalingFrame,
   type ClientSignalingFrame,
   type ServerSignalingFrame,
 } from "@simpleim/contracts";
-import { bytesToUtf8 } from "@simpleim/crypto";
+import { bytesToUtf8, utf8ToBytes } from "@simpleim/crypto";
 import type { SignalingClientPort } from "@simpleim/peer-core";
 
 export interface WebSocketLike {
@@ -57,6 +59,7 @@ export interface CliSignalingClientOptions {
   serverUrl: string;
   sessionToken: string;
   peerId: string;
+  maxSignalPayloadBytes?: number;
   initialReconnectDelayMs?: number;
   maxReconnectDelayMs?: number;
   autoReconnect?: boolean;
@@ -67,6 +70,7 @@ export interface CliSignalingClientOptions {
 export class CliSignalingClient implements SignalingClientPort {
   readonly wsUrl: string;
   private readonly sessionToken: string;
+  private readonly maxSignalPayloadBytes?: number;
   private readonly initialReconnectDelayMs: number;
   private readonly maxReconnectDelayMs: number;
   private readonly autoReconnect: boolean;
@@ -86,6 +90,7 @@ export class CliSignalingClient implements SignalingClientPort {
   constructor(options: CliSignalingClientOptions) {
     this.wsUrl = buildSignalingWsUrl(options.serverUrl, options.peerId);
     this.sessionToken = options.sessionToken;
+    this.maxSignalPayloadBytes = options.maxSignalPayloadBytes;
     this.initialReconnectDelayMs = options.initialReconnectDelayMs ?? 250;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 10_000;
     this.autoReconnect = options.autoReconnect ?? true;
@@ -127,11 +132,24 @@ export class CliSignalingClient implements SignalingClientPort {
   }
 
   send(frame: ClientSignalingFrame): void {
-    const validated = parseClientSignalingFrame(frame);
+    const validated = parseClientSignalingFrame(
+      frame,
+      this.maxSignalPayloadBytes !== undefined
+        ? { maxFrameBytes: this.maxSignalPayloadBytes }
+        : undefined,
+    );
+    const serialized = JSON.stringify(validated);
+    const maxBytes = this.maxSignalPayloadBytes ?? MAX_SIGNAL_FRAME_BYTES;
+    if (utf8ToBytes(serialized).byteLength > maxBytes) {
+      throw new ContractValidationError(
+        `Signaling frame exceeds ${maxBytes}-byte limit`,
+        "payload_too_large",
+      );
+    }
     if (!this.ws || this.ws.readyState !== WS_READY_STATE_OPEN) {
       throw new Error("Signaling WebSocket is not connected");
     }
-    this.ws.send(JSON.stringify(validated));
+    this.ws.send(serialized);
   }
 
   disconnect(): void {
@@ -292,7 +310,12 @@ export class CliSignalingClient implements SignalingClientPort {
       } else {
         throw new Error("Unsupported WebSocket frame payload type");
       }
-      const parsed = parseServerSignalingFrame(rawText);
+      const parsed = parseServerSignalingFrame(
+        rawText,
+        this.maxSignalPayloadBytes !== undefined
+          ? { maxFrameBytes: this.maxSignalPayloadBytes }
+          : undefined,
+      );
       for (const handler of this.frameHandlers) {
         handler(parsed);
       }

@@ -1,4 +1,6 @@
 import { createHmac } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import type {
   ClientKind,
   IceServerConfig,
@@ -63,9 +65,45 @@ export class BunPasswordHasher implements PasswordHasherPort {
 export interface ServerIdentitySignerOptions {
   readonly serverKeyId?: string;
   readonly privateKeyBase64Url?: string;
+  readonly persistedKeyPath?: string;
+  readonly requireExplicitKey?: boolean;
   readonly coturnUrls?: readonly string[];
   readonly coturnSharedSecret?: string;
   readonly turnTtlSeconds?: number;
+}
+
+function resolveOrPersistServerKeyPair(
+  options?: ServerIdentitySignerOptions,
+): Ed25519KeyPair {
+  const explicit = options?.privateKeyBase64Url?.trim();
+  if (explicit) {
+    return ed25519KeyPairFromPrivateKey(explicit);
+  }
+  if (options?.requireExplicitKey) {
+    throw new Error(
+      "SERVER_IDENTITY_PRIVATE_KEY is required when NODE_ENV=production so PeerIdentityCerts and CSRF secrets survive server restarts",
+    );
+  }
+  const keyPath = options?.persistedKeyPath?.trim();
+  if (keyPath) {
+    if (existsSync(keyPath)) {
+      const saved = readFileSync(keyPath, "utf8").trim();
+      return ed25519KeyPairFromPrivateKey(saved);
+    }
+    const generated = generateEd25519KeyPair();
+    mkdirSync(dirname(keyPath), { recursive: true });
+    writeFileSync(keyPath, `${generated.privateKeyBase64Url}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    try {
+      chmodSync(keyPath, 0o600);
+    } catch {
+      // Ignore chmod errors on filesystems without POSIX permissions
+    }
+    return generated;
+  }
+  return generateEd25519KeyPair();
 }
 
 export class ServerIdentitySigner implements IdentitySignerPort {
@@ -79,9 +117,7 @@ export class ServerIdentitySigner implements IdentitySignerPort {
 
   constructor(options?: ServerIdentitySignerOptions) {
     this.serverKeyId = options?.serverKeyId || "srvk_2026_01";
-    this.keyPair = options?.privateKeyBase64Url
-      ? ed25519KeyPairFromPrivateKey(options.privateKeyBase64Url)
-      : generateEd25519KeyPair();
+    this.keyPair = resolveOrPersistServerKeyPair(options);
     this.serverSignPubKey = this.keyPair.publicKeyBase64Url;
     this.csrfSecret = sha256Bytes(
       concatBytes(

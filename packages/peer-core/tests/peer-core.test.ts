@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
   decodeSwarmFrame,
   encodeSwarmFrame,
+  MAX_CHAT_LAMPORT,
   SWARM_CHUNK_SIZE,
+  SWARM_HASH_PAGE_CHUNKS,
   SWARM_HEADER_BYTES,
   SWARM_MAX_BUFFERED_AMOUNT,
   SwarmFrameType,
@@ -78,8 +80,11 @@ function createTestPeerRig(params: {
   certNowMs?: number;
   certTtlMs?: number;
   maxInFlightPerPeer?: number;
+  requestTimeoutMs?: number;
   helloAuthTimeoutMs?: number;
+  maxSignalPayloadBytes?: number;
   now?: () => number;
+  signalingOptions?: ConstructorParameters<typeof MockSignalingClient>[2];
   transportConfig?: (p: {
     localPeerId: string;
     remotePeerId: string;
@@ -101,7 +106,10 @@ function createTestPeerRig(params: {
     ttlMs: params.certTtlMs ?? 3_600_000,
   });
 
-  const signaling = params.hub.createClient(params.peerId);
+  const signaling = params.hub.createClient(
+    params.peerId,
+    params.signalingOptions,
+  );
   const { factory, createdConnections } = params.network.createFactory(
     params.transportConfig,
   );
@@ -128,7 +136,9 @@ function createTestPeerRig(params: {
     transportFactory: factory,
     chunkStorage: storage,
     maxInFlightPerPeer: params.maxInFlightPerPeer,
+    requestTimeoutMs: params.requestTimeoutMs,
     helloAuthTimeoutMs: params.helloAuthTimeoutMs,
+    maxSignalPayloadBytes: params.maxSignalPayloadBytes,
     now: params.now,
     events: {
       onCenterConnectionChange: (connected) => {
@@ -1471,6 +1481,783 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
         peerB.engine.stop(),
         peerC.engine.stop(),
       ]);
+    }
+  });
+
+  test("7. Regression guards: start() retry, post-open helloAuthTimeout, MAX_CHAT_LAMPORT bound, BITFIELD/HAVE OR-merge, async cancel race, timeout deprioritization, write backpressure, and >512-chunk paged FileManifest", async () => {
+    const ca = createTestServerCA();
+    const roomKeys = deriveRoomKeys("codex-peer-core-regressions", FAST_KDF);
+
+    // 7a + 7b. engine.start() recovers after signaling.connect() failure AND helloAuthTimeoutMs starts only on dc:0 open
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+      hub.shutdownCenterServer(); // Initially offline!
+
+      const peerA = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01aaaaaaaaaa",
+        username: "alice",
+        helloAuthTimeoutMs: 50,
+      });
+      const peerB = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02bbbbbbbbbb",
+        username: "bob",
+        helloAuthTimeoutMs: 50,
+        signalingOptions: {
+          interceptOutgoing: (frame, defaultSend) => {
+            if (frame.type === "signal.relay") {
+              // Delay SDP answer / ICE > helloAuthTimeoutMs (50ms) before dc:0 opens!
+              setTimeout(() => defaultSend(frame), 90);
+              return;
+            }
+            defaultSend(frame);
+          },
+        },
+      });
+
+      try {
+        await expect(peerA.engine.start()).rejects.toThrow(
+          "Center signaling server is offline",
+        );
+
+        // Retry after center server comes back online!
+        hub.restartCenterServer();
+        await Promise.all([peerA.engine.start(), peerB.engine.start()]);
+
+        await waitFor(
+          () =>
+            peerA.engine.getVerifiedPeers().length === 1 &&
+            peerB.engine.getVerifiedPeers().length === 1,
+        );
+        expect(peerA.authRejections).toHaveLength(0);
+        expect(peerB.authRejections).toHaveLength(0);
+
+        // 7c. MAX_CHAT_LAMPORT guard rejects oversized remote Lamport clocks without overflowing local clock
+        const forgedHighLamport = signChatMessage({
+          roomId: roomKeys.roomId,
+          lamport: MAX_CHAT_LAMPORT + 1,
+          body: "Overflow attempt",
+          authorCert: issuePeerIdentityCert({
+            serverKeyId: ca.serverKeyId,
+            serverSignPrivKey: ca.keyPair.privateKeyBytes,
+            userId: "usr_bob0000000",
+            username: "bob",
+            displayName: "BOB",
+            peerId: peerB.peerId,
+            peerSignPubKey: peerB.signalingKeyPair.publicKeyBase64Url,
+            clientKind: "web",
+          }),
+          peerSignPrivKey: peerB.signalingKeyPair.privateKeyBytes,
+        });
+        const bToA = peerB.connections.find(
+          (c) => c.remotePeerId === peerA.peerId,
+        )!;
+        bToA.controlChannel.sendText(
+          JSON.stringify(
+            sealPostAuthControlFrame(roomKeys.roomAppKey, roomKeys.roomId, {
+              type: "chat.message",
+              message: forgedHighLamport,
+            }),
+          ),
+        );
+
+        const cleanMsg = await peerA.engine.sendChatMessage("Safe lamport");
+        expect(cleanMsg.lamport).toBe(1);
+        await waitFor(() => peerB.engine.getMessages().length === 1);
+        expect(peerA.engine.getMessages().map((m) => m.msgId)).toEqual([
+          cleanMsg.msgId,
+        ]);
+      } finally {
+        await Promise.all([peerA.engine.stop(), peerB.engine.stop()]);
+      }
+    }
+
+    // 7d + 7e + 7f + 7g. BITFIELD/HAVE OR-merge, cancelDownload during async initReceivingFile,
+    // timed-out source deprioritization, and pendingStorageWrites backpressure
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+
+      const seederA = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01seederaaaa",
+        username: "alice",
+      });
+      const seederB = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02seederbbbb",
+        username: "bob",
+      });
+      const receiverC = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_03receivercc",
+        username: "carol",
+        maxInFlightPerPeer: 2,
+        requestTimeoutMs: 40,
+      });
+
+      try {
+        await Promise.all([
+          seederA.engine.start(),
+          seederB.engine.start(),
+          receiverC.engine.start(),
+        ]);
+        await waitFor(
+          () =>
+            seederA.engine.getVerifiedPeers().length === 2 &&
+            seederB.engine.getVerifiedPeers().length === 2 &&
+            receiverC.engine.getVerifiedPeers().length === 2,
+        );
+
+        // 7d. Out-of-order HAVE(1) followed by stale BITFIELD([0x01]) OR-merges so chunk 1 stays available
+        const twoChunkBytes = makeDeterministicPayload(2 * SWARM_CHUNK_SIZE);
+        const aToC = seederA.connections.find(
+          (c) => c.remotePeerId === receiverC.peerId,
+        )!;
+        // Intercept Seeder A's initial BITFIELD to simulate HAVE(1) arriving before stale BITFIELD([0x01])
+        let reorderedInitialBitfield = false;
+        aToC.swarmChannel.setBinaryOutgoingInterceptor((raw) => {
+          const decoded = decodeSwarmFrame(raw);
+          if (
+            decoded.frameType === SwarmFrameType.BITFIELD &&
+            !reorderedInitialBitfield
+          ) {
+            reorderedInitialBitfield = true;
+            queueMicrotask(() => {
+              // First send HAVE(chunk 1), then stale BITFIELD claiming only chunk 0!
+              aToC.swarmChannel.sendBinary(
+                encodeSwarmFrame({
+                  frameType: SwarmFrameType.HAVE,
+                  fileId: decoded.fileId,
+                  chunkIndex: 1,
+                  payload: new Uint8Array(0),
+                }),
+              );
+              aToC.swarmChannel.sendBinary(
+                encodeSwarmFrame({
+                  frameType: SwarmFrameType.BITFIELD,
+                  fileId: decoded.fileId,
+                  chunkIndex: 0,
+                  payload: new Uint8Array([0x80]), // MSB bit 0 = chunk 0 only!
+                }),
+              );
+            });
+            return null;
+          }
+          return raw;
+        });
+
+        const mergeManifest = await seederA.engine.shareFile({
+          fileName: "or-merge.bin",
+          fileSize: twoChunkBytes.byteLength,
+          readChunk: makeSliceReader(twoChunkBytes),
+        });
+        await waitFor(() => receiverC.announcedFiles.length === 1);
+        await receiverC.engine.downloadFile(mergeManifest.fileId);
+        await waitFor(() => receiverC.completedFiles.length === 1);
+        expect(receiverC.storage.getFinalizedBytes(mergeManifest.fileId)).toEqual(
+          twoChunkBytes,
+        );
+        aToC.swarmChannel.setBinaryOutgoingInterceptor(undefined);
+
+        // 7e. cancelDownload invoked while initReceivingFile is still awaiting cancels cleanly
+        const raceBytes = makeDeterministicPayload(2 * SWARM_CHUNK_SIZE);
+        const raceManifest = await seederA.engine.shareFile({
+          fileName: "cancel-race.bin",
+          fileSize: raceBytes.byteLength,
+          readChunk: makeSliceReader(raceBytes),
+        });
+        await waitFor(() => receiverC.announcedFiles.length === 2);
+
+        let releaseInit!: () => void;
+        const origInit = receiverC.storage.initReceivingFile.bind(
+          receiverC.storage,
+        );
+        receiverC.storage.initReceivingFile = async (m) => {
+          await new Promise<void>((resolve) => {
+            releaseInit = resolve;
+          });
+          return origInit(m);
+        };
+
+        const pendingDownload = receiverC.engine.downloadFile(
+          raceManifest.fileId,
+        );
+        await waitFor(() => typeof releaseInit === "function");
+        await receiverC.engine.cancelDownload(raceManifest.fileId);
+        releaseInit();
+        await pendingDownload;
+
+        expect(
+          receiverC.engine.getTransferProgress(raceManifest.fileId)?.status,
+        ).toBe("paused");
+        expect(receiverC.storage.deletedFileIds).toContain(raceManifest.fileId);
+        receiverC.storage.initReceivingFile = origInit;
+
+        // 7f + 7g. Timed-out source peer deprioritization + writeVerifiedChunk backpressure
+        const sixChunkBytes = makeDeterministicPayload(6 * SWARM_CHUNK_SIZE);
+        const timeoutManifest = await seederA.engine.shareFile({
+          fileName: "timeout-and-backpressure.bin",
+          fileSize: sixChunkBytes.byteLength,
+          readChunk: makeSliceReader(sixChunkBytes),
+        });
+        await waitFor(
+          () =>
+            seederB.announcedFiles.length === 3 &&
+            receiverC.announcedFiles.length === 3,
+        );
+        await seederB.engine.downloadFile(timeoutManifest.fileId);
+        await waitFor(() => seederB.completedFiles.length === 1);
+
+        // Make Seeder A silently drop all outgoing CHUNK frames so Receiver C times out on A and falls back to Seeder B!
+        aToC.swarmChannel.setBinaryOutgoingInterceptor((raw) => {
+          const decoded = decodeSwarmFrame(raw);
+          if (decoded.frameType === SwarmFrameType.CHUNK) {
+            return null;
+          }
+          return raw;
+        });
+
+        // Gate Receiver C's writeVerifiedChunk to verify maxInFlightPerPeer (2) caps concurrent storage writes!
+        let activeWrites = 0;
+        let peakConcurrentWrites = 0;
+        const pendingWriteResolvers: Array<() => void> = [];
+        const origWrite = receiverC.storage.writeVerifiedChunk.bind(
+          receiverC.storage,
+        );
+        receiverC.storage.writeVerifiedChunk = async (
+          fileId,
+          chunkIndex,
+          data,
+        ) => {
+          activeWrites += 1;
+          if (activeWrites > peakConcurrentWrites) {
+            peakConcurrentWrites = activeWrites;
+          }
+          await new Promise<void>((resolve) => {
+            pendingWriteResolvers.push(resolve);
+          });
+          activeWrites -= 1;
+          return origWrite(fileId, chunkIndex, data);
+        };
+
+        await receiverC.engine.downloadFile(timeoutManifest.fileId);
+        // Wait until Seeder B delivers its maxInFlightPerPeer (2) chunks and stalls on write backpressure
+        await waitFor(() => pendingWriteResolvers.length === 2, 3_000);
+        await new Promise<void>((r) => setTimeout(r, 30));
+        // Because Seeder A drops chunks and Seeder B has maxInFlightPerPeer=2 occupied by pendingStorageWrites,
+        // peakConcurrentWrites on Seeder B stays bounded at 2!
+        expect(peakConcurrentWrites).toBe(2);
+
+        // Restore fast writes and drain queued resolvers so all 6 chunks finish via Seeder B!
+        receiverC.storage.writeVerifiedChunk = origWrite;
+        while (pendingWriteResolvers.length > 0) {
+          pendingWriteResolvers.shift()!();
+        }
+
+        await waitFor(() => receiverC.completedFiles.length === 2, 5_000);
+        expect(
+          receiverC.storage.getFinalizedBytes(timeoutManifest.fileId),
+        ).toEqual(sixChunkBytes);
+      } finally {
+        await Promise.all([
+          seederA.engine.stop(),
+          seederB.engine.stop(),
+          receiverC.engine.stop(),
+        ]);
+      }
+    }
+
+    // 7h. > 512 chunks (515 chunks) paged FileManifest transfers file.hash_page_request / file.hash_page
+    // and rejects tampered hash pages from a malicious peer
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+
+      const honestSeeder = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01honestseed",
+        username: "alice",
+      });
+      const maliciousPeer = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02maliciousm",
+        username: "mallory",
+      });
+      const receiver = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_03receiverbb",
+        username: "bob",
+        maxInFlightPerPeer: 32,
+      });
+
+      try {
+        await Promise.all([
+          honestSeeder.engine.start(),
+          maliciousPeer.engine.start(),
+          receiver.engine.start(),
+        ]);
+        await waitFor(
+          () =>
+            honestSeeder.engine.getVerifiedPeers().length === 2 &&
+            maliciousPeer.engine.getVerifiedPeers().length === 2 &&
+            receiver.engine.getVerifiedPeers().length === 2,
+        );
+
+        const totalChunks = SWARM_HASH_PAGE_CHUNKS + 3; // 515 chunks across 2 hash pages!
+        const pagedPayload = makeDeterministicPayload(
+          (totalChunks - 1) * SWARM_CHUNK_SIZE + 512,
+        );
+
+        const pagedManifest = await honestSeeder.engine.shareFile({
+          fileName: "large-paged-archive.tar",
+          fileSize: pagedPayload.byteLength,
+          readChunk: makeSliceReader(pagedPayload),
+        });
+        expect(pagedManifest.totalChunks).toBe(515);
+        expect(pagedManifest.chunkHashes).toHaveLength(0);
+        expect(pagedManifest.hashPageHashes).toHaveLength(2);
+
+        await waitFor(() => receiver.announcedFiles.length === 1);
+
+        // Mallory injects 3 tampered file.hash_page frames -> gets evicted for hash_page_poisoning
+        const malloryToReceiver = maliciousPeer.connections.find(
+          (c) => c.remotePeerId === receiver.peerId,
+        )!;
+        for (let i = 0; i < 3; i++) {
+          malloryToReceiver.controlChannel.sendText(
+            JSON.stringify(
+              sealPostAuthControlFrame(roomKeys.roomAppKey, roomKeys.roomId, {
+                type: "file.hash_page",
+                fileId: pagedManifest.fileId,
+                pageIndex: 1,
+                chunkHashes: [
+                  "0".repeat(64),
+                  "1".repeat(64),
+                  "2".repeat(64),
+                ],
+              }),
+            ),
+          );
+        }
+
+        await waitFor(
+          () => receiver.engine.getVerifiedPeers().length === 1,
+          3_000,
+        );
+        expect(receiver.engine.getVerifiedPeers()[0]?.peerId).toBe(
+          honestSeeder.peerId,
+        );
+
+        // Receiver fetches valid hash pages 0 & 1 and all 515 chunks from Honest Seeder!
+        await receiver.engine.downloadFile(pagedManifest.fileId);
+        await waitFor(() => receiver.completedFiles.length === 1, 8_000);
+        expect(receiver.storage.getFinalizedBytes(pagedManifest.fileId)).toEqual(
+          pagedPayload,
+        );
+      } finally {
+        await Promise.all([
+          honestSeeder.engine.stop(),
+          maliciousPeer.engine.stop(),
+          receiver.engine.stop(),
+        ]);
+      }
+    }
+  });
+
+  test("8. Round-2 regression guards: configurable maxSignalPayloadBytes, overlapping/cancel-restart downloadFile storage ownership, and multi-peer hash-page retry rotation", async () => {
+    const ca = createTestServerCA();
+    const roomKeys = deriveRoomKeys("codex-round2-peer-core-suite", FAST_KDF);
+
+    // 8a. Large (>28,000 char) SDP payloads succeed when maxSignalPayloadBytes is raised to 65_536
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+
+      const peerA = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01largeoffer",
+        username: "alice",
+        maxSignalPayloadBytes: 65_536,
+      });
+      const peerB = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02largeanswr",
+        username: "bob",
+        maxSignalPayloadBytes: 65_536,
+      });
+
+      // Inflate outgoing SDP offer & answer beyond the default 28,000-char / 40,000-ciphertext limit
+      const origCreateA = peerA.engine.start.bind(peerA.engine);
+      void origCreateA;
+      const interceptWithHugeSdp = async () => {
+        const { openSignalingPayload, sealSignalingPayload } = await import(
+          "@simpleim/crypto"
+        );
+        const hugePadding = `\r\na=x-sdp-padding:${"Z".repeat(33_000)}`;
+        const makeBloater =
+          (fromId: string) =>
+          (
+            frame: Parameters<typeof peerA.signaling.send>[0],
+            defaultSend: (f: Parameters<typeof peerA.signaling.send>[0]) => void,
+          ) => {
+            if (frame.type === "signal.relay") {
+              const inner = openSignalingPayload(
+                roomKeys.signalingKey,
+                roomKeys.roomId,
+                fromId,
+                frame.toPeerId,
+                frame.envelope,
+                { maxFrameBytes: 65_536 },
+              );
+              if (inner.kind === "sdp-offer" || inner.kind === "sdp-answer") {
+                const bloated = sealSignalingPayload(
+                  roomKeys.signalingKey,
+                  roomKeys.roomId,
+                  fromId,
+                  frame.toPeerId,
+                  {
+                    kind: inner.kind,
+                    sdp: inner.sdp + hugePadding,
+                  },
+                );
+                expect(bloated.ciphertext.length).toBeGreaterThan(44_000);
+                defaultSend({ ...frame, envelope: bloated });
+                return;
+              }
+            }
+            defaultSend(frame);
+          };
+
+        const hub2 = new MockSignalingHub();
+        const net2 = new MockPeerTransportNetwork();
+        const defaultLimitPeerB = createTestPeerRig({
+          ca,
+          hub: hub2,
+          network: net2,
+          roomKeys,
+          peerId: "peer_02defaultlim",
+          username: "bob",
+          // Default 32 KiB limit -> must drop the >44,000-char envelope
+        });
+        const highSenderA = createTestPeerRig({
+          ca,
+          hub: hub2,
+          network: net2,
+          roomKeys,
+          peerId: "peer_01highsender",
+          username: "alice",
+          maxSignalPayloadBytes: 65_536,
+          signalingOptions: {
+            interceptOutgoing: makeBloater("peer_01highsender"),
+          },
+        });
+
+        try {
+          await Promise.all([
+            highSenderA.engine.start(),
+            defaultLimitPeerB.engine.start(),
+          ]);
+          await new Promise<void>((r) => setTimeout(r, 60));
+          expect(defaultLimitPeerB.engine.getVerifiedPeers()).toHaveLength(0);
+        } finally {
+          await Promise.all([
+            highSenderA.engine.stop(),
+            defaultLimitPeerB.engine.stop(),
+          ]);
+        }
+
+        // Now run with BOTH peers configured at maxSignalPayloadBytes: 65_536
+        const hub3 = new MockSignalingHub();
+        const net3 = new MockPeerTransportNetwork();
+        const highA = createTestPeerRig({
+          ca,
+          hub: hub3,
+          network: net3,
+          roomKeys,
+          peerId: "peer_01highpeer01",
+          username: "alice",
+          maxSignalPayloadBytes: 65_536,
+          signalingOptions: {
+            interceptOutgoing: makeBloater("peer_01highpeer01"),
+          },
+        });
+        const highB = createTestPeerRig({
+          ca,
+          hub: hub3,
+          network: net3,
+          roomKeys,
+          peerId: "peer_02highpeer02",
+          username: "bob",
+          maxSignalPayloadBytes: 65_536,
+          signalingOptions: {
+            interceptOutgoing: makeBloater("peer_02highpeer02"),
+          },
+        });
+        try {
+          await Promise.all([highA.engine.start(), highB.engine.start()]);
+          await waitFor(
+            () =>
+              highA.engine.getVerifiedPeers().length === 1 &&
+              highB.engine.getVerifiedPeers().length === 1,
+          );
+        } finally {
+          await Promise.all([highA.engine.stop(), highB.engine.stop()]);
+          await Promise.all([peerA.engine.stop(), peerB.engine.stop()]);
+        }
+      };
+      await interceptWithHugeSdp();
+    }
+
+    // 8b. Overlapping downloadFile() calls AND cancelDownload -> immediate downloadFile restart preserve storage ownership
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+
+      const seeder = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01seederaaaa",
+        username: "alice",
+      });
+      const receiver = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02receiverbb",
+        username: "bob",
+      });
+
+      try {
+        await Promise.all([seeder.engine.start(), receiver.engine.start()]);
+        await waitFor(
+          () =>
+            seeder.engine.getVerifiedPeers().length === 1 &&
+            receiver.engine.getVerifiedPeers().length === 1,
+        );
+
+        // Subcase 1: Concurrent duplicate downloadFile(id) while initReceivingFile is still pending
+        const dupPayload = makeDeterministicPayload(3 * SWARM_CHUNK_SIZE + 128);
+        const dupManifest = await seeder.engine.shareFile({
+          fileName: "concurrent-dup.bin",
+          fileSize: dupPayload.byteLength,
+          readChunk: makeSliceReader(dupPayload),
+        });
+        await waitFor(() => receiver.announcedFiles.length === 1);
+
+        let releaseDupInit!: () => void;
+        let dupInitCalls = 0;
+        const origInit = receiver.storage.initReceivingFile.bind(
+          receiver.storage,
+        );
+        receiver.storage.initReceivingFile = async (m) => {
+          dupInitCalls += 1;
+          await new Promise<void>((r) => {
+            releaseDupInit = r;
+          });
+          return origInit(m);
+        };
+
+        const pDup1 = receiver.engine.downloadFile(dupManifest.fileId);
+        await waitFor(() => typeof releaseDupInit === "function");
+        const pDup2 = receiver.engine.downloadFile(dupManifest.fileId);
+
+        releaseDupInit();
+        await Promise.all([pDup1, pDup2]);
+        receiver.storage.initReceivingFile = origInit;
+
+        await waitFor(() => receiver.completedFiles.length === 1);
+        expect(dupInitCalls).toBe(1);
+        expect(receiver.storage.deletedFileIds).not.toContain(
+          dupManifest.fileId,
+        );
+        expect(receiver.storage.getFinalizedBytes(dupManifest.fileId)).toEqual(
+          dupPayload,
+        );
+
+        // Subcase 2: downloadFile #1 -> cancelDownload -> immediate downloadFile #2 BEFORE #1's initReceivingFile resolves
+        const restartPayload = makeDeterministicPayload(
+          2 * SWARM_CHUNK_SIZE + 512,
+        );
+        const restartManifest = await seeder.engine.shareFile({
+          fileName: "cancel-restart.bin",
+          fileSize: restartPayload.byteLength,
+          readChunk: makeSliceReader(restartPayload),
+        });
+        await waitFor(() => receiver.announcedFiles.length === 2);
+
+        let releaseStaleInit!: () => void;
+        let initCallIndex = 0;
+        receiver.storage.initReceivingFile = async (m) => {
+          initCallIndex += 1;
+          if (initCallIndex === 1) {
+            await new Promise<void>((r) => {
+              releaseStaleInit = r;
+            });
+          }
+          return origInit(m);
+        };
+
+        const staleAttempt = receiver.engine.downloadFile(
+          restartManifest.fileId,
+        );
+        await waitFor(() => typeof releaseStaleInit === "function");
+        await receiver.engine.cancelDownload(restartManifest.fileId);
+        // Immediately restart BEFORE staleAttempt's initReceivingFile resolves!
+        const freshAttempt = receiver.engine.downloadFile(
+          restartManifest.fileId,
+        );
+        // Now let Attempt #1's delayed initReceivingFile resolve
+        releaseStaleInit();
+        await Promise.all([staleAttempt, freshAttempt]);
+        receiver.storage.initReceivingFile = origInit;
+
+        await waitFor(() => receiver.completedFiles.length === 2);
+        expect(
+          receiver.storage.getFinalizedBytes(restartManifest.fileId),
+        ).toEqual(restartPayload);
+      } finally {
+        await Promise.all([seeder.engine.stop(), receiver.engine.stop()]);
+      }
+    }
+
+    // 8c. Hash-page retry rotation walks past 2+ unresponsive peers to reach the 3rd honest seeder
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+
+      const unresponsive1 = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01silentpeer",
+        username: "silent1",
+      });
+      const unresponsive2 = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02silentpeer",
+        username: "silent2",
+      });
+      const honestSeeder3 = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_03honestseed",
+        username: "alice",
+      });
+      const receiver4 = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_04receiverdd",
+        username: "bob",
+        maxInFlightPerPeer: 32,
+        requestTimeoutMs: 30,
+      });
+
+      try {
+        await Promise.all([
+          unresponsive1.engine.start(),
+          unresponsive2.engine.start(),
+          honestSeeder3.engine.start(),
+          receiver4.engine.start(),
+        ]);
+        await waitFor(
+          () =>
+            unresponsive1.engine.getVerifiedPeers().length === 3 &&
+            unresponsive2.engine.getVerifiedPeers().length === 3 &&
+            honestSeeder3.engine.getVerifiedPeers().length === 3 &&
+            receiver4.engine.getVerifiedPeers().length === 3,
+        );
+
+        const totalChunks = SWARM_HASH_PAGE_CHUNKS + 4; // 516 chunks across 2 hash pages
+        const pagedBytes = makeDeterministicPayload(
+          (totalChunks - 1) * SWARM_CHUNK_SIZE + 256,
+        );
+        const pagedManifest = await honestSeeder3.engine.shareFile({
+          fileName: "rotate-hash-pages.tar",
+          fileSize: pagedBytes.byteLength,
+          readChunk: makeSliceReader(pagedBytes),
+        });
+        await waitFor(() => receiver4.announcedFiles.length === 1);
+
+        // Make BOTH unresponsive1 and unresponsive2 advertise full BITFIELDs to receiver4 so they
+        // look like top-priority seeders, while never answering file.hash_page_request or CHUNK!
+        const fullBf = new Uint8Array(Math.ceil(totalChunks / 8)).fill(0xff);
+        // Clear trailing unused bits in final byte
+        const rem = totalChunks % 8;
+        if (rem !== 0) {
+          fullBf[fullBf.length - 1] = (0xff << (8 - rem)) & 0xff;
+        }
+        for (const silentRig of [unresponsive1, unresponsive2]) {
+          const connToR = silentRig.connections.find(
+            (c) => c.remotePeerId === receiver4.peerId,
+          )!;
+          connToR.swarmChannel.sendBinary(
+            encodeSwarmFrame({
+              frameType: SwarmFrameType.BITFIELD,
+              fileId: pagedManifest.fileId,
+              chunkIndex: 0,
+              payload: fullBf,
+            }),
+          );
+        }
+        await new Promise<void>((r) => setTimeout(r, 15));
+
+        await receiver4.engine.downloadFile(pagedManifest.fileId);
+        await waitFor(() => receiver4.completedFiles.length === 1, 8_000);
+        expect(receiver4.storage.getFinalizedBytes(pagedManifest.fileId)).toEqual(
+          pagedBytes,
+        );
+      } finally {
+        await Promise.all([
+          unresponsive1.engine.stop(),
+          unresponsive2.engine.stop(),
+          honestSeeder3.engine.stop(),
+          receiver4.engine.stop(),
+        ]);
+      }
     }
   });
 });

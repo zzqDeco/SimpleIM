@@ -63,10 +63,14 @@ export function createRoomPeerEngine(
     serverSignPubKey,
     chunkStorage,
     maxInFlightPerPeer: options.maxInFlightPerPeer,
+    requestTimeoutMs: options.requestTimeoutMs,
     now,
     events,
     broadcastControlFrame: (frame) => {
       meshManagerRef?.broadcastControlFrame(frame);
+    },
+    sendControlFrameToPeer: (peerId, frame) => {
+      meshManagerRef?.sendControlFrameToPeer(peerId, frame);
     },
     evictPeer: (peerId, reason) => {
       meshManagerRef?.evictPeer(peerId, reason);
@@ -82,6 +86,7 @@ export function createRoomPeerEngine(
     iceServers,
     transportFactory,
     helloAuthTimeoutMs: options.helloAuthTimeoutMs,
+    maxSignalPayloadBytes: options.maxSignalPayloadBytes,
     now,
     events,
     callbacks: {
@@ -178,7 +183,22 @@ export function createRoomPeerEngine(
         chatSync.ingestRemoteMessage(frame.message, false);
         break;
       case "file.announce":
-        swarmScheduler.ingestFileManifest(frame.manifest);
+        swarmScheduler.ingestFileManifest(frame.manifest, remotePeerId);
+        break;
+      case "file.hash_page_request":
+        swarmScheduler.handleHashPageRequestFrame(
+          remotePeerId,
+          frame.fileId,
+          frame.pageIndices,
+        );
+        break;
+      case "file.hash_page":
+        swarmScheduler.handleHashPageFrame(
+          remotePeerId,
+          frame.fileId,
+          frame.pageIndex,
+          frame.chunkHashes,
+        );
         break;
       case "sync.summary": {
         const wantMsgIds = chatSync.computeMissingMsgIdsToRequest(
@@ -221,7 +241,7 @@ export function createRoomPeerEngine(
           chatSync.ingestRemoteMessage(msg, true);
         }
         for (const manifest of frame.files) {
-          swarmScheduler.ingestFileManifest(manifest);
+          swarmScheduler.ingestFileManifest(manifest, remotePeerId);
         }
         break;
       }
@@ -309,7 +329,15 @@ export function createRoomPeerEngine(
       started = true;
 
       if (!signaling.isConnected) {
-        await signaling.connect();
+        try {
+          await signaling.connect();
+        } catch (err) {
+          if (!stopped) {
+            started = false;
+            joinedOnCurrentConnection = false;
+          }
+          throw err;
+        }
       }
       if (stopped) return;
 

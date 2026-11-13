@@ -5,13 +5,20 @@ import {
 } from "@simpleim/contracts";
 import type { ChunkStoragePort } from "@simpleim/peer-core";
 import {
+  acquireSharedInstanceLock,
+  assertValidStorageFileId,
+  defaultWebLocksProvider,
+  generateStorageInstanceId,
   OPFS_SWARM_DIR_NAME,
   OpfsWorkerStorageCore,
+  reclaimAbandonedOpfsInstances,
   toExactArrayBuffer,
+  type HeldInstanceLock,
   type OpfsDirectoryHandleLike,
   type OpfsStorageNavigatorLike,
   type OpfsWorkerRequest,
   type OpfsWorkerResponse,
+  type WebLocksLike,
 } from "./opfs-protocol.ts";
 
 interface LocalSeedingEntry {
@@ -31,6 +38,10 @@ interface PendingRpc {
 export interface OpfsChunkStorageOptions {
   forceInlineFallback?: boolean;
   storageProvider?: () => OpfsStorageNavigatorLike | undefined;
+  locksProvider?: () => WebLocksLike | undefined;
+  instanceId?: string;
+  maxFallbackBytes?: number;
+  workerFactory?: () => Worker;
 }
 
 export function createBrowserFileChunkReader(
@@ -47,8 +58,15 @@ export function createBrowserFileChunkReader(
 }
 
 export class OpfsChunkStorageAdapter implements ChunkStoragePort {
+  readonly instanceId: string;
   private worker: Worker | null = null;
+  private workerConfigured = false;
+  private workerConfigPromise: Promise<void> | null = null;
+  private workerError: Error | null = null;
   private inlineCore: OpfsWorkerStorageCore | null = null;
+  private instanceLock: HeldInstanceLock | null = null;
+  private startupSweepPromise: Promise<void> | null = null;
+  private crashCleanupPromise: Promise<void> | null = null;
   private closed = false;
   private nextRpcId = 1;
   private readonly pendingRpcs = new Map<number, PendingRpc>();
@@ -59,28 +77,125 @@ export class OpfsChunkStorageAdapter implements ChunkStoragePort {
 
   constructor(options?: OpfsChunkStorageOptions) {
     this.options = options ?? {};
-    if (!this.options.forceInlineFallback && typeof Worker !== "undefined") {
+    const candidateInstanceId =
+      this.options.instanceId ?? generateStorageInstanceId();
+    assertValidStorageFileId(candidateInstanceId);
+    this.instanceId = candidateInstanceId;
+    this.instanceLock = acquireSharedInstanceLock(
+      this.resolveWebLocks(),
+      this.instanceId,
+    );
+    this.startupSweepPromise = this.sweepAbandonedInstancesOnMainThread();
+
+    const canUseWorker =
+      !this.options.forceInlineFallback &&
+      (typeof this.options.workerFactory === "function" ||
+        typeof Worker !== "undefined");
+
+    if (canUseWorker) {
       try {
-        const w = new Worker(
-          new URL("../workers/opfs.worker.ts", import.meta.url),
-          { type: "module" },
-        );
+        const w = this.options.workerFactory
+          ? this.options.workerFactory()
+          : new Worker(new URL("../workers/opfs.worker.ts", import.meta.url), {
+              type: "module",
+            });
         w.onmessage = (event: MessageEvent<OpfsWorkerResponse>) => {
           this.handleWorkerResponse(event.data);
         };
         w.onerror = (event: ErrorEvent) => {
-          const err = new Error(event.message || "OPFS worker runtime error");
-          for (const pending of this.pendingRpcs.values()) {
-            pending.reject(err);
-          }
-          this.pendingRpcs.clear();
+          const err = new Error(event?.message || "OPFS worker runtime error");
+          this.handleWorkerFatalError(err);
+        };
+        w.onmessageerror = () => {
+          this.handleWorkerFatalError(
+            new Error("OPFS worker message deserialization error"),
+          );
         };
         this.worker = w;
       } catch {
-        this.inlineCore = new OpfsWorkerStorageCore(this.options.storageProvider);
+        this.inlineCore = new OpfsWorkerStorageCore({
+          storageProvider: this.options.storageProvider,
+          locksProvider: this.options.locksProvider,
+          instanceId: this.instanceId,
+          ...(this.options.maxFallbackBytes !== undefined
+            ? { maxFallbackBytes: this.options.maxFallbackBytes }
+            : {}),
+        });
       }
     } else {
-      this.inlineCore = new OpfsWorkerStorageCore(this.options.storageProvider);
+      this.inlineCore = new OpfsWorkerStorageCore({
+        storageProvider: this.options.storageProvider,
+        locksProvider: this.options.locksProvider,
+        instanceId: this.instanceId,
+        ...(this.options.maxFallbackBytes !== undefined
+          ? { maxFallbackBytes: this.options.maxFallbackBytes }
+          : {}),
+      });
+    }
+  }
+
+  private resolveStorageNavigator(): OpfsStorageNavigatorLike | undefined {
+    return this.options.storageProvider
+      ? this.options.storageProvider()
+      : typeof navigator !== "undefined"
+        ? (navigator.storage as unknown as OpfsStorageNavigatorLike | undefined)
+        : undefined;
+  }
+
+  private resolveWebLocks(): WebLocksLike | undefined {
+    return this.options.locksProvider
+      ? this.options.locksProvider()
+      : defaultWebLocksProvider();
+  }
+
+  private async sweepAbandonedInstancesOnMainThread(): Promise<void> {
+    const locks = this.resolveWebLocks();
+    const storage = this.resolveStorageNavigator();
+    if (!locks || !storage || typeof storage.getDirectory !== "function") {
+      return;
+    }
+    await this.instanceLock?.ready;
+    try {
+      const root = await storage.getDirectory();
+      const swarmRoot = await root.getDirectoryHandle(OPFS_SWARM_DIR_NAME);
+      await reclaimAbandonedOpfsInstances(swarmRoot, this.instanceId, locks);
+    } catch {
+      // Ignore when simpleim-swarm directory does not exist yet
+    }
+  }
+
+  private async cleanupOwnInstanceDirOnMainThread(): Promise<void> {
+    const storage = this.resolveStorageNavigator();
+    if (!storage || typeof storage.getDirectory !== "function") {
+      return;
+    }
+    try {
+      const root = await storage.getDirectory();
+      const swarmRoot = await root.getDirectoryHandle(OPFS_SWARM_DIR_NAME);
+      await swarmRoot.removeEntry(this.instanceId, { recursive: true });
+    } catch {
+      // Ignore NotFoundError or environments without OPFS directory support
+    }
+  }
+
+  private handleWorkerFatalError(err: Error): void {
+    if (!this.workerError) {
+      this.workerError = err;
+    }
+    if (this.worker) {
+      try {
+        this.worker.terminate();
+      } catch {
+        // Ignore terminate errors
+      }
+      this.worker = null;
+    }
+    for (const pending of this.pendingRpcs.values()) {
+      pending.reject(this.workerError);
+    }
+    this.pendingRpcs.clear();
+    if (!this.crashCleanupPromise) {
+      this.crashCleanupPromise = this.cleanupOwnInstanceDirOnMainThread();
     }
   }
 
@@ -195,13 +310,19 @@ export class OpfsChunkStorageAdapter implements ChunkStoragePort {
     this.localSourceBlobs.clear();
     this.downloadedFileIds.clear();
     try {
-      await this.sendRpc({
-        id: this.nextRpcId++,
-        type: "closeAll",
-      });
+      if (this.inlineCore || (this.worker && !this.workerError)) {
+        await this.sendRpc({
+          id: this.nextRpcId++,
+          type: "closeAll",
+        }).catch(() => undefined);
+      }
     } finally {
       if (this.worker) {
-        this.worker.terminate();
+        try {
+          this.worker.terminate();
+        } catch {
+          // Ignore terminate errors
+        }
         this.worker = null;
       }
       this.inlineCore = null;
@@ -209,6 +330,12 @@ export class OpfsChunkStorageAdapter implements ChunkStoragePort {
         pending.reject(new Error("OPFS storage closed"));
       }
       this.pendingRpcs.clear();
+      await this.startupSweepPromise?.catch(() => undefined);
+      await this.crashCleanupPromise?.catch(() => undefined);
+      await this.cleanupOwnInstanceDirOnMainThread();
+      const lock = this.instanceLock;
+      this.instanceLock = null;
+      await lock?.release();
     }
   }
 
@@ -246,8 +373,12 @@ export class OpfsChunkStorageAdapter implements ChunkStoragePort {
           throw new Error("OPFS directory API unavailable on main thread");
         }
         const rootDir: OpfsDirectoryHandleLike = await storage.getDirectory();
-        const swarmDir = await rootDir.getDirectoryHandle(OPFS_SWARM_DIR_NAME);
-        const fileHandle = await swarmDir.getFileHandle(`${fileId}.bin`);
+        const swarmRootDir =
+          await rootDir.getDirectoryHandle(OPFS_SWARM_DIR_NAME);
+        const instanceDir = await swarmRootDir.getDirectoryHandle(
+          this.instanceId,
+        );
+        const fileHandle = await instanceDir.getFileHandle(`${fileId}.bin`);
         // Zero-copy File backed directly by OPFS disk storage
         const opfsFile = await fileHandle.getFile();
         blobToSave = opfsFile.slice(0, opfsFile.size, safeMime);
@@ -287,6 +418,51 @@ export class OpfsChunkStorageAdapter implements ChunkStoragePort {
     pending.resolve(res);
   }
 
+  private async postWorkerRpc(
+    req: OpfsWorkerRequest,
+    transfer: Transferable[] = [],
+  ): Promise<Extract<OpfsWorkerResponse, { ok: true }>> {
+    if (this.workerError) {
+      throw this.workerError;
+    }
+    const worker = this.worker;
+    if (!worker) {
+      throw new Error("OPFS worker has been closed");
+    }
+
+    return new Promise<Extract<OpfsWorkerResponse, { ok: true }>>(
+      (resolve, reject) => {
+        this.pendingRpcs.set(req.id, { resolve, reject });
+        try {
+          worker.postMessage(req, transfer);
+        } catch (err) {
+          this.pendingRpcs.delete(req.id);
+          const wrapped =
+            err instanceof Error ? err : new Error(String(err));
+          this.handleWorkerFatalError(wrapped);
+          reject(this.workerError ?? wrapped);
+        }
+      },
+    );
+  }
+
+  private async ensureWorkerConfigured(): Promise<void> {
+    if (this.workerConfigured) return;
+    if (!this.workerConfigPromise) {
+      this.workerConfigPromise = this.postWorkerRpc({
+        id: this.nextRpcId++,
+        type: "configure",
+        instanceId: this.instanceId,
+        ...(this.options.maxFallbackBytes !== undefined
+          ? { maxFallbackBytes: this.options.maxFallbackBytes }
+          : {}),
+      }).then(() => {
+        this.workerConfigured = true;
+      });
+    }
+    await this.workerConfigPromise;
+  }
+
   private async sendRpc(
     req: OpfsWorkerRequest,
     transfer: Transferable[] = [],
@@ -299,17 +475,17 @@ export class OpfsChunkStorageAdapter implements ChunkStoragePort {
       return response;
     }
 
-    const worker = this.worker;
-    if (!worker) {
-      // Recreate inline core if called during teardown race, or fail cleanly
+    if (this.workerError) {
+      throw this.workerError;
+    }
+    if (!this.worker) {
       throw new Error("OPFS worker has been closed");
     }
 
-    return new Promise<Extract<OpfsWorkerResponse, { ok: true }>>(
-      (resolve, reject) => {
-        this.pendingRpcs.set(req.id, { resolve, reject });
-        worker.postMessage(req, transfer);
-      },
-    );
+    if (req.type !== "configure" && !this.workerConfigured) {
+      await this.ensureWorkerConfigured();
+    }
+
+    return this.postWorkerRpc(req, transfer);
   }
 }

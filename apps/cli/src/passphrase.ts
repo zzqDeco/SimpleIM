@@ -8,10 +8,64 @@ export interface ReadSecretOptions {
   allowEmpty?: boolean;
 }
 
+interface BufferedLineStreamState {
+  decoder: StringDecoder;
+  buffer: string;
+  ended: boolean;
+}
+
+const bufferedStreamStates = new WeakMap<
+  NodeJS.ReadableStream,
+  BufferedLineStreamState
+>();
+
+function getBufferedStreamState(
+  stream: NodeJS.ReadableStream,
+): BufferedLineStreamState {
+  let state = bufferedStreamStates.get(stream);
+  if (!state) {
+    state = {
+      decoder: new StringDecoder("utf8"),
+      buffer: "",
+      ended: false,
+    };
+    bufferedStreamStates.set(stream, state);
+  }
+  return state;
+}
+
+function stripTrailingCrLf(line: string): string {
+  return line.replace(/\r?\n$/, "").replace(/\r$/, "");
+}
+
 function readSingleLineFromStream(stream: NodeJS.ReadableStream): Promise<string> {
+  const state = getBufferedStreamState(stream);
+
+  const existingNlIdx = state.buffer.indexOf("\n");
+  if (existingNlIdx >= 0) {
+    const line = state.buffer.slice(0, existingNlIdx);
+    state.buffer = state.buffer.slice(existingNlIdx + 1);
+    return Promise.resolve(stripTrailingCrLf(line));
+  }
+
+  const streamAlreadyEnded =
+    state.ended ||
+    Boolean((stream as { readableEnded?: boolean }).readableEnded);
+  if (streamAlreadyEnded) {
+    state.ended = true;
+    state.buffer += state.decoder.end();
+    const nlIdx = state.buffer.indexOf("\n");
+    if (nlIdx >= 0) {
+      const line = state.buffer.slice(0, nlIdx);
+      state.buffer = state.buffer.slice(nlIdx + 1);
+      return Promise.resolve(stripTrailingCrLf(line));
+    }
+    const remainder = state.buffer;
+    state.buffer = "";
+    return Promise.resolve(stripTrailingCrLf(remainder));
+  }
+
   return new Promise<string>((resolve, reject) => {
-    const decoder = new StringDecoder("utf8");
-    let buffer = "";
     let settled = false;
 
     const cleanup = () => {
@@ -27,22 +81,34 @@ function readSingleLineFromStream(stream: NodeJS.ReadableStream): Promise<string
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(line.replace(/\r?\n$/, "").replace(/\r$/, ""));
+      resolve(stripTrailingCrLf(line));
     };
 
     const onData = (chunk: Buffer | string) => {
-      const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
-      buffer += text;
-      const nlIdx = buffer.indexOf("\n");
+      const text =
+        typeof chunk === "string" ? chunk : state.decoder.write(chunk);
+      state.buffer += text;
+      const nlIdx = state.buffer.indexOf("\n");
       if (nlIdx >= 0) {
-        finish(buffer.slice(0, nlIdx));
+        const line = state.buffer.slice(0, nlIdx);
+        state.buffer = state.buffer.slice(nlIdx + 1);
+        finish(line);
       }
     };
 
     const onEnd = () => {
-      buffer += decoder.end();
-      const nlIdx = buffer.indexOf("\n");
-      finish(nlIdx >= 0 ? buffer.slice(0, nlIdx) : buffer);
+      state.ended = true;
+      state.buffer += state.decoder.end();
+      const nlIdx = state.buffer.indexOf("\n");
+      if (nlIdx >= 0) {
+        const line = state.buffer.slice(0, nlIdx);
+        state.buffer = state.buffer.slice(nlIdx + 1);
+        finish(line);
+      } else {
+        const remainder = state.buffer;
+        state.buffer = "";
+        finish(remainder);
+      }
     };
 
     const onError = (err: unknown) => {

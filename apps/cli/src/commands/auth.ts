@@ -180,17 +180,28 @@ export async function runLogoutCommand(
   const creds = await store.load();
 
   if (creds) {
-    const serverUrl = resolveEffectiveServerUrl(
+    const storedUrl = normalizeServerUrl(creds.serverUrl);
+    const targetUrl = resolveEffectiveServerUrl(
       cmd.serverUrl,
       creds.serverUrl,
       io.env,
     );
-    const api = new CliApiClient({ serverUrl, fetchImpl: io.fetchImpl });
+    if (storedUrl !== targetUrl) {
+      throw new Error(
+        `Stored credentials belong to ${storedUrl}, not ${targetUrl}. Omit --server / SIMPLEIM_SERVER_URL or pass --server ${storedUrl} to log out.`,
+      );
+    }
+    const api = new CliApiClient({
+      serverUrl: storedUrl,
+      fetchImpl: io.fetchImpl,
+    });
     try {
       await api.logout(creds.sessionToken);
     } catch {
       // Always remove local credentials even if remote session expired or server is unreachable
     }
+  } else if (cmd.serverUrl || io.env?.SIMPLEIM_SERVER_URL) {
+    resolveEffectiveServerUrl(cmd.serverUrl, undefined, io.env);
   }
 
   const removed = await store.clear();

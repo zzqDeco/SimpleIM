@@ -99,14 +99,30 @@ export function buildSignalingAad(
   );
 }
 
+function resolveMaxCiphertextChars(customMaxFrameBytes?: number): number {
+  if (
+    customMaxFrameBytes === undefined ||
+    customMaxFrameBytes === MAX_SIGNAL_FRAME_BYTES
+  ) {
+    return 40_000;
+  }
+  if (customMaxFrameBytes > MAX_SIGNAL_FRAME_BYTES) {
+    return Math.max(40_000, Math.ceil(customMaxFrameBytes * 1.4));
+  }
+  return Math.max(20, customMaxFrameBytes);
+}
+
 export function parseClientSignalingFrame(
   raw: unknown,
+  options?: { maxFrameBytes?: number },
 ): ClientSignalingFrame {
+  const maxFrameBytes = options?.maxFrameBytes ?? MAX_SIGNAL_FRAME_BYTES;
+  const maxCiphertextChars = resolveMaxCiphertextChars(options?.maxFrameBytes);
   let obj: unknown = raw;
   if (typeof raw === "string") {
-    if (new TextEncoder().encode(raw).byteLength > MAX_SIGNAL_FRAME_BYTES) {
+    if (new TextEncoder().encode(raw).byteLength > maxFrameBytes) {
       throw new ContractValidationError(
-        "Signaling frame exceeds 32 KiB limit",
+        `Signaling frame exceeds ${maxFrameBytes}-byte limit`,
         "payload_too_large",
       );
     }
@@ -134,7 +150,7 @@ export function parseClientSignalingFrame(
           "invalid_frame",
         );
       }
-      if (!isValidEncryptedEnvelope(obj.envelope)) {
+      if (!isValidEncryptedEnvelope(obj.envelope, maxCiphertextChars)) {
         throw new ContractValidationError("Invalid AEAD envelope", "invalid_frame");
       }
       return {
@@ -154,9 +170,21 @@ export function parseClientSignalingFrame(
 
 export function parseServerSignalingFrame(
   raw: unknown,
+  options?: { maxFrameBytes?: number },
 ): ServerSignalingFrame {
+  const maxFrameBytes = options?.maxFrameBytes ?? MAX_SIGNAL_FRAME_BYTES;
+  // Allow 256 bytes of envelope overhead ("signal.deliver" + "fromPeerId") so any
+  // client signal.relay accepted within maxFrameBytes parses cleanly on delivery.
+  const maxDeliverWireBytes = maxFrameBytes + 256;
+  const maxCiphertextChars = resolveMaxCiphertextChars(options?.maxFrameBytes);
   let obj: unknown = raw;
   if (typeof raw === "string") {
+    if (new TextEncoder().encode(raw).byteLength > maxDeliverWireBytes) {
+      throw new ContractValidationError(
+        `Server signaling frame exceeds ${maxFrameBytes}-byte limit`,
+        "payload_too_large",
+      );
+    }
     try {
       obj = JSON.parse(raw);
     } catch {
@@ -198,7 +226,7 @@ export function parseServerSignalingFrame(
       if (
         !isValidRoomIdHex(obj.roomId) ||
         !isValidPeerId(obj.fromPeerId) ||
-        !isValidEncryptedEnvelope(obj.envelope)
+        !isValidEncryptedEnvelope(obj.envelope, maxCiphertextChars)
       ) {
         throw new ContractValidationError("Invalid signal.deliver frame", "invalid_frame");
       }
@@ -237,7 +265,20 @@ export function parseServerSignalingFrame(
 
 export function parseSignalingInnerPayload(
   raw: unknown,
+  options?: { maxFrameBytes?: number },
 ): SignalingInnerPayload {
+  const maxFrameBytes = options?.maxFrameBytes ?? MAX_SIGNAL_FRAME_BYTES;
+  const maxSdpChars =
+    options?.maxFrameBytes === undefined ||
+    maxFrameBytes === MAX_SIGNAL_FRAME_BYTES
+      ? 28_000
+      : maxFrameBytes > MAX_SIGNAL_FRAME_BYTES
+        ? Math.max(28_000, maxFrameBytes)
+        : Math.max(1, maxFrameBytes);
+  const maxIceCandidateChars =
+    maxFrameBytes > MAX_SIGNAL_FRAME_BYTES
+      ? Math.max(4_096, Math.min(16_384, maxFrameBytes))
+      : Math.min(4_096, Math.max(1, maxFrameBytes));
   let obj: unknown = raw;
   if (typeof raw === "string") {
     try {
@@ -252,13 +293,20 @@ export function parseSignalingInnerPayload(
   switch (obj.kind) {
     case "sdp-offer":
     case "sdp-answer": {
-      if (typeof obj.sdp !== "string" || obj.sdp.length < 1 || obj.sdp.length > 28_000) {
+      if (
+        typeof obj.sdp !== "string" ||
+        obj.sdp.length < 1 ||
+        obj.sdp.length > maxSdpChars
+      ) {
         throw new ContractValidationError("Invalid SDP body", "invalid_frame");
       }
       return { kind: obj.kind, sdp: obj.sdp };
     }
     case "ice-candidate": {
-      if (typeof obj.candidate !== "string" || obj.candidate.length > 4_096) {
+      if (
+        typeof obj.candidate !== "string" ||
+        obj.candidate.length > maxIceCandidateChars
+      ) {
         throw new ContractValidationError("Invalid ICE candidate", "invalid_frame");
       }
       const sdpMid =

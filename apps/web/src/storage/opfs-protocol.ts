@@ -5,10 +5,18 @@ import {
 } from "@simpleim/contracts";
 
 export const OPFS_SWARM_DIR_NAME = "simpleim-swarm";
+export const OPFS_INSTANCE_LOCK_PREFIX = "simpleim-opfs-instance:";
+export const MAX_FALLBACK_STORAGE_BYTES = 16 * 1024 * 1024; // 16 MiB cap when OPFS SyncAccessHandle is unavailable
 
 export type OpfsBackendKind = "opfs" | "fallback";
 
 export type OpfsWorkerRequest =
+  | {
+      id: number;
+      type: "configure";
+      instanceId: string;
+      maxFallbackBytes?: number;
+    }
   | {
       id: number;
       type: "initReceivingFile";
@@ -61,7 +69,12 @@ export type OpfsWorkerResponse =
   | {
       id: number;
       ok: true;
-      type: "writeVerifiedChunk" | "finalizeFile" | "deleteFile" | "closeAll";
+      type:
+        | "configure"
+        | "writeVerifiedChunk"
+        | "finalizeFile"
+        | "deleteFile"
+        | "closeAll";
     }
   | {
       id: number;
@@ -108,10 +121,31 @@ export interface OpfsDirectoryHandleLike {
     name: string,
     options?: { recursive?: boolean },
   ): Promise<void>;
+  keys?: () => AsyncIterable<string>;
+  entries?: () => AsyncIterable<[string, unknown]>;
+  [Symbol.asyncIterator]?: () => AsyncIterator<[string, unknown]>;
 }
 
 export interface OpfsStorageNavigatorLike {
   getDirectory?: () => Promise<OpfsDirectoryHandleLike>;
+}
+
+export interface WebLockRequestOptions {
+  mode?: "exclusive" | "shared";
+  ifAvailable?: boolean;
+}
+
+export interface WebLocksLike {
+  request<T>(
+    name: string,
+    options: WebLockRequestOptions,
+    callback: (lock: object | null) => Promise<T> | T,
+  ): Promise<T>;
+}
+
+export interface HeldInstanceLock {
+  readonly ready: Promise<void>;
+  release(): Promise<void>;
 }
 
 interface OpfsFileEntry {
@@ -139,10 +173,137 @@ type ManagedFileEntry = OpfsFileEntry | FallbackFileEntry;
 
 const SAFE_FILE_ID_RE = /^[a-zA-Z0-9_-]{4,80}$/;
 
-function assertValidStorageFileId(fileId: string): void {
+export function assertValidStorageFileId(fileId: string): void {
   if (!SAFE_FILE_ID_RE.test(fileId)) {
     throw new Error(`Unsafe storage fileId: ${fileId}`);
   }
+}
+
+export function defaultWebLocksProvider(): WebLocksLike | undefined {
+  if (typeof navigator !== "undefined" && "locks" in navigator) {
+    return (navigator as unknown as { locks?: WebLocksLike }).locks;
+  }
+  return undefined;
+}
+
+export function acquireSharedInstanceLock(
+  locks: WebLocksLike | undefined,
+  instanceId: string,
+): HeldInstanceLock | null {
+  if (!locks || typeof locks.request !== "function") {
+    return null;
+  }
+  let markReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+  let releaseHold!: () => void;
+  const holdPromise = new Promise<void>((resolve) => {
+    releaseHold = resolve;
+  });
+  let released = false;
+
+  const requestDone = Promise.resolve(
+    locks.request(
+      `${OPFS_INSTANCE_LOCK_PREFIX}${instanceId}`,
+      { mode: "shared" },
+      async () => {
+        markReady();
+        await holdPromise;
+      },
+    ),
+  ).catch(() => {
+    markReady();
+  });
+
+  return {
+    ready,
+    async release(): Promise<void> {
+      if (!released) {
+        released = true;
+        markReady();
+        releaseHold();
+      }
+      await requestDone;
+    },
+  };
+}
+
+export async function listOpfsDirectoryNames(
+  dir: OpfsDirectoryHandleLike,
+): Promise<string[]> {
+  const names: string[] = [];
+  try {
+    if (typeof dir.keys === "function") {
+      for await (const name of dir.keys()) {
+        if (typeof name === "string") {
+          names.push(name);
+        }
+      }
+      return names;
+    }
+    if (typeof dir.entries === "function") {
+      for await (const [name] of dir.entries()) {
+        if (typeof name === "string") {
+          names.push(name);
+        }
+      }
+      return names;
+    }
+    if (typeof dir[Symbol.asyncIterator] === "function") {
+      for await (const [name] of dir as unknown as AsyncIterable<
+        [string, unknown]
+      >) {
+        if (typeof name === "string") {
+          names.push(name);
+        }
+      }
+    }
+  } catch {
+    // Ignore directory iteration errors in unsupported environments
+  }
+  return names;
+}
+
+export async function reclaimAbandonedOpfsInstances(
+  swarmRoot: OpfsDirectoryHandleLike,
+  selfInstanceId: string,
+  locks: WebLocksLike | undefined,
+): Promise<string[]> {
+  if (!locks || typeof locks.request !== "function") {
+    return [];
+  }
+  const names = await listOpfsDirectoryNames(swarmRoot);
+  const reclaimed: string[] = [];
+  for (const candidateId of names) {
+    if (
+      candidateId === selfInstanceId ||
+      !SAFE_FILE_ID_RE.test(candidateId)
+    ) {
+      continue;
+    }
+    try {
+      await locks.request(
+        `${OPFS_INSTANCE_LOCK_PREFIX}${candidateId}`,
+        { mode: "exclusive", ifAvailable: true },
+        async (lock) => {
+          if (!lock) {
+            // Live tab or worker holds a shared lock on candidateId — preserve it!
+            return;
+          }
+          try {
+            await swarmRoot.removeEntry(candidateId, { recursive: true });
+            reclaimed.push(candidateId);
+          } catch {
+            // Ignore NotFoundError or active handle race
+          }
+        },
+      );
+    } catch {
+      // Ignore lock manager errors
+    }
+  }
+  return reclaimed;
 }
 
 export function toExactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -158,20 +319,111 @@ export function toExactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return copy.buffer;
 }
 
+export function generateStorageInstanceId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `inst_${Math.random().toString(36).slice(2, 12)}_${Date.now()}`;
+}
+
+export interface OpfsWorkerStorageOptions {
+  storageProvider?: () => OpfsStorageNavigatorLike | undefined;
+  locksProvider?: () => WebLocksLike | undefined;
+  instanceId?: string;
+  maxFallbackBytes?: number;
+}
+
 export class OpfsWorkerStorageCore {
   private readonly entries = new Map<string, ManagedFileEntry>();
-  private rootDir: OpfsDirectoryHandleLike | null = null;
+  private swarmRootDir: OpfsDirectoryHandleLike | null = null;
   private swarmDir: OpfsDirectoryHandleLike | null = null;
+  private instanceLock: HeldInstanceLock | null = null;
   private opfsSupported: boolean | null = null;
   private readonly storageProvider: () => OpfsStorageNavigatorLike | undefined;
+  private readonly locksProvider: () => WebLocksLike | undefined;
+  private instanceId: string;
+  private maxFallbackBytes: number;
 
-  constructor(storageProvider?: () => OpfsStorageNavigatorLike | undefined) {
+  constructor(
+    optionsOrProvider?:
+      | (() => OpfsStorageNavigatorLike | undefined)
+      | OpfsWorkerStorageOptions,
+  ) {
+    const opts: OpfsWorkerStorageOptions =
+      typeof optionsOrProvider === "function"
+        ? { storageProvider: optionsOrProvider }
+        : (optionsOrProvider ?? {});
     this.storageProvider =
-      storageProvider ??
+      opts.storageProvider ??
       (() =>
         typeof navigator !== "undefined"
           ? (navigator.storage as unknown as OpfsStorageNavigatorLike | undefined)
           : undefined);
+    this.locksProvider = opts.locksProvider ?? defaultWebLocksProvider;
+    const candidateInstanceId = opts.instanceId ?? generateStorageInstanceId();
+    assertValidStorageFileId(candidateInstanceId);
+    this.instanceId = candidateInstanceId;
+    this.maxFallbackBytes = this.normalizeMaxFallbackBytes(
+      opts.maxFallbackBytes,
+    );
+  }
+
+  getInstanceId(): string {
+    return this.instanceId;
+  }
+
+  configure(params: { instanceId: string; maxFallbackBytes?: number }): void {
+    assertValidStorageFileId(params.instanceId);
+    if (this.entries.size === 0 && !this.swarmDir) {
+      this.instanceId = params.instanceId;
+    }
+    if (params.maxFallbackBytes !== undefined) {
+      this.maxFallbackBytes = this.normalizeMaxFallbackBytes(
+        params.maxFallbackBytes,
+      );
+    }
+  }
+
+  private normalizeMaxFallbackBytes(value?: number): number {
+    if (value === undefined) {
+      return MAX_FALLBACK_STORAGE_BYTES;
+    }
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error("maxFallbackBytes must be a non-negative finite number");
+    }
+    return Math.floor(value);
+  }
+
+  private getFallbackReservedBytes(excludeFileId?: string): number {
+    let total = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.kind !== "fallback" || entry.fileId === excludeFileId) {
+        continue;
+      }
+      let storedBytes = 0;
+      for (const chunk of entry.chunks.values()) {
+        storedBytes += chunk.byteLength;
+      }
+      total += Math.max(entry.fileSize, storedBytes);
+    }
+    return total;
+  }
+
+  private getFallbackStoredChunkBytes(
+    excludeFileId?: string,
+    excludeChunkIndex?: number,
+  ): number {
+    let total = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.kind !== "fallback") continue;
+      for (const [idx, chunk] of entry.chunks.entries()) {
+        if (entry.fileId === excludeFileId && idx === excludeChunkIndex) {
+          continue;
+        }
+        total += chunk.byteLength;
+      }
+    }
+    return total;
   }
 
   async dispatch(
@@ -179,6 +431,23 @@ export class OpfsWorkerStorageCore {
   ): Promise<{ response: OpfsWorkerResponse; transfer: Transferable[] }> {
     try {
       switch (req.type) {
+        case "configure": {
+          this.configure({
+            instanceId: req.instanceId,
+            ...(req.maxFallbackBytes !== undefined
+              ? { maxFallbackBytes: req.maxFallbackBytes }
+              : {}),
+          });
+          return {
+            response: {
+              id: req.id,
+              ok: true,
+              type: "configure",
+            },
+            transfer: [],
+          };
+        }
+
         case "initReceivingFile": {
           const { bitfield, backend } = await this.initReceivingFile(
             req.fileId,
@@ -309,14 +578,28 @@ export class OpfsWorkerStorageCore {
       return null;
     }
     try {
+      const locks = this.locksProvider();
+      if (!this.instanceLock) {
+        this.instanceLock = acquireSharedInstanceLock(locks, this.instanceId);
+      }
+      await this.instanceLock?.ready;
+
       const root = await storage.getDirectory();
-      const dir = await root.getDirectoryHandle(OPFS_SWARM_DIR_NAME, {
+      const swarmRoot = await root.getDirectoryHandle(OPFS_SWARM_DIR_NAME, {
         create: true,
       });
-      this.rootDir = root;
-      this.swarmDir = dir;
-      return dir;
+      const instanceDir = await swarmRoot.getDirectoryHandle(this.instanceId, {
+        create: true,
+      });
+      this.swarmRootDir = swarmRoot;
+      this.swarmDir = instanceDir;
+
+      await reclaimAbandonedOpfsInstances(swarmRoot, this.instanceId, locks);
+      return instanceDir;
     } catch {
+      const lock = this.instanceLock;
+      this.instanceLock = null;
+      await lock?.release();
       this.opfsSupported = false;
       return null;
     }
@@ -377,6 +660,16 @@ export class OpfsWorkerStorageCore {
       }
     }
 
+    const reservedBytes = this.getFallbackReservedBytes(fileId);
+    if (
+      fileSize > this.maxFallbackBytes ||
+      reservedBytes + fileSize > this.maxFallbackBytes
+    ) {
+      throw new Error(
+        `OPFS SyncAccessHandle is unavailable and file size (${fileSize} B) exceeds in-memory fallback cap (${this.maxFallbackBytes} B)`,
+      );
+    }
+
     const fallbackEntry: FallbackFileEntry = {
       kind: "fallback",
       fileId,
@@ -418,6 +711,15 @@ export class OpfsWorkerStorageCore {
       }
       handle.flush();
     } else {
+      const storedElsewhere = this.getFallbackStoredChunkBytes(
+        fileId,
+        chunkIndex,
+      );
+      if (storedElsewhere + data.byteLength > this.maxFallbackBytes) {
+        throw new Error(
+          `In-memory fallback storage cap (${this.maxFallbackBytes} B) exceeded`,
+        );
+      }
       const copy = new Uint8Array(data.byteLength);
       copy.set(data);
       entry.chunks.set(chunkIndex, copy);
@@ -561,44 +863,53 @@ export class OpfsWorkerStorageCore {
   }
 
   async closeAll(): Promise<void> {
-    const fileIds = Array.from(this.entries.keys());
-    for (const fileId of fileIds) {
-      const entry = this.entries.get(fileId);
-      if (!entry) continue;
-      if (entry.kind === "opfs") {
-        if (entry.accessHandle) {
-          try {
-            entry.accessHandle.close();
-          } catch {
-            // Ignore close errors
-          }
-          entry.accessHandle = null;
-        }
-      } else {
-        for (const chunk of entry.chunks.values()) {
-          chunk.fill(0);
-        }
-        entry.chunks.clear();
-      }
-    }
-    this.entries.clear();
-
-    if (this.swarmDir) {
+    try {
+      const fileIds = Array.from(this.entries.keys());
       for (const fileId of fileIds) {
-        try {
-          await this.swarmDir.removeEntry(`${fileId}.bin`);
-        } catch {
-          // Ignore individual file removal error
+        const entry = this.entries.get(fileId);
+        if (!entry) continue;
+        if (entry.kind === "opfs") {
+          if (entry.accessHandle) {
+            try {
+              entry.accessHandle.close();
+            } catch {
+              // Ignore close errors
+            }
+            entry.accessHandle = null;
+          }
+        } else {
+          for (const chunk of entry.chunks.values()) {
+            chunk.fill(0);
+          }
+          entry.chunks.clear();
         }
       }
-    }
-    if (this.rootDir) {
-      try {
-        await this.rootDir.removeEntry(OPFS_SWARM_DIR_NAME, { recursive: true });
-      } catch {
-        // Ignore if directory already empty/removed
+      this.entries.clear();
+
+      if (this.swarmDir) {
+        for (const fileId of fileIds) {
+          try {
+            await this.swarmDir.removeEntry(`${fileId}.bin`);
+          } catch {
+            // Ignore individual file removal error
+          }
+        }
       }
+      if (this.swarmRootDir) {
+        try {
+          await this.swarmRootDir.removeEntry(this.instanceId, {
+            recursive: true,
+          });
+        } catch {
+          // Ignore if instance directory already empty/removed
+        }
+      }
+      this.swarmDir = null;
+      this.swarmRootDir = null;
+    } finally {
+      const lock = this.instanceLock;
+      this.instanceLock = null;
+      await lock?.release();
     }
-    this.swarmDir = null;
   }
 }

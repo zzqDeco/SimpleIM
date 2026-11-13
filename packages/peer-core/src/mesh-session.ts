@@ -31,6 +31,7 @@ import type {
 import type { VerifiedSwarmPeerLink } from "./swarm-scheduler.ts";
 
 const PRESENCE_PING_INTERVAL_MS = 15_000;
+const PRE_OPEN_CONNECT_TIMEOUT_MS = 30_000;
 const MAX_BUFFERED_ICE_PER_PEER = 128;
 const MAX_EARLY_ICE_PEERS = 32;
 
@@ -64,6 +65,7 @@ export interface MeshSessionManagerOptions {
   iceServers: IceServerConfig[];
   transportFactory: PeerTransportFactoryPort;
   helloAuthTimeoutMs?: number;
+  maxSignalPayloadBytes?: number;
   now: () => number;
   events?: RoomPeerEngineEvents;
   callbacks: MeshSessionCallbacks;
@@ -89,6 +91,7 @@ interface PeerSession {
   remoteCert: PeerIdentityCert | null;
   rttMs: number | null;
   connectedAt: number;
+  connectTimer: TimerHandle | null;
   helloAuthTimer: TimerHandle | null;
   pingInterval: IntervalHandle | null;
 }
@@ -102,6 +105,7 @@ export class MeshSessionManager {
   private readonly iceServers: IceServerConfig[];
   private readonly transportFactory: PeerTransportFactoryPort;
   private readonly helloAuthTimeoutMs: number;
+  private readonly maxSignalPayloadBytes?: number;
   private readonly now: () => number;
   private readonly events?: RoomPeerEngineEvents;
   private readonly callbacks: MeshSessionCallbacks;
@@ -120,6 +124,7 @@ export class MeshSessionManager {
     this.transportFactory = options.transportFactory;
     this.helloAuthTimeoutMs =
       options.helloAuthTimeoutMs ?? HELLO_AUTH_TIMEOUT_MS;
+    this.maxSignalPayloadBytes = options.maxSignalPayloadBytes;
     this.now = options.now;
     this.events = options.events;
     this.callbacks = options.callbacks;
@@ -185,6 +190,9 @@ export class MeshSessionManager {
         fromPeerId,
         this.localPeerId,
         envelope,
+        this.maxSignalPayloadBytes !== undefined
+          ? { maxFrameBytes: this.maxSignalPayloadBytes }
+          : undefined,
       );
     } catch {
       // Attacker or wrong room key: safely drop frame without crashing or affecting state
@@ -299,6 +307,10 @@ export class MeshSessionManager {
     for (const session of active) {
       session.closed = true;
       session.verified = false;
+      if (session.connectTimer !== null) {
+        clearTimeout(session.connectTimer);
+        session.connectTimer = null;
+      }
       if (session.helloAuthTimer !== null) {
         clearTimeout(session.helloAuthTimer);
         session.helloAuthTimer = null;
@@ -364,17 +376,27 @@ export class MeshSessionManager {
       remoteCert: null,
       rttMs: null,
       connectedAt: 0,
+      connectTimer: null,
       helloAuthTimer: null,
       pingInterval: null,
     };
 
     this.sessions.set(remotePeerId, session);
 
-    session.helloAuthTimer = setTimeout(() => {
-      if (!this.stopped && !session.closed && !session.verified) {
-        this.rejectSessionAuth(session, "hello_auth_timeout");
+    const preOpenTimeoutMs = Math.max(
+      PRE_OPEN_CONNECT_TIMEOUT_MS,
+      this.helloAuthTimeoutMs * 3,
+    );
+    session.connectTimer = setTimeout(() => {
+      if (
+        !this.stopped &&
+        !session.closed &&
+        !session.verified &&
+        session.pc.controlChannel.readyState !== "open"
+      ) {
+        this.closeSession(session);
       }
-    }, this.helloAuthTimeoutMs);
+    }, preOpenTimeoutMs);
 
     this.attachPeerConnectionHandlers(session);
     return session;
@@ -625,6 +647,17 @@ export class MeshSessionManager {
 
   private handleControlChannelOpen(session: PeerSession): void {
     if (this.stopped || session.closed) return;
+    if (session.connectTimer !== null) {
+      clearTimeout(session.connectTimer);
+      session.connectTimer = null;
+    }
+    if (session.helloAuthTimer === null && !session.verified) {
+      session.helloAuthTimer = setTimeout(() => {
+        if (!this.stopped && !session.closed && !session.verified) {
+          this.rejectSessionAuth(session, "hello_auth_timeout");
+        }
+      }, this.helloAuthTimeoutMs);
+    }
     this.sendChallengeIfReady(session);
     this.sendProveIfReady(session);
     this.maybePromoteSession(session);
@@ -823,6 +856,10 @@ export class MeshSessionManager {
     session.verified = true;
     session.connectedAt = this.now();
 
+    if (session.connectTimer !== null) {
+      clearTimeout(session.connectTimer);
+      session.connectTimer = null;
+    }
     if (session.helloAuthTimer !== null) {
       clearTimeout(session.helloAuthTimer);
       session.helloAuthTimer = null;
@@ -866,6 +903,10 @@ export class MeshSessionManager {
     session.closed = true;
     session.verified = false;
 
+    if (session.connectTimer !== null) {
+      clearTimeout(session.connectTimer);
+      session.connectTimer = null;
+    }
     if (session.helloAuthTimer !== null) {
       clearTimeout(session.helloAuthTimer);
       session.helloAuthTimer = null;

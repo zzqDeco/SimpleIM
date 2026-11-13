@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -15,11 +16,14 @@ import {
   countChunksInBitfield,
   createBitfield,
   hasChunkInBitfield,
+  MAX_SWARM_FILE_CHUNKS,
   sanitizeFileName,
   setChunkInBitfield,
   SWARM_CHUNK_SIZE,
+  uuidToBytes16,
   type FileManifest,
 } from "@simpleim/contracts";
+import { hexToBytes, verifyChunkSha256 } from "@simpleim/crypto";
 import type { ChunkStoragePort } from "@simpleim/peer-core";
 
 export class StorageQuotaExceededError extends Error {
@@ -72,6 +76,111 @@ function splitStemAndExt(safeName: string): { stem: string; ext: string } {
     stem: safeName.slice(0, lastDot),
     ext: safeName.slice(lastDot),
   };
+}
+
+const BITFIELD_MAGIC = new Uint8Array([
+  0x53, 0x49, 0x4d, 0x42, 0x46, 0x30, 0x31, 0x00,
+]); // "SIMBF01\0"
+const BITFIELD_HEADER_BYTES = 8 + 16 + 32 + 32; // 88 bytes: magic + fileId(16) + roomId(32) + fileSha256(32)
+const MAX_BITFIELD_SIDECAR_BYTES =
+  BITFIELD_HEADER_BYTES + Math.ceil(MAX_SWARM_FILE_CHUNKS / 8);
+const MAX_FILENAME_UTF8_BYTES = 255;
+const LONGEST_PARTIAL_SUFFIX_BYTES = ".simpleim.bitfield.tmp".length; // 22 bytes
+const STREAM_HASH_BLOCK_BYTES = 256 * 1024;
+
+function truncateUtf8ByBytes(input: string, maxBytes: number): string {
+  const encoder = new TextEncoder();
+  if (encoder.encode(input).byteLength <= maxBytes) {
+    return input;
+  }
+  let acc = "";
+  let usedBytes = 0;
+  for (const ch of input) {
+    const chBytes = encoder.encode(ch).byteLength;
+    if (usedBytes + chBytes > maxBytes) {
+      break;
+    }
+    acc += ch;
+    usedBytes += chBytes;
+  }
+  return acc.length > 0 ? acc : "file";
+}
+
+function buildBitfieldHeader(manifest: FileManifest): Uint8Array {
+  const header = new Uint8Array(BITFIELD_HEADER_BYTES);
+  header.set(BITFIELD_MAGIC, 0);
+  header.set(uuidToBytes16(manifest.fileId), 8);
+  header.set(hexToBytes(manifest.roomId), 24);
+  header.set(hexToBytes(manifest.fileSha256), 56);
+  return header;
+}
+
+function encodeBitfieldSidecar(
+  manifest: FileManifest,
+  bitfield: Uint8Array,
+): Uint8Array {
+  const header = buildBitfieldHeader(manifest);
+  const out = new Uint8Array(BITFIELD_HEADER_BYTES + bitfield.byteLength);
+  out.set(header, 0);
+  out.set(bitfield, BITFIELD_HEADER_BYTES);
+  return out;
+}
+
+function hasBitfieldMagic(raw: Uint8Array): boolean {
+  if (raw.byteLength < BITFIELD_MAGIC.byteLength) return false;
+  for (let i = 0; i < BITFIELD_MAGIC.byteLength; i++) {
+    if (raw[i] !== BITFIELD_MAGIC[i]) return false;
+  }
+  return true;
+}
+
+function matchesBitfieldHeader(
+  raw: Uint8Array,
+  manifest: FileManifest,
+): boolean {
+  if (raw.byteLength < BITFIELD_HEADER_BYTES) return false;
+  let expected: Uint8Array;
+  try {
+    expected = buildBitfieldHeader(manifest);
+  } catch {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < BITFIELD_HEADER_BYTES; i++) {
+    diff |= (raw[i] ?? 0) ^ (expected[i] ?? 0);
+  }
+  return diff === 0;
+}
+
+async function computeFileHandleSha256Hex(
+  fh: FileHandle,
+  totalBytes: number,
+): Promise<string> {
+  const hasher = createHash("sha256");
+  if (totalBytes === 0) {
+    return hasher.digest("hex");
+  }
+  const buf = new Uint8Array(Math.min(STREAM_HASH_BLOCK_BYTES, totalBytes));
+  let offset = 0;
+  while (offset < totalBytes) {
+    const toRead = Math.min(buf.byteLength, totalBytes - offset);
+    const { bytesRead } = await fh.read(buf, 0, toRead, offset);
+    if (bytesRead <= 0) {
+      throw new Error(
+        `Unexpected EOF verifying finalized file at offset ${offset} (expected ${totalBytes} B)`,
+      );
+    }
+    hasher.update(buf.subarray(0, bytesRead));
+    offset += bytesRead;
+  }
+  return hasher.digest("hex");
+}
+
+function clearBitInBitfield(bitfield: Uint8Array, chunkIndex: number): void {
+  const byteIdx = chunkIndex >>> 3;
+  if (byteIdx < 0 || byteIdx >= bitfield.byteLength) return;
+  const mask = ~(0x80 >>> (chunkIndex & 7)) & 0xff;
+  bitfield[byteIdx] = (bitfield[byteIdx] ?? 0) & mask;
 }
 
 function maskUnusedTrailingBits(
@@ -151,6 +260,16 @@ export class FsChunkStorageAdapter implements ChunkStoragePort {
   readonly maxStorageBytes?: number;
 
   private readonly records = new Map<string, StoredFileRecord>();
+  private fsAllocQueue: Promise<void> = Promise.resolve();
+
+  private withFsAllocLock<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.fsAllocQueue.then(fn, fn);
+    this.fsAllocQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
 
   constructor(options: FsChunkStorageOptions) {
     this.downloadDir = resolve(options.downloadDir);
@@ -180,6 +299,25 @@ export class FsChunkStorageAdapter implements ChunkStoragePort {
     return candidate;
   }
 
+  private async isSidecarHeaderFile(filePath: string): Promise<boolean> {
+    let fh: FileHandle | null = null;
+    try {
+      fh = await open(filePath, "r");
+      const magicBuf = new Uint8Array(BITFIELD_MAGIC.byteLength);
+      const { bytesRead } = await fh.read(
+        magicBuf,
+        0,
+        BITFIELD_MAGIC.byteLength,
+        0,
+      );
+      return bytesRead === BITFIELD_MAGIC.byteLength && hasBitfieldMagic(magicBuf);
+    } catch {
+      return false;
+    } finally {
+      await fh?.close().catch(() => {});
+    }
+  }
+
   async getUsedPayloadBytes(excludePartPath?: string): Promise<number> {
     let entries: string[];
     try {
@@ -191,20 +329,69 @@ export class FsChunkStorageAdapter implements ChunkStoragePort {
       throw err;
     }
 
+    const activeMetadataPaths = new Set<string>();
+    const finalizedPayloadPaths = new Set<string>();
+    for (const rec of this.records.values()) {
+      if (rec.kind === "receiving") {
+        activeMetadataPaths.add(rec.bitfieldPath);
+        activeMetadataPaths.add(`${rec.bitfieldPath}.tmp`);
+      } else if (rec.kind === "finalized") {
+        finalizedPayloadPaths.add(rec.finalPath);
+      }
+    }
+
+    const entrySet = new Set(entries);
     let total = 0;
     for (const name of entries) {
-      if (name.endsWith(".simpleim.bitfield") || name.endsWith(".bitfield.tmp")) {
-        continue;
-      }
       const fullPath = join(this.downloadDir, name);
       if (excludePartPath && fullPath === excludePartPath) {
         continue;
       }
+      if (activeMetadataPaths.has(fullPath)) {
+        continue;
+      }
+
       try {
         const st = await stat(fullPath);
-        if (st.isFile()) {
-          total += st.size;
+        if (!st.isFile()) {
+          continue;
         }
+
+        if (!finalizedPayloadPaths.has(fullPath)) {
+          if (
+            name.endsWith(".simpleim.bitfield") &&
+            st.size >= BITFIELD_HEADER_BYTES &&
+            st.size <= MAX_BITFIELD_SIDECAR_BYTES
+          ) {
+            const stem = name.slice(0, -".simpleim.bitfield".length);
+            const adjacentPartName = `${stem}.simpleim.part`;
+            const adjacentPartPath = join(this.downloadDir, adjacentPartName);
+            if (
+              entrySet.has(adjacentPartName) &&
+              !finalizedPayloadPaths.has(adjacentPartPath) &&
+              (await this.isSidecarHeaderFile(fullPath))
+            ) {
+              continue;
+            }
+          } else if (
+            name.endsWith(".simpleim.bitfield.tmp") &&
+            st.size >= BITFIELD_HEADER_BYTES &&
+            st.size <= MAX_BITFIELD_SIDECAR_BYTES
+          ) {
+            const stem = name.slice(0, -".simpleim.bitfield.tmp".length);
+            const adjacentPartName = `${stem}.simpleim.part`;
+            const adjacentPartPath = join(this.downloadDir, adjacentPartName);
+            if (
+              entrySet.has(adjacentPartName) &&
+              !finalizedPayloadPaths.has(adjacentPartPath) &&
+              (await this.isSidecarHeaderFile(fullPath))
+            ) {
+              continue;
+            }
+          }
+        }
+
+        total += st.size;
       } catch {
         // Ignore concurrently removed transient files
       }
@@ -217,7 +404,185 @@ export class FsChunkStorageAdapter implements ChunkStoragePort {
     return rec?.kind === "finalized" ? rec.finalPath : undefined;
   }
 
+  private isOwnedByOtherRecord(
+    partPath: string,
+    bitfieldPath: string,
+    fileId: string,
+  ): boolean {
+    for (const [id, rec] of this.records.entries()) {
+      if (id === fileId) continue;
+      if (rec.kind === "receiving") {
+        if (
+          rec.partPath === partPath ||
+          rec.bitfieldPath === bitfieldPath ||
+          rec.partPath === bitfieldPath ||
+          rec.bitfieldPath === partPath
+        ) {
+          return true;
+        }
+      } else if (rec.kind === "finalized") {
+        if (rec.finalPath === partPath || rec.finalPath === bitfieldPath) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private async inspectCandidatePair(
+    partPath: string,
+    bitfieldPath: string,
+    manifest: FileManifest,
+    expectedBitfieldBytes: number,
+  ): Promise<
+    | { state: "free" }
+    | { state: "resumable"; bitfield: Uint8Array }
+    | { state: "collision" }
+  > {
+    if (this.isOwnedByOtherRecord(partPath, bitfieldPath, manifest.fileId)) {
+      return { state: "collision" };
+    }
+
+    const [partExists, bfExists, tmpExists] = await Promise.all([
+      pathExistsAny(partPath),
+      pathExistsAny(bitfieldPath),
+      pathExistsAny(`${bitfieldPath}.tmp`),
+    ]);
+
+    if (!partExists && !bfExists && !tmpExists) {
+      return { state: "free" };
+    }
+
+    if (partExists && bfExists) {
+      try {
+        const [partStat, rawBf] = await Promise.all([
+          stat(partPath),
+          readFile(bitfieldPath),
+        ]);
+        if (
+          partStat.isFile() &&
+          matchesBitfieldHeader(rawBf, manifest) &&
+          partStat.size === manifest.fileSize &&
+          rawBf.byteLength === BITFIELD_HEADER_BYTES + expectedBitfieldBytes
+        ) {
+          const bf = rawBf.slice(BITFIELD_HEADER_BYTES);
+          maskUnusedTrailingBits(bf, manifest.totalChunks);
+          return { state: "resumable", bitfield: bf };
+        }
+      } catch {
+        // Fall through to collision
+      }
+    }
+
+    return { state: "collision" };
+  }
+
+  private async selectReceivingPaths(
+    safeName: string,
+    manifest: FileManifest,
+    expectedBitfieldBytes: number,
+  ): Promise<{
+    partPath: string;
+    bitfieldPath: string;
+    resumedBitfield: Uint8Array | null;
+  }> {
+    const maxBaseBytes = MAX_FILENAME_UTF8_BYTES - LONGEST_PARTIAL_SUFFIX_BYTES; // 233 bytes
+    const primaryBase = truncateUtf8ByBytes(safeName, maxBaseBytes);
+    const primaryPart = this.resolveSafeChildPath(
+      `${primaryBase}.simpleim.part`,
+    );
+    const primaryBf = this.resolveSafeChildPath(
+      `${primaryBase}.simpleim.bitfield`,
+    );
+
+    const primaryCheck = await this.inspectCandidatePair(
+      primaryPart,
+      primaryBf,
+      manifest,
+      expectedBitfieldBytes,
+    );
+    if (primaryCheck.state === "free") {
+      return {
+        partPath: primaryPart,
+        bitfieldPath: primaryBf,
+        resumedBitfield: null,
+      };
+    }
+    if (primaryCheck.state === "resumable") {
+      return {
+        partPath: primaryPart,
+        bitfieldPath: primaryBf,
+        resumedBitfield: primaryCheck.bitfield,
+      };
+    }
+
+    // Disambiguate using the FULL manifest.fileId (never a truncated prefix!)
+    const idSuffix = `.${manifest.fileId}`;
+    const idBasePrefix = truncateUtf8ByBytes(
+      safeName,
+      maxBaseBytes - idSuffix.length,
+    );
+    const idBase = `${idBasePrefix}${idSuffix}`;
+    const idPart = this.resolveSafeChildPath(`${idBase}.simpleim.part`);
+    const idBf = this.resolveSafeChildPath(`${idBase}.simpleim.bitfield`);
+    const idCheck = await this.inspectCandidatePair(
+      idPart,
+      idBf,
+      manifest,
+      expectedBitfieldBytes,
+    );
+    if (idCheck.state === "free") {
+      return { partPath: idPart, bitfieldPath: idBf, resumedBitfield: null };
+    }
+    if (idCheck.state === "resumable") {
+      return {
+        partPath: idPart,
+        bitfieldPath: idBf,
+        resumedBitfield: idCheck.bitfield,
+      };
+    }
+
+    for (let counter = 1; counter <= 10_000; counter++) {
+      const numberedSuffix = `.${manifest.fileId}.${counter}`;
+      const numberedPrefix = truncateUtf8ByBytes(
+        safeName,
+        maxBaseBytes - numberedSuffix.length,
+      );
+      const numberedBase = `${numberedPrefix}${numberedSuffix}`;
+      const partPath = this.resolveSafeChildPath(
+        `${numberedBase}.simpleim.part`,
+      );
+      const bitfieldPath = this.resolveSafeChildPath(
+        `${numberedBase}.simpleim.bitfield`,
+      );
+      const check = await this.inspectCandidatePair(
+        partPath,
+        bitfieldPath,
+        manifest,
+        expectedBitfieldBytes,
+      );
+      if (check.state === "free") {
+        return { partPath, bitfieldPath, resumedBitfield: null };
+      }
+      if (check.state === "resumable") {
+        return {
+          partPath,
+          bitfieldPath,
+          resumedBitfield: check.bitfield,
+        };
+      }
+    }
+
+    throw new Error("Unable to allocate non-colliding partial file path");
+  }
+
   async initReceivingFile(
+    manifest: FileManifest,
+  ): Promise<{ existingBitfield: Uint8Array }> {
+    return this.withFsAllocLock(() => this.initReceivingFileLocked(manifest));
+  }
+
+  private async initReceivingFileLocked(
     manifest: FileManifest,
   ): Promise<{ existingBitfield: Uint8Array }> {
     const safeName = sanitizeFileName(manifest.fileName);
@@ -238,18 +603,9 @@ export class FsChunkStorageAdapter implements ChunkStoragePort {
 
     await mkdir(this.downloadDir, { recursive: true });
 
-    // Disambiguate if another active download in the same session already owns <safeName>.simpleim.part
-    const activePartCollision = Array.from(this.records.values()).some(
-      (r) => r.kind === "receiving" && r.safeName === safeName,
-    );
-    const partBaseName = activePartCollision
-      ? `${safeName}.${manifest.fileId.slice(0, 8)}`
-      : safeName;
-
-    const partPath = this.resolveSafeChildPath(`${partBaseName}.simpleim.part`);
-    const bitfieldPath = this.resolveSafeChildPath(
-      `${partBaseName}.simpleim.bitfield`,
-    );
+    const expectedBitfieldBytes = Math.ceil(manifest.totalChunks / 8);
+    const { partPath, bitfieldPath, resumedBitfield } =
+      await this.selectReceivingPaths(safeName, manifest, expectedBitfieldBytes);
 
     if (this.maxStorageBytes !== undefined) {
       const currentUsed = await this.getUsedPayloadBytes(partPath);
@@ -260,40 +616,63 @@ export class FsChunkStorageAdapter implements ChunkStoragePort {
       }
     }
 
-    const expectedBitfieldBytes = Math.ceil(manifest.totalChunks / 8);
-
-    let resumedBitfield: Uint8Array | null = null;
-    try {
-      const [partStat, rawBf] = await Promise.all([
-        stat(partPath),
-        readFile(bitfieldPath),
-      ]);
-      if (
-        partStat.isFile() &&
-        partStat.size === manifest.fileSize &&
-        rawBf.byteLength === expectedBitfieldBytes
-      ) {
-        const bf = new Uint8Array(rawBf.byteLength);
-        bf.set(rawBf);
-        maskUnusedTrailingBits(bf, manifest.totalChunks);
-        resumedBitfield = bf;
-      }
-    } catch {
-      resumedBitfield = null;
-    }
-
     let fileHandle: FileHandle;
     let bitfield: Uint8Array;
 
     if (resumedBitfield !== null) {
       fileHandle = await open(partPath, "r+");
       bitfield = resumedBitfield;
+
+      // Re-verify resumed on-disk chunks whenever inline chunk hashes are present
+      if (manifest.chunkHashes.length === manifest.totalChunks) {
+        let clearedAnyCorruptChunk = false;
+        try {
+          for (let i = 0; i < manifest.totalChunks; i++) {
+            if (!hasChunkInBitfield(bitfield, i)) continue;
+            const offset = i * SWARM_CHUNK_SIZE;
+            const expectedLen = Math.min(
+              SWARM_CHUNK_SIZE,
+              manifest.fileSize - offset,
+            );
+            const expectedHash = manifest.chunkHashes[i];
+            let valid = false;
+            if (expectedHash) {
+              try {
+                const diskBytes = await readFullAt(
+                  fileHandle,
+                  expectedLen,
+                  offset,
+                );
+                valid = verifyChunkSha256(diskBytes, expectedHash);
+              } catch {
+                valid = false;
+              }
+            }
+            if (!valid) {
+              clearBitInBitfield(bitfield, i);
+              clearedAnyCorruptChunk = true;
+            }
+          }
+          if (clearedAnyCorruptChunk) {
+            await writeFile(
+              bitfieldPath,
+              encodeBitfieldSidecar(manifest, bitfield),
+            );
+          }
+        } catch (err) {
+          await fileHandle.close().catch(() => {});
+          throw err;
+        }
+      }
     } else {
       fileHandle = await open(partPath, "w+");
       try {
         await fileHandle.truncate(manifest.fileSize);
         bitfield = createBitfield(manifest.totalChunks);
-        await writeFile(bitfieldPath, bitfield);
+        await writeFile(
+          bitfieldPath,
+          encodeBitfieldSidecar(manifest, bitfield),
+        );
       } catch (err) {
         await fileHandle.close().catch(() => {});
         throw err;
@@ -366,10 +745,10 @@ export class FsChunkStorageAdapter implements ChunkStoragePort {
     await writeFullAt(rec.fileHandle, data, offset);
     setChunkInBitfield(rec.bitfield, chunkIndex);
 
-    const snapshot = rec.bitfield.slice();
+    const sidecarSnapshot = encodeBitfieldSidecar(manifest, rec.bitfield);
     const persistOp = rec.bitfieldWriteChain.then(async () => {
       const tmpBf = `${rec.bitfieldPath}.tmp`;
-      await writeFile(tmpBf, snapshot);
+      await writeFile(tmpBf, sidecarSnapshot);
       await rename(tmpBf, rec.bitfieldPath);
     });
     rec.bitfieldWriteChain = persistOp.catch(() => {});
@@ -450,11 +829,29 @@ export class FsChunkStorageAdapter implements ChunkStoragePort {
       );
     }
 
+    // Verify whole-file SHA-256 against manifest before finalizing onto disk
+    const wholeFileSha256 = await computeFileHandleSha256Hex(
+      rec.fileHandle,
+      rec.manifest.fileSize,
+    );
+    if (wholeFileSha256 !== rec.manifest.fileSha256.toLowerCase()) {
+      this.records.delete(fileId);
+      await rec.fileHandle.close().catch(() => {});
+      await rm(rec.partPath, { force: true }).catch(() => {});
+      await rm(rec.bitfieldPath, { force: true }).catch(() => {});
+      throw new Error(
+        `Finalized file SHA-256 mismatch for fileId=${fileId}`,
+      );
+    }
+
     await rec.fileHandle.sync();
     await rec.fileHandle.close();
 
-    const finalPath = await this.pickNonClobberingDestination(rec.safeName);
-    await rename(rec.partPath, finalPath);
+    const finalPath = await this.withFsAllocLock(async () => {
+      const dest = await this.pickNonClobberingDestination(rec.safeName);
+      await rename(rec.partPath, dest);
+      return dest;
+    });
     await rm(rec.bitfieldPath, { force: true });
 
     this.records.set(fileId, {

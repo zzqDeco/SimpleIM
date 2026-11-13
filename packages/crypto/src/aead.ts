@@ -68,10 +68,11 @@ export function openSignalingPayload(
   fromPeerId: string,
   toPeerId: string,
   envelope: EncryptedEnvelope,
+  options?: { maxFrameBytes?: number },
 ): SignalingInnerPayload {
   const aad = buildSignalingAad(roomId, fromPeerId, toPeerId);
   const plaintext = openXChaCha(signalingKey, envelope, aad);
-  return parseSignalingInnerPayload(bytesToUtf8(plaintext));
+  return parseSignalingInnerPayload(bytesToUtf8(plaintext), options);
 }
 
 function buildControlAad(roomId: string): Uint8Array {

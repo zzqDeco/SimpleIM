@@ -9,6 +9,7 @@ import {
   setChunkInBitfield,
   SWARM_BUFFERED_LOW_THRESHOLD,
   SWARM_CHUNK_SIZE,
+  SWARM_HASH_PAGE_CHUNKS,
   SWARM_MAX_BUFFERED_AMOUNT,
   SwarmFrameType,
   type FileManifest,
@@ -16,9 +17,10 @@ import {
   type PostAuthControlFrame,
 } from "@simpleim/contracts";
 import {
-  createSignedFileManifestFromChunks,
+  createSignedFileManifestWithPages,
   verifyChunkSha256,
   verifyFileManifest,
+  verifyHashPage,
   type Ed25519KeyPair,
 } from "@simpleim/crypto";
 import type {
@@ -59,6 +61,7 @@ export interface SwarmSchedulerOptions {
   now: () => number;
   events?: RoomPeerEngineEvents;
   broadcastControlFrame: (frame: PostAuthControlFrame) => void;
+  sendControlFrameToPeer?: (peerId: string, frame: PostAuthControlFrame) => void;
   evictPeer: (peerId: string, reason: string) => void;
 }
 
@@ -79,6 +82,15 @@ interface SwarmFileEntry {
   bytesCompleted: number;
   writingChunks: Set<number>;
   chunkInFlightPeers: Map<number, Set<string>>;
+  resolvedChunkHashes: Array<string | undefined>;
+  verifiedHashPages: Map<number, string[]>;
+  requestedHashPages: Map<number, { peerId: string; requestedAt: number }>;
+  failedHashPagePeers: Map<number, Set<string>>;
+  downloadGen: number;
+  activeDownloadGen: number | null;
+  storageOwnerGen: number | null;
+  initDownloadPromise: Promise<void> | null;
+  pendingStorageOps: Set<Promise<unknown>>;
   finalizing: boolean;
   downloadStartedAt: number | null;
   speedSamples: Array<{ ts: number; bytes: number }>;
@@ -93,6 +105,7 @@ interface SwarmPeerEntry {
   earlyRawBitfields: Map<string, Uint8Array>;
   earlyHaves: Map<string, Set<number>>;
   inFlightRequests: Map<string, InFlightChunkRequest>;
+  pendingStorageWrites: number;
   outboundChunkQueue: Array<{ fileId: string; chunkIndex: number }>;
   outboundChunkKeys: Set<string>;
   currentReadingKey: string | null;
@@ -100,6 +113,8 @@ interface SwarmPeerEntry {
   drainingOutbound: boolean;
   needsRedrain: boolean;
   poisonStrikes: number;
+  timeoutStrikes: number;
+  chunkCooldownUntil: Map<string, number>;
   initialBitfieldsSent: boolean;
 }
 
@@ -146,11 +161,16 @@ export class SwarmScheduler {
   private readonly now: () => number;
   private readonly events?: RoomPeerEngineEvents;
   private readonly broadcastControlFrame: (frame: PostAuthControlFrame) => void;
+  private readonly sendControlFrameToPeer: (
+    peerId: string,
+    frame: PostAuthControlFrame,
+  ) => void;
   private readonly evictPeer: (peerId: string, reason: string) => void;
 
   private readonly files = new Map<string, SwarmFileEntry>();
   private readonly fileOrder: string[] = [];
   private readonly peers = new Map<string, SwarmPeerEntry>();
+  private readonly hashPageRetryTimers = new Set<TimerHandle>();
   private stopped = false;
 
   constructor(options: SwarmSchedulerOptions) {
@@ -167,6 +187,7 @@ export class SwarmScheduler {
     this.now = options.now;
     this.events = options.events;
     this.broadcastControlFrame = options.broadcastControlFrame;
+    this.sendControlFrameToPeer = options.sendControlFrameToPeer ?? (() => {});
     this.evictPeer = options.evictPeer;
   }
 
@@ -174,7 +195,7 @@ export class SwarmScheduler {
     if (this.stopped) {
       throw new Error("RoomPeerEngine is stopped");
     }
-    const manifest = await createSignedFileManifestFromChunks({
+    const { manifest, chunkHashPages } = await createSignedFileManifestWithPages({
       roomId: this.roomId,
       fileName: input.fileName,
       fileSize: input.fileSize,
@@ -194,6 +215,11 @@ export class SwarmScheduler {
       setChunkInBitfield(localBitfield, i);
     }
 
+    const resolvedChunkHashes: Array<string | undefined> = chunkHashPages.flat();
+    const verifiedHashPages = new Map<number, string[]>(
+      chunkHashPages.map((page, idx) => [idx, page]),
+    );
+
     let entry = this.files.get(manifest.fileId);
     if (!entry) {
       entry = {
@@ -204,6 +230,15 @@ export class SwarmScheduler {
         bytesCompleted: manifest.fileSize,
         writingChunks: new Set(),
         chunkInFlightPeers: new Map(),
+        resolvedChunkHashes,
+        verifiedHashPages,
+        requestedHashPages: new Map(),
+        failedHashPagePeers: new Map(),
+        downloadGen: 1,
+        activeDownloadGen: null,
+        storageOwnerGen: 1,
+        initDownloadPromise: null,
+        pendingStorageOps: new Set(),
         finalizing: false,
         downloadStartedAt: null,
         speedSamples: [],
@@ -213,10 +248,18 @@ export class SwarmScheduler {
       this.files.set(manifest.fileId, entry);
       this.fileOrder.push(manifest.fileId);
     } else {
+      const gen = (entry.downloadGen += 1);
+      entry.activeDownloadGen = null;
+      entry.storageOwnerGen = gen;
+      entry.initDownloadPromise = null;
       entry.status = "seeding";
       entry.localBitfield = localBitfield;
       entry.completedChunks = manifest.totalChunks;
       entry.bytesCompleted = manifest.fileSize;
+      entry.resolvedChunkHashes = resolvedChunkHashes;
+      entry.verifiedHashPages = verifiedHashPages;
+      entry.requestedHashPages.clear();
+      entry.failedHashPagePeers.clear();
       entry.errorMessage = undefined;
     }
 
@@ -232,12 +275,21 @@ export class SwarmScheduler {
     return manifest;
   }
 
-  ingestFileManifest(manifest: FileManifest): boolean {
+  ingestFileManifest(manifest: FileManifest, _sourcePeerId?: string): boolean {
     if (!verifyFileManifest(manifest, this.serverSignPubKey, this.roomId)) {
       return false;
     }
     if (this.files.has(manifest.fileId)) {
       return false;
+    }
+
+    const isPaged = manifest.hashPageHashes !== undefined;
+    const resolvedChunkHashes: Array<string | undefined> = isPaged
+      ? new Array<string | undefined>(manifest.totalChunks)
+      : [...manifest.chunkHashes];
+    const verifiedHashPages = new Map<number, string[]>();
+    if (!isPaged && manifest.totalChunks > 0) {
+      verifiedHashPages.set(0, [...manifest.chunkHashes]);
     }
 
     const entry: SwarmFileEntry = {
@@ -248,6 +300,15 @@ export class SwarmScheduler {
       bytesCompleted: 0,
       writingChunks: new Set(),
       chunkInFlightPeers: new Map(),
+      resolvedChunkHashes,
+      verifiedHashPages,
+      requestedHashPages: new Map(),
+      failedHashPagePeers: new Map(),
+      downloadGen: 0,
+      activeDownloadGen: null,
+      storageOwnerGen: null,
+      initDownloadPromise: null,
+      pendingStorageOps: new Set(),
       finalizing: false,
       downloadStartedAt: null,
       speedSamples: [],
@@ -260,6 +321,127 @@ export class SwarmScheduler {
 
     this.events?.onFileAnnounced?.(manifest);
     return true;
+  }
+
+  handleHashPageRequestFrame(
+    fromPeerId: string,
+    fileId: string,
+    pageIndices: readonly number[],
+  ): void {
+    if (this.stopped) return;
+    const peer = this.peers.get(fromPeerId);
+    if (!peer || !peer.link.isVerified()) return;
+    const entry = this.files.get(fileId);
+    if (!entry) return;
+
+    for (const pageIndex of pageIndices) {
+      const pageHashes = entry.verifiedHashPages.get(pageIndex);
+      if (pageHashes && pageHashes.length > 0) {
+        this.sendControlFrameToPeer(fromPeerId, {
+          type: "file.hash_page",
+          fileId,
+          pageIndex,
+          chunkHashes: pageHashes,
+        });
+      }
+    }
+  }
+
+  handleHashPageFrame(
+    fromPeerId: string,
+    fileId: string,
+    pageIndex: number,
+    chunkHashes: readonly string[],
+  ): void {
+    if (this.stopped) return;
+    const peer = this.peers.get(fromPeerId);
+    if (!peer || !peer.link.isVerified()) return;
+    const entry = this.files.get(fileId);
+    if (!entry || !entry.manifest.hashPageHashes) return;
+
+    const expectedDigest = entry.manifest.hashPageHashes[pageIndex];
+    const startChunk = pageIndex * SWARM_HASH_PAGE_CHUNKS;
+    const expectedLen = Math.min(
+      SWARM_HASH_PAGE_CHUNKS,
+      Math.max(0, entry.manifest.totalChunks - startChunk),
+    );
+    const valid =
+      expectedDigest !== undefined &&
+      expectedLen > 0 &&
+      chunkHashes.length === expectedLen &&
+      verifyHashPage(fileId, pageIndex, chunkHashes, expectedDigest);
+
+    if (!valid) {
+      entry.requestedHashPages.delete(pageIndex);
+      this.recordFailedHashPagePeer(entry, pageIndex, fromPeerId);
+      peer.poisonStrikes += 1;
+      if (peer.poisonStrikes >= MAX_POISON_STRIKES) {
+        this.evictPeer(fromPeerId, "hash_page_mismatch");
+      } else {
+        this.scheduleDownloads();
+      }
+      return;
+    }
+
+    entry.requestedHashPages.delete(pageIndex);
+    entry.failedHashPagePeers.delete(pageIndex);
+    if (!entry.verifiedHashPages.has(pageIndex)) {
+      entry.verifiedHashPages.set(pageIndex, [...chunkHashes]);
+      for (let i = 0; i < chunkHashes.length; i++) {
+        entry.resolvedChunkHashes[startChunk + i] = chunkHashes[i];
+      }
+    }
+    if (entry.status === "downloading") {
+      this.scheduleDownloads();
+    }
+  }
+
+  private runTrackedStorageOp<T>(
+    entry: SwarmFileEntry,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const p = fn();
+    const settled = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    entry.pendingStorageOps.add(settled);
+    void settled.finally(() => {
+      entry.pendingStorageOps.delete(settled);
+    });
+    return p;
+  }
+
+  private async deleteStaleStorageIfOwned(
+    entry: SwarmFileEntry,
+    staleGen: number,
+  ): Promise<void> {
+    if (
+      this.stopped ||
+      (entry.storageOwnerGen !== null && entry.storageOwnerGen !== staleGen)
+    ) {
+      return;
+    }
+    if (entry.storageOwnerGen === staleGen) {
+      entry.storageOwnerGen = null;
+    }
+    await this.runTrackedStorageOp(entry, () =>
+      this.chunkStorage.deleteFile(entry.manifest.fileId).catch(() => undefined),
+    );
+  }
+
+  private recordFailedHashPagePeer(
+    entry: SwarmFileEntry,
+    pageIndex: number,
+    peerId: string,
+  ): Set<string> {
+    let failed = entry.failedHashPagePeers.get(pageIndex);
+    if (!failed) {
+      failed = new Set();
+      entry.failedHashPagePeers.set(pageIndex, failed);
+    }
+    failed.add(peerId);
+    return failed;
   }
 
   async downloadFile(fileId: string): Promise<void> {
@@ -277,15 +459,75 @@ export class SwarmScheduler {
       this.scheduleDownloads();
       return;
     }
+    if (entry.initDownloadPromise !== null) {
+      return entry.initDownloadPromise;
+    }
 
-    const { existingBitfield } = await this.chunkStorage.initReceivingFile(
-      entry.manifest,
-    );
-    if (this.stopped) return;
+    const gen = (entry.downloadGen += 1);
+    entry.activeDownloadGen = gen;
+    const initPromise = this.performDownloadInit(entry, gen).finally(() => {
+      if (entry.initDownloadPromise === initPromise) {
+        entry.initDownloadPromise = null;
+      }
+    });
+    entry.initDownloadPromise = initPromise;
+    return initPromise;
+  }
+
+  private async performDownloadInit(
+    entry: SwarmFileEntry,
+    gen: number,
+  ): Promise<void> {
+    const fileId = entry.manifest.fileId;
+
+    // Wait for any in-flight storage operations from cancelled/obsolete attempts
+    // to settle before initializing storage for the new generation.
+    while (entry.pendingStorageOps.size > 0) {
+      await Promise.allSettled(Array.from(entry.pendingStorageOps));
+      if (this.stopped || entry.downloadGen !== gen) {
+        return;
+      }
+    }
+    if (this.stopped || entry.downloadGen !== gen) {
+      return;
+    }
+
+    entry.storageOwnerGen = gen;
+    let existingBitfield: Uint8Array;
+    try {
+      const res = await this.runTrackedStorageOp(entry, () =>
+        this.chunkStorage.initReceivingFile(entry.manifest),
+      );
+      existingBitfield = res.existingBitfield;
+    } catch (err) {
+      if (entry.activeDownloadGen === gen) {
+        entry.activeDownloadGen = null;
+      }
+      if (entry.storageOwnerGen === gen) {
+        entry.storageOwnerGen = null;
+      }
+      throw err;
+    }
+    if (this.stopped || entry.downloadGen !== gen) {
+      await this.deleteStaleStorageIfOwned(entry, gen);
+      return;
+    }
 
     if (entry.manifest.totalChunks === 0) {
-      await this.chunkStorage.finalizeFile(fileId);
-      if (this.stopped) return;
+      try {
+        await this.runTrackedStorageOp(entry, () =>
+          this.chunkStorage.finalizeFile(fileId),
+        );
+      } catch (err) {
+        if (entry.activeDownloadGen === gen) {
+          entry.activeDownloadGen = null;
+        }
+        throw err;
+      }
+      if (this.stopped || entry.downloadGen !== gen) {
+        await this.deleteStaleStorageIfOwned(entry, gen);
+        return;
+      }
       entry.localBitfield = createBitfield(0);
       entry.completedChunks = 0;
       entry.bytesCompleted = 0;
@@ -317,8 +559,20 @@ export class SwarmScheduler {
     entry.writingChunks.clear();
 
     if (completed === entry.manifest.totalChunks) {
-      await this.chunkStorage.finalizeFile(fileId);
-      if (this.stopped) return;
+      try {
+        await this.runTrackedStorageOp(entry, () =>
+          this.chunkStorage.finalizeFile(fileId),
+        );
+      } catch (err) {
+        if (entry.activeDownloadGen === gen) {
+          entry.activeDownloadGen = null;
+        }
+        throw err;
+      }
+      if (this.stopped || entry.downloadGen !== gen) {
+        await this.deleteStaleStorageIfOwned(entry, gen);
+        return;
+      }
       entry.status = "seeding";
       entry.lastSpeedBytesPerSec = 0;
       this.broadcastBitfieldForFile(entry);
@@ -346,9 +600,15 @@ export class SwarmScheduler {
       return;
     }
 
+    entry.downloadGen += 1;
+    entry.activeDownloadGen = null;
+    entry.storageOwnerGen = null;
+    entry.initDownloadPromise = null;
     entry.status = "paused";
     entry.finalizing = false;
     entry.writingChunks.clear();
+    entry.requestedHashPages.clear();
+    entry.failedHashPagePeers.clear();
     entry.speedSamples = [];
     entry.lastSpeedBytesPerSec = 0;
     entry.downloadStartedAt = null;
@@ -395,7 +655,9 @@ export class SwarmScheduler {
     entry.bytesCompleted = 0;
     this.broadcastBitfieldForFile(entry);
 
-    await this.chunkStorage.deleteFile(fileId);
+    await this.runTrackedStorageOp(entry, () =>
+      this.chunkStorage.deleteFile(fileId),
+    );
     if (!this.stopped) {
       this.emitProgress(entry);
       this.scheduleDownloads();
@@ -479,6 +741,7 @@ export class SwarmScheduler {
         earlyRawBitfields: new Map(),
         earlyHaves: new Map(),
         inFlightRequests: new Map(),
+        pendingStorageWrites: 0,
         outboundChunkQueue: [],
         outboundChunkKeys: new Set(),
         currentReadingKey: null,
@@ -486,6 +749,8 @@ export class SwarmScheduler {
         drainingOutbound: false,
         needsRedrain: false,
         poisonStrikes: 0,
+        timeoutStrikes: 0,
+        chunkCooldownUntil: new Map(),
         initialBitfieldsSent: false,
       };
       this.peers.set(link.peerId, peer);
@@ -560,6 +825,18 @@ export class SwarmScheduler {
 
     if (!this.stopped) {
       for (const entry of this.files.values()) {
+        for (const [pageIdx, pendingPage] of entry.requestedHashPages.entries()) {
+          if (pendingPage.peerId === peerId) {
+            entry.requestedHashPages.delete(pageIdx);
+            releasedAnyInFlight = true;
+          }
+        }
+        for (const [pageIdx, failedSet] of entry.failedHashPagePeers.entries()) {
+          failedSet.delete(peerId);
+          if (failedSet.size === 0) {
+            entry.failedHashPagePeers.delete(pageIdx);
+          }
+        }
         if (entry.status === "downloading") {
           this.emitProgress(entry);
         }
@@ -610,6 +887,10 @@ export class SwarmScheduler {
 
   stop(): void {
     this.stopped = true;
+    for (const t of this.hashPageRetryTimers) {
+      clearTimeout(t);
+    }
+    this.hashPageRetryTimers.clear();
     for (const peer of this.peers.values()) {
       for (const req of peer.inFlightRequests.values()) {
         clearTimeout(req.timer);
@@ -620,8 +901,13 @@ export class SwarmScheduler {
     }
     this.peers.clear();
     for (const entry of this.files.values()) {
+      entry.downloadGen += 1;
+      entry.activeDownloadGen = null;
+      entry.initDownloadPromise = null;
       entry.chunkInFlightPeers.clear();
       entry.writingChunks.clear();
+      entry.requestedHashPages.clear();
+      entry.failedHashPagePeers.clear();
     }
   }
 
@@ -635,8 +921,13 @@ export class SwarmScheduler {
     }
     const entry = this.files.get(fileId);
     if (!entry) {
-      if (
-        peer.earlyRawBitfields.has(fileId) ||
+      const existingRaw = peer.earlyRawBitfields.get(fileId);
+      if (existingRaw && existingRaw.byteLength === payload.byteLength) {
+        for (let i = 0; i < existingRaw.byteLength; i++) {
+          existingRaw[i] = (existingRaw[i] ?? 0) | (payload[i] ?? 0);
+        }
+      } else if (
+        existingRaw !== undefined ||
         peer.earlyRawBitfields.size < MAX_PRE_MANIFEST_FILES_PER_PEER
       ) {
         peer.earlyRawBitfields.set(fileId, payload.slice());
@@ -654,6 +945,10 @@ export class SwarmScheduler {
       peer.bitfields.set(fileId, new Uint8Array(0));
     } else {
       const cleanBf = createBitfield(entry.manifest.totalChunks);
+      const existingBf = peer.bitfields.get(fileId);
+      if (existingBf && existingBf.byteLength === cleanBf.byteLength) {
+        cleanBf.set(existingBf);
+      }
       for (let i = 0; i < entry.manifest.totalChunks; i++) {
         if (hasChunkInBitfield(payload, i)) {
           setChunkInBitfield(cleanBf, i);
@@ -732,6 +1027,10 @@ export class SwarmScheduler {
 
       if (!rawBf && !rawHaves) continue;
       const bf = createBitfield(totalChunks);
+      const existingBf = peer.bitfields.get(fileId);
+      if (existingBf && existingBf.byteLength === bf.byteLength) {
+        bf.set(existingBf);
+      }
       if (rawBf && rawBf.byteLength === expectedLen) {
         for (let i = 0; i < totalChunks; i++) {
           if (hasChunkInBitfield(rawBf, i)) {
@@ -901,10 +1200,11 @@ export class SwarmScheduler {
     }
 
     const senderPeerId = peer.link.peerId;
+    const reqKey = `${fileId}:${chunkIndex}`;
     this.releaseInFlightRequest(entry, peer, chunkIndex);
 
     const expectedLen = expectedChunkByteLength(entry.manifest, chunkIndex);
-    const expectedHash = entry.manifest.chunkHashes[chunkIndex];
+    const expectedHash = entry.resolvedChunkHashes[chunkIndex];
     const isValid =
       chunkIndex < entry.manifest.totalChunks &&
       payload.byteLength === expectedLen &&
@@ -921,6 +1221,9 @@ export class SwarmScheduler {
       return;
     }
 
+    peer.timeoutStrikes = 0;
+    peer.chunkCooldownUntil.delete(reqKey);
+
     if (entry.status !== "downloading") {
       this.scheduleDownloads();
       return;
@@ -934,7 +1237,9 @@ export class SwarmScheduler {
       return;
     }
 
+    const chunkGen = entry.downloadGen;
     entry.writingChunks.add(chunkIndex);
+    peer.pendingStorageWrites += 1;
 
     // Endgame cancellation: cancel any redundant in-flight requests to other peers for this chunk
     const otherPeers = entry.chunkInFlightPeers.get(chunkIndex);
@@ -955,25 +1260,40 @@ export class SwarmScheduler {
       entry.chunkInFlightPeers.delete(chunkIndex);
     }
 
-    // Schedule next chunk immediately on newly freed slot
+    // Schedule next chunk only if peer/file write budgets still have capacity
     this.scheduleDownloads();
 
     try {
-      await this.chunkStorage.writeVerifiedChunk(fileId, chunkIndex, payload);
+      await this.runTrackedStorageOp(entry, () =>
+        this.chunkStorage.writeVerifiedChunk(fileId, chunkIndex, payload),
+      );
     } catch (err) {
       entry.writingChunks.delete(chunkIndex);
-      if (!this.stopped && entry.status === "downloading") {
+      peer.pendingStorageWrites = Math.max(0, peer.pendingStorageWrites - 1);
+      if (
+        !this.stopped &&
+        entry.downloadGen === chunkGen &&
+        entry.status === "downloading"
+      ) {
         const errorObj = err instanceof Error ? err : new Error(String(err));
+        entry.activeDownloadGen = null;
         entry.status = "error";
         entry.errorMessage = errorObj.message;
         this.emitProgress(entry);
         this.events?.onError?.(errorObj);
       }
+      this.scheduleDownloads();
       return;
     }
 
     entry.writingChunks.delete(chunkIndex);
-    if (this.stopped || entry.status !== "downloading") {
+    peer.pendingStorageWrites = Math.max(0, peer.pendingStorageWrites - 1);
+    if (
+      this.stopped ||
+      entry.downloadGen !== chunkGen ||
+      entry.status !== "downloading"
+    ) {
+      this.scheduleDownloads();
       return;
     }
 
@@ -994,11 +1314,18 @@ export class SwarmScheduler {
       if (entry.finalizing) return;
       entry.finalizing = true;
       try {
-        await this.chunkStorage.finalizeFile(fileId);
+        await this.runTrackedStorageOp(entry, () =>
+          this.chunkStorage.finalizeFile(fileId),
+        );
       } catch (err) {
         entry.finalizing = false;
-        if (!this.stopped && entry.status === "downloading") {
+        if (
+          !this.stopped &&
+          entry.downloadGen === chunkGen &&
+          entry.status === "downloading"
+        ) {
           const errorObj = err instanceof Error ? err : new Error(String(err));
+          entry.activeDownloadGen = null;
           entry.status = "error";
           entry.errorMessage = errorObj.message;
           this.emitProgress(entry);
@@ -1006,7 +1333,14 @@ export class SwarmScheduler {
         }
         return;
       }
-      if (this.stopped || entry.status !== "downloading") {
+      if (
+        this.stopped ||
+        entry.downloadGen !== chunkGen ||
+        entry.status !== "downloading"
+      ) {
+        if (!this.stopped && entry.downloadGen !== chunkGen) {
+          await this.deleteStaleStorageIfOwned(entry, chunkGen);
+        }
         return;
       }
       entry.status = "seeding";
@@ -1020,23 +1354,190 @@ export class SwarmScheduler {
     this.scheduleDownloads();
   }
 
+  private peerHasChunkInRange(
+    bf: Uint8Array | undefined,
+    startChunk: number,
+    endChunkExclusive: number,
+  ): boolean {
+    if (!bf || bf.byteLength === 0) return false;
+    for (let idx = startChunk; idx < endChunkExclusive; idx++) {
+      if (hasChunkInBitfield(bf, idx)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private scheduleHashPageRetryTimer(entry: SwarmFileEntry, delayMs: number): void {
+    const retryTimer = setTimeout(() => {
+      this.hashPageRetryTimers.delete(retryTimer);
+      if (!this.stopped && entry.status === "downloading") {
+        this.scheduleDownloads();
+      }
+    }, Math.max(1, delayMs));
+    this.hashPageRetryTimers.add(retryTimer);
+  }
+
+  private ensureHashPagesRequested(entry: SwarmFileEntry): void {
+    const pageDigests = entry.manifest.hashPageHashes;
+    if (!pageDigests || pageDigests.length === 0) return;
+    if (entry.verifiedHashPages.size >= pageDigests.length) return;
+
+    const nowTs = this.now();
+    const missingPages: number[] = [];
+    let nextPendingExpiryMs = Number.POSITIVE_INFINITY;
+
+    for (let p = 0; p < pageDigests.length; p++) {
+      if (entry.verifiedHashPages.has(p)) continue;
+      const prevReq = entry.requestedHashPages.get(p);
+      if (!prevReq || nowTs - prevReq.requestedAt >= this.requestTimeoutMs) {
+        missingPages.push(p);
+      } else {
+        const remaining = prevReq.requestedAt + this.requestTimeoutMs - nowTs;
+        if (remaining < nextPendingExpiryMs) {
+          nextPendingExpiryMs = remaining;
+        }
+      }
+    }
+
+    if (missingPages.length === 0) {
+      if (
+        Number.isFinite(nextPendingExpiryMs) &&
+        this.hashPageRetryTimers.size === 0
+      ) {
+        this.scheduleHashPageRetryTimer(entry, nextPendingExpiryMs);
+      }
+      return;
+    }
+
+    const verifiedPeers: SwarmPeerEntry[] = [];
+    for (const peer of this.peers.values()) {
+      if (peer.link.isVerified()) {
+        verifiedPeers.push(peer);
+      }
+    }
+    if (verifiedPeers.length === 0) return;
+
+    const pagesByPeer = new Map<string, number[]>();
+    for (const pageIdx of missingPages) {
+      const prevReq = entry.requestedHashPages.get(pageIdx);
+      let failedSet = entry.failedHashPagePeers.get(pageIdx);
+      if (prevReq && nowTs - prevReq.requestedAt >= this.requestTimeoutMs) {
+        failedSet = this.recordFailedHashPagePeer(
+          entry,
+          pageIdx,
+          prevReq.peerId,
+        );
+      }
+
+      if (
+        failedSet &&
+        verifiedPeers.every((p) => failedSet!.has(p.link.peerId))
+      ) {
+        failedSet.clear();
+        if (prevReq && verifiedPeers.length > 1) {
+          failedSet.add(prevReq.peerId);
+        }
+      }
+
+      const startChunk = pageIdx * SWARM_HASH_PAGE_CHUNKS;
+      const endChunk = Math.min(
+        entry.manifest.totalChunks,
+        startChunk + SWARM_HASH_PAGE_CHUNKS,
+      );
+
+      const sorted = [...verifiedPeers].sort((a, b) => {
+        const aFailed = failedSet?.has(a.link.peerId) ? 1 : 0;
+        const bFailed = failedSet?.has(b.link.peerId) ? 1 : 0;
+        if (aFailed !== bFailed) return aFailed - bFailed;
+
+        const aBf = a.bitfields.get(entry.manifest.fileId);
+        const bBf = b.bitfields.get(entry.manifest.fileId);
+        const aHasPageChunk = this.peerHasChunkInRange(aBf, startChunk, endChunk)
+          ? 0
+          : 1;
+        const bHasPageChunk = this.peerHasChunkInRange(bBf, startChunk, endChunk)
+          ? 0
+          : 1;
+        if (aHasPageChunk !== bHasPageChunk) {
+          return aHasPageChunk - bHasPageChunk;
+        }
+
+        const aHasAnyChunks =
+          countChunksInBitfield(
+            aBf ?? new Uint8Array(0),
+            entry.manifest.totalChunks,
+          ) > 0
+            ? 0
+            : 1;
+        const bHasAnyChunks =
+          countChunksInBitfield(
+            bBf ?? new Uint8Array(0),
+            entry.manifest.totalChunks,
+          ) > 0
+            ? 0
+            : 1;
+        if (aHasAnyChunks !== bHasAnyChunks) {
+          return aHasAnyChunks - bHasAnyChunks;
+        }
+        if (a.poisonStrikes !== b.poisonStrikes) {
+          return a.poisonStrikes - b.poisonStrikes;
+        }
+        return a.timeoutStrikes - b.timeoutStrikes;
+      });
+      const chosen = sorted[0];
+      if (!chosen) continue;
+      entry.requestedHashPages.set(pageIdx, {
+        peerId: chosen.link.peerId,
+        requestedAt: nowTs,
+      });
+      let batch = pagesByPeer.get(chosen.link.peerId);
+      if (!batch) {
+        batch = [];
+        pagesByPeer.set(chosen.link.peerId, batch);
+      }
+      batch.push(pageIdx);
+    }
+
+    for (const [peerId, pageIndices] of pagesByPeer.entries()) {
+      this.sendControlFrameToPeer(peerId, {
+        type: "file.hash_page_request",
+        fileId: entry.manifest.fileId,
+        pageIndices,
+      });
+    }
+
+    this.scheduleHashPageRetryTimer(entry, this.requestTimeoutMs);
+  }
+
+  private peerActiveLoad(peer: SwarmPeerEntry): number {
+    return peer.inFlightRequests.size + peer.pendingStorageWrites;
+  }
+
   private scheduleDownloads(): void {
     if (this.stopped) return;
 
-    const openPeers: SwarmPeerEntry[] = [];
+    const maxPendingWritesPerFile = Math.max(16, this.maxInFlightPerPeer * 4);
+    let anyPeerHasControl = false;
+    let anyPeerHasSwarmSlot = false;
     for (const peer of this.peers.values()) {
+      if (!peer.link.isVerified()) continue;
+      anyPeerHasControl = true;
       if (
-        peer.link.isVerified() &&
         peer.link.swarmChannel.readyState === "open" &&
-        peer.inFlightRequests.size < this.maxInFlightPerPeer
+        this.peerActiveLoad(peer) < this.maxInFlightPerPeer
       ) {
-        openPeers.push(peer);
+        anyPeerHasSwarmSlot = true;
       }
     }
-    if (openPeers.length === 0) return;
+    if (!anyPeerHasControl) return;
 
     for (const entry of this.files.values()) {
       if (entry.status !== "downloading") continue;
+
+      this.ensureHashPagesRequested(entry);
+      if (!anyPeerHasSwarmSlot) continue;
+      if (entry.writingChunks.size >= maxPendingWritesPerFile) continue;
 
       const totalChunks = entry.manifest.totalChunks;
       const uncompletedChunks =
@@ -1047,7 +1548,7 @@ export class SwarmScheduler {
       const isEndgame = uncompletedChunks <= endgameThreshold;
       const maxRequestsPerChunk = isEndgame ? 2 : 1;
 
-      // Collect candidate missing chunks and compute availability across verified peers
+      // Collect candidate missing chunks whose hashes are already verified
       const candidates: Array<{
         chunkIndex: number;
         availability: number;
@@ -1056,6 +1557,7 @@ export class SwarmScheduler {
 
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
         if (
+          entry.resolvedChunkHashes[chunkIndex] === undefined ||
           hasChunkInBitfield(entry.localBitfield, chunkIndex) ||
           entry.writingChunks.has(chunkIndex)
         ) {
@@ -1096,20 +1598,23 @@ export class SwarmScheduler {
           a.chunkIndex - b.chunkIndex,
       );
 
+      const nowTs = this.now();
       for (const candidate of candidates) {
+        if (entry.writingChunks.size >= maxPendingWritesPerFile) break;
         const { chunkIndex } = candidate;
+        const reqKey = `${entry.manifest.fileId}:${chunkIndex}`;
         let inFlightPeers = entry.chunkInFlightPeers.get(chunkIndex);
         const neededCopies =
           maxRequestsPerChunk - (inFlightPeers?.size ?? 0);
         if (neededCopies <= 0) continue;
 
-        // Find eligible peers holding this chunk with available in-flight slots
+        // Find eligible peers holding this chunk with available in-flight + storage-write slots
         const eligiblePeers: SwarmPeerEntry[] = [];
         for (const peer of this.peers.values()) {
           if (
             !peer.link.isVerified() ||
             peer.link.swarmChannel.readyState !== "open" ||
-            peer.inFlightRequests.size >= this.maxInFlightPerPeer
+            this.peerActiveLoad(peer) >= this.maxInFlightPerPeer
           ) {
             continue;
           }
@@ -1125,11 +1630,21 @@ export class SwarmScheduler {
         if (eligiblePeers.length === 0) continue;
 
         eligiblePeers.sort((a, b) => {
+          const coolA =
+            (a.chunkCooldownUntil.get(reqKey) ?? 0) > nowTs ? 1 : 0;
+          const coolB =
+            (b.chunkCooldownUntil.get(reqKey) ?? 0) > nowTs ? 1 : 0;
+          if (coolA !== coolB) return coolA - coolB;
+
           const strikeDiff = a.poisonStrikes - b.poisonStrikes;
           if (strikeDiff !== 0) return strikeDiff;
-          const loadDiff =
-            a.inFlightRequests.size - b.inFlightRequests.size;
+
+          const timeoutDiff = a.timeoutStrikes - b.timeoutStrikes;
+          if (timeoutDiff !== 0) return timeoutDiff;
+
+          const loadDiff = this.peerActiveLoad(a) - this.peerActiveLoad(b);
           if (loadDiff !== 0) return loadDiff;
+
           const rttA = a.link.getRttMs() ?? 999_999;
           const rttB = b.link.getRttMs() ?? 999_999;
           if (rttA !== rttB) return rttA - rttB;
@@ -1163,6 +1678,12 @@ export class SwarmScheduler {
       const currentPeer = this.peers.get(peerId);
       const currentEntry = this.files.get(fileId);
       if (currentPeer && currentEntry) {
+        currentPeer.timeoutStrikes += 1;
+        const cooldownMs = Math.max(
+          200,
+          Math.min(5_000, this.requestTimeoutMs * 2),
+        );
+        currentPeer.chunkCooldownUntil.set(reqKey, this.now() + cooldownMs);
         this.releaseInFlightRequest(currentEntry, currentPeer, chunkIndex);
         this.sendSwarmFrameToPeer(currentPeer, {
           frameType: SwarmFrameType.CANCEL,

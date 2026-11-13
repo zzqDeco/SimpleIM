@@ -5,12 +5,21 @@ import {
   decodeSwarmFrame,
   encodeSwarmFrame,
   hasChunkInBitfield,
+  isValidFileManifest,
+  MAX_CHAT_LAMPORT,
   parseClientSignalingFrame,
+  parsePostAuthControlFrame,
   parseRegisterRequest,
+  parseServerSignalingFrame,
+  parseSignalingInnerPayload,
   sanitizeFileName,
   setChunkInBitfield,
+  SWARM_CHUNK_SIZE,
+  SWARM_HASH_PAGE_CHUNKS,
   SWARM_HEADER_BYTES,
   SwarmFrameType,
+  type ChatMessageEnvelope,
+  type PeerIdentityCert,
 } from "../src/index.ts";
 
 describe("@simpleim/contracts", () => {
@@ -99,5 +108,180 @@ describe("@simpleim/contracts", () => {
     expect(hasChunkInBitfield(bf, 8)).toBe(false);
     expect(hasChunkInBitfield(bf, 9)).toBe(true);
     expect(countChunksInBitfield(bf, 10)).toBe(3);
+  });
+
+  test("parsePostAuthControlFrame accepts both nested and flat chat.message and bounds lamport", () => {
+    const dummyCert: PeerIdentityCert = {
+      payload: {
+        v: 1,
+        iss: "simpleim-server",
+        kid: "srvk_1",
+        userId: "usr_019300000000",
+        username: "alice",
+        displayName: "Alice",
+        peerId: "peer_019300000000",
+        peerSignPubKey: "A".repeat(43),
+        clientKind: "web",
+        iat: 1_763_000_000_000,
+        exp: 1_763_086_400_000,
+      },
+      serverSig: "B".repeat(86),
+    };
+    const msg: ChatMessageEnvelope = {
+      msgId: "01932c7f-8a1e-7b23-9d4c-112233445566",
+      roomId: "a".repeat(64),
+      lamport: 42,
+      createdAt: 1_763_000_010_000,
+      body: "Hello wire shape!",
+      replyToMsgId: null,
+      authorCert: dummyCert,
+      authorSig: "C".repeat(86),
+    };
+
+    const nested = parsePostAuthControlFrame(
+      JSON.stringify({ type: "chat.message", message: msg }),
+    );
+    const flat = parsePostAuthControlFrame(
+      JSON.stringify({ type: "chat.message", ...msg }),
+    );
+    expect(nested).toEqual({ type: "chat.message", message: msg });
+    expect(flat).toEqual({ type: "chat.message", message: msg });
+
+    // Overflowing Lamport value must be rejected
+    expect(() =>
+      parsePostAuthControlFrame(
+        JSON.stringify({
+          type: "chat.message",
+          message: { ...msg, lamport: MAX_CHAT_LAMPORT + 1 },
+        }),
+      ),
+    ).toThrow();
+  });
+
+  test("paged FileManifest and file.hash_page / file.hash_page_request validate up to 2 GiB", () => {
+    const dummyCert: PeerIdentityCert = {
+      payload: {
+        v: 1,
+        iss: "simpleim-server",
+        kid: "srvk_1",
+        userId: "usr_019300000000",
+        username: "alice",
+        displayName: "Alice",
+        peerId: "peer_019300000000",
+        peerSignPubKey: "A".repeat(43),
+        clientKind: "cli",
+        iat: 1_763_000_000_000,
+        exp: 1_763_086_400_000,
+      },
+      serverSig: "B".repeat(86),
+    };
+    const fileId = "01932c7f-8a1e-7b23-9d4c-112233445566";
+    const twoGiBChunks = 32_768;
+    const expectedPages = Math.ceil(twoGiBChunks / SWARM_HASH_PAGE_CHUNKS); // 64
+    const pagedManifest = {
+      fileId,
+      roomId: "b".repeat(64),
+      fileName: "dataset-2gib.tar.zst",
+      fileSize: twoGiBChunks * SWARM_CHUNK_SIZE,
+      mimeType: "application/zstd",
+      chunkSize: SWARM_CHUNK_SIZE,
+      totalChunks: twoGiBChunks,
+      fileSha256: "d".repeat(64),
+      chunkHashes: [],
+      hashPageHashes: Array.from({ length: expectedPages }, () => "e".repeat(64)),
+      senderCert: dummyCert,
+      senderSig: "C".repeat(86),
+    };
+    expect(isValidFileManifest(pagedManifest)).toBe(true);
+    // Reject inline chunkHashes when totalChunks > 512
+    expect(
+      isValidFileManifest({
+        ...pagedManifest,
+        totalChunks: 513,
+        fileSize: 513 * SWARM_CHUNK_SIZE,
+        chunkHashes: Array.from({ length: 513 }, () => "e".repeat(64)),
+        hashPageHashes: undefined,
+      }),
+    ).toBe(false);
+
+    const reqFrame = parsePostAuthControlFrame(
+      JSON.stringify({
+        type: "file.hash_page_request",
+        fileId,
+        pageIndices: [0, 1, 1],
+      }),
+    );
+    expect(reqFrame).toEqual({
+      type: "file.hash_page_request",
+      fileId,
+      pageIndices: [0, 1],
+    });
+
+    const pageFrame = parsePostAuthControlFrame(
+      JSON.stringify({
+        type: "file.hash_page",
+        fileId,
+        pageIndex: 0,
+        chunkHashes: ["f".repeat(64)],
+      }),
+    );
+    expect(pageFrame).toEqual({
+      type: "file.hash_page",
+      fileId,
+      pageIndex: 0,
+      chunkHashes: ["f".repeat(64)],
+    });
+  });
+
+  test("parseServerSignalingFrame and parseSignalingInnerPayload honor configurable maxFrameBytes", () => {
+    const roomId = "c".repeat(64);
+    const largeDeliverRaw = JSON.stringify({
+      type: "signal.deliver",
+      roomId,
+      fromPeerId: "peer_019300000001",
+      envelope: {
+        nonce: "A".repeat(32),
+        ciphertext: "B".repeat(50_000),
+      },
+    });
+    const largeSdpRaw = JSON.stringify({
+      kind: "sdp-offer",
+      sdp: `v=0\r\na=ext:${"x".repeat(35_000)}\r\n`,
+    });
+
+    // Rejected under default 32 KiB limit
+    expect(() => parseServerSignalingFrame(largeDeliverRaw)).toThrow();
+    expect(() => parseSignalingInnerPayload(largeSdpRaw)).toThrow();
+
+    // Accepted when server meta raises maxSignalPayloadBytes to 64 KiB
+    const parsedDeliver = parseServerSignalingFrame(largeDeliverRaw, {
+      maxFrameBytes: 65_536,
+    });
+    expect(parsedDeliver.type).toBe("signal.deliver");
+    const parsedInner = parseSignalingInnerPayload(largeSdpRaw, {
+      maxFrameBytes: 65_536,
+    });
+    expect(parsedInner.kind).toBe("sdp-offer");
+
+    // Lowered limit (e.g. 8 KiB) rejects 12 KiB envelopes and 10 KiB SDPs
+    const mediumDeliverRaw = JSON.stringify({
+      type: "signal.deliver",
+      roomId,
+      fromPeerId: "peer_019300000001",
+      envelope: {
+        nonce: "A".repeat(32),
+        ciphertext: "B".repeat(12_000),
+      },
+    });
+    const mediumSdpRaw = JSON.stringify({
+      kind: "sdp-answer",
+      sdp: "y".repeat(10_000),
+    });
+    expect(() =>
+      parseServerSignalingFrame(mediumDeliverRaw, { maxFrameBytes: 8_192 }),
+    ).toThrow();
+    expect(() =>
+      parseSignalingInnerPayload(mediumSdpRaw, { maxFrameBytes: 8_192 }),
+    ).toThrow();
   });
 });

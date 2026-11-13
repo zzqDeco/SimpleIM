@@ -11,6 +11,7 @@ import {
   issuePeerIdentityCert,
   sha256Hex,
 } from "@simpleim/crypto";
+import { RoomRuntimeSlot } from "../src/App.tsx";
 import { HttpAuthClient } from "../src/api/http-client.ts";
 import { deriveRoomKeysOffThread } from "../src/crypto/kdf-client.ts";
 import {
@@ -22,7 +23,9 @@ import {
   type OpfsDirectoryHandleLike,
   type OpfsFileHandleLike,
   type OpfsSyncAccessHandleLike,
+  type WebLocksLike,
 } from "../src/storage/opfs-protocol.ts";
+import { BrowserSignalingClient } from "../src/transport/browser-signaling.ts";
 import {
   formatBytes,
   formatMessageTime,
@@ -335,6 +338,433 @@ describe("OPFS Worker Fallback & SyncAccessHandle Storage Protocol", () => {
       sha256Hex(raw.subarray(SWARM_CHUNK_SIZE, SWARM_CHUNK_SIZE * 2)),
     );
   });
+
+  test("enforces maxFallbackBytes cap, isolates OPFS cleanup per instanceId, and fails fast when OPFS Worker crashes", async () => {
+    // 1. Bounded fallback storage when OPFS SyncAccessHandle is unavailable
+    const cappedFallback = new OpfsChunkStorageAdapter({
+      forceInlineFallback: true,
+      storageProvider: () => undefined,
+      maxFallbackBytes: SWARM_CHUNK_SIZE,
+    });
+    const tooLargeManifest = buildDummyManifest({
+      fileId: "019a0000-0000-7000-8000-000000000301",
+      fileName: "huge-video.mp4",
+      fileSize: SWARM_CHUNK_SIZE * 2,
+      totalChunks: 2,
+    });
+    await expect(
+      cappedFallback.initReceivingFile(tooLargeManifest),
+    ).rejects.toThrow("exceeds in-memory fallback cap");
+    await cappedFallback.closeAll();
+
+    // 2. Per-instance OPFS directory isolation across concurrent tabs
+    const instanceDirs = new Map<string, Map<string, Uint8Array>>();
+    const makeInstanceDir = (instName: string): OpfsDirectoryHandleLike => ({
+      async getDirectoryHandle() {
+        throw new Error("Unexpected nested subdir");
+      },
+      async getFileHandle(fileName: string) {
+        let files = instanceDirs.get(instName);
+        if (!files) {
+          files = new Map();
+          instanceDirs.set(instName, files);
+        }
+        if (!files.has(fileName)) {
+          files.set(fileName, new Uint8Array(0));
+        }
+        return {
+          async getFile() {
+            const bytes = files!.get(fileName) ?? new Uint8Array(0);
+            return new File([bytes.slice()], fileName);
+          },
+          async createSyncAccessHandle(): Promise<OpfsSyncAccessHandleLike> {
+            return {
+              write(buf, opts) {
+                const at = opts?.at ?? 0;
+                const cur = files!.get(fileName) ?? new Uint8Array(0);
+                const next = new Uint8Array(
+                  Math.max(cur.byteLength, at + buf.byteLength),
+                );
+                next.set(cur);
+                next.set(buf, at);
+                files!.set(fileName, next);
+                return buf.byteLength;
+              },
+              read(buf, opts) {
+                const at = opts?.at ?? 0;
+                const cur = files!.get(fileName) ?? new Uint8Array(0);
+                const avail = Math.min(buf.byteLength, Math.max(0, cur.byteLength - at));
+                buf.set(cur.subarray(at, at + avail), 0);
+                return avail;
+              },
+              truncate(sz) {
+                const cur = files!.get(fileName) ?? new Uint8Array(0);
+                files!.set(fileName, cur.slice(0, sz));
+              },
+              flush() {},
+              close() {},
+            };
+          },
+        };
+      },
+      async removeEntry(fileName: string) {
+        instanceDirs.get(instName)?.delete(fileName);
+      },
+    });
+
+    const swarmRootHandle: OpfsDirectoryHandleLike = {
+      async getDirectoryHandle(name: string) {
+        if (!instanceDirs.has(name)) {
+          instanceDirs.set(name, new Map());
+        }
+        return makeInstanceDir(name);
+      },
+      async getFileHandle() {
+        throw new Error("Unexpected root file");
+      },
+      async removeEntry(name: string) {
+        instanceDirs.delete(name);
+      },
+    };
+    const sharedRootHandle: OpfsDirectoryHandleLike = {
+      async getDirectoryHandle() {
+        return swarmRootHandle;
+      },
+      async getFileHandle() {
+        throw new Error("Unexpected root file");
+      },
+      async removeEntry() {
+        throw new Error("Must NEVER wipe shared simpleim-swarm root directory!");
+      },
+    };
+
+    const tabACore = new OpfsWorkerStorageCore({
+      instanceId: "tab_instance_a",
+      storageProvider: () => ({ getDirectory: async () => sharedRootHandle }),
+    });
+    const tabBCore = new OpfsWorkerStorageCore({
+      instanceId: "tab_instance_b",
+      storageProvider: () => ({ getDirectory: async () => sharedRootHandle }),
+    });
+
+    const fileA = "019a0000-0000-7000-8000-000000000311";
+    const fileB = "019a0000-0000-7000-8000-000000000312";
+    await tabACore.initReceivingFile(fileA, 16, 1);
+    await tabBCore.initReceivingFile(fileB, 16, 1);
+    await tabACore.writeVerifiedChunk(fileA, 0, new Uint8Array(16).fill(0xaa));
+    await tabBCore.writeVerifiedChunk(fileB, 0, new Uint8Array(16).fill(0xbb));
+
+    // Closing Tab A deletes ONLY tab_instance_a while preserving Tab B's OPFS data!
+    await tabACore.closeAll();
+    expect(instanceDirs.has("tab_instance_a")).toBe(false);
+    expect(instanceDirs.get("tab_instance_b")?.get(`${fileB}.bin`)).toEqual(
+      new Uint8Array(16).fill(0xbb),
+    );
+    await tabBCore.closeAll();
+    expect(instanceDirs.has("tab_instance_b")).toBe(false);
+
+    // 3. OPFS Worker crash fails fast on in-flight + subsequent RPCs and does not hang closeAll()
+    let mockOnError: ((ev: ErrorEvent) => void) | null = null;
+    let terminatedCount = 0;
+    const crashingAdapter = new OpfsChunkStorageAdapter({
+      workerFactory: () => {
+        const fakeWorker = {
+          onmessage: null as ((ev: MessageEvent) => void) | null,
+          onmessageerror: null as (() => void) | null,
+          set onerror(fn: ((ev: ErrorEvent) => void) | null) {
+            mockOnError = fn;
+          },
+          get onerror() {
+            return mockOnError;
+          },
+          postMessage() {
+            queueMicrotask(() => {
+              mockOnError?.({ message: "Simulated OPFS worker crash" } as ErrorEvent);
+            });
+          },
+          terminate() {
+            terminatedCount += 1;
+          },
+        };
+        return fakeWorker as unknown as Worker;
+      },
+    });
+
+    const crashManifest = buildDummyManifest({
+      fileId: "019a0000-0000-7000-8000-000000000321",
+      fileName: "crash.bin",
+      fileSize: 64,
+      totalChunks: 1,
+    });
+    await expect(
+      crashingAdapter.initReceivingFile(crashManifest),
+    ).rejects.toThrow("Simulated OPFS worker crash");
+    expect(terminatedCount).toBe(1);
+
+    // Subsequent calls fail immediately with the stored worker error instead of hanging
+    await expect(
+      crashingAdapter.initReceivingFile(crashManifest),
+    ).rejects.toThrow("Simulated OPFS worker crash");
+
+    // closeAll() resolves immediately without hanging on the dead worker
+    await crashingAdapter.closeAll();
+
+    // 4. Worker crash after writing OPFS chunks cleans up simpleim-swarm/<crashedInstanceId>,
+    // and hard-crashed tab directories are reclaimed via Web Locks while preserving live tabs!
+    const sharedHolders = new Map<string, number>();
+    const exclusiveHeld = new Set<string>();
+    const mockLocks: WebLocksLike = {
+      async request<T>(
+        name: string,
+        options: { mode?: "exclusive" | "shared"; ifAvailable?: boolean },
+        callback: (lock: object | null) => Promise<T> | T,
+      ): Promise<T> {
+        const mode = options.mode ?? "exclusive";
+        if (mode === "shared") {
+          sharedHolders.set(name, (sharedHolders.get(name) ?? 0) + 1);
+          try {
+            return await callback({ name, mode });
+          } finally {
+            const next = (sharedHolders.get(name) ?? 1) - 1;
+            if (next <= 0) {
+              sharedHolders.delete(name);
+            } else {
+              sharedHolders.set(name, next);
+            }
+          }
+        }
+        const busy =
+          (sharedHolders.get(name) ?? 0) > 0 || exclusiveHeld.has(name);
+        if (options.ifAvailable && busy) {
+          return await callback(null);
+        }
+        exclusiveHeld.add(name);
+        try {
+          return await callback({ name, mode });
+        } finally {
+          exclusiveHeld.delete(name);
+        }
+      },
+    };
+
+    const enumerableSwarmRoot: OpfsDirectoryHandleLike = {
+      async getDirectoryHandle(name: string, opts?: { create?: boolean }) {
+        if (!instanceDirs.has(name)) {
+          if (!opts?.create) {
+            throw new Error(`Directory not found: ${name}`);
+          }
+          instanceDirs.set(name, new Map());
+        }
+        return makeInstanceDir(name);
+      },
+      async getFileHandle() {
+        throw new Error("Unexpected root file");
+      },
+      async removeEntry(name: string) {
+        instanceDirs.delete(name);
+      },
+      async *keys() {
+        for (const k of Array.from(instanceDirs.keys())) {
+          yield k;
+        }
+      },
+    };
+    const enumerableRoot: OpfsDirectoryHandleLike = {
+      async getDirectoryHandle() {
+        return enumerableSwarmRoot;
+      },
+      async getFileHandle() {
+        throw new Error("Unexpected root file");
+      },
+      async removeEntry() {
+        throw new Error("Must NEVER wipe shared root!");
+      },
+    };
+
+    // 4a. Worker writes to OPFS then crashes -> main-thread cleanup deletes simpleim-swarm/<workerCrashInst>
+    instanceDirs.set(
+      "worker_crashed_inst",
+      new Map([["partial.bin", new Uint8Array(32).fill(0x55)]]),
+    );
+    let triggerLateCrash: ((ev: ErrorEvent) => void) | null = null;
+    const midSessionCrashAdapter = new OpfsChunkStorageAdapter({
+      instanceId: "worker_crashed_inst",
+      storageProvider: () => ({ getDirectory: async () => enumerableRoot }),
+      locksProvider: () => mockLocks,
+      workerFactory: () => {
+        const w = {
+          onmessage: null as ((ev: MessageEvent) => void) | null,
+          onmessageerror: null as (() => void) | null,
+          set onerror(fn: ((ev: ErrorEvent) => void) | null) {
+            triggerLateCrash = fn;
+          },
+          get onerror() {
+            return triggerLateCrash;
+          },
+          postMessage(req: { id: number; type: string }) {
+            queueMicrotask(() => {
+              w.onmessage?.({
+                data: { id: req.id, ok: true, type: req.type },
+              } as MessageEvent);
+            });
+          },
+          terminate() {},
+        };
+        return w as unknown as Worker;
+      },
+    });
+
+    triggerLateCrash?.({ message: "OPFS worker OOM crash" } as ErrorEvent);
+    await midSessionCrashAdapter.closeAll();
+    expect(instanceDirs.has("worker_crashed_inst")).toBe(false);
+
+    // 4b. Hard tab crash leaves abandoned_tab_inst with NO Web Lock, while live_tab_inst holds a shared Web Lock
+    instanceDirs.set(
+      "abandoned_tab_inst",
+      new Map([["orphan.bin", new Uint8Array(64).fill(0x99)]]),
+    );
+
+    const liveTabCore = new OpfsWorkerStorageCore({
+      instanceId: "live_tab_inst",
+      storageProvider: () => ({ getDirectory: async () => enumerableRoot }),
+      locksProvider: () => mockLocks,
+    });
+    const liveFileId = "019a0000-0000-7000-8000-000000000399";
+    await liveTabCore.initReceivingFile(liveFileId, 16, 1);
+    await liveTabCore.writeVerifiedChunk(
+      liveFileId,
+      0,
+      new Uint8Array(16).fill(0x77),
+    );
+    // Notice: abandoned_tab_inst was already swept by liveTabCore on startup!
+    expect(instanceDirs.has("abandoned_tab_inst")).toBe(false);
+    expect(instanceDirs.has("live_tab_inst")).toBe(true);
+
+    // Re-plant another crashed tab directory and open a chat-only OpfsChunkStorageAdapter on main thread
+    instanceDirs.set(
+      "second_crashed_tab",
+      new Map([["orphan2.bin", new Uint8Array(64).fill(0x88)]]),
+    );
+    const freshTabAdapter = new OpfsChunkStorageAdapter({
+      instanceId: "fresh_chat_tab",
+      forceInlineFallback: true,
+      storageProvider: () => ({ getDirectory: async () => enumerableRoot }),
+      locksProvider: () => mockLocks,
+    });
+    await freshTabAdapter.closeAll();
+
+    // second_crashed_tab was reclaimed, while live_tab_inst's active file remained 100% untouched!
+    expect(instanceDirs.has("second_crashed_tab")).toBe(false);
+    expect(instanceDirs.get("live_tab_inst")?.get(`${liveFileId}.bin`)).toEqual(
+      new Uint8Array(16).fill(0x77),
+    );
+    await liveTabCore.closeAll();
+    expect(instanceDirs.has("live_tab_inst")).toBe(false);
+  });
+});
+
+describe("BrowserSignalingClient configurable maxSignalPayloadBytes", () => {
+  test("accepts >32 KiB signal.relay / signal.deliver when maxSignalPayloadBytes is raised and drops under default", async () => {
+    const roomId = "e".repeat(64);
+    const peerA = "peer_019a0000000070008000000000000011";
+    const peerB = "peer_019a0000000070008000000000000022";
+    const bigCiphertext = "K".repeat(48_000);
+
+    const makeMockWsFactory = () => {
+      let lastSocket: {
+        readyState: number;
+        binaryType: string;
+        sent: string[];
+        onopen: (() => void) | null;
+        onmessage: ((ev: { data: unknown }) => void) | null;
+        onerror: (() => void) | null;
+        onclose: ((ev: { code: number }) => void) | null;
+        send(d: string): void;
+        close(): void;
+      } | null = null;
+
+      const factory = (_url: string) => {
+        const sock = {
+          readyState: WebSocket.OPEN,
+          binaryType: "arraybuffer",
+          sent: [] as string[],
+          onopen: null as (() => void) | null,
+          onmessage: null as ((ev: { data: unknown }) => void) | null,
+          onerror: null as (() => void) | null,
+          onclose: null as ((ev: { code: number }) => void) | null,
+          send(d: string) {
+            sock.sent.push(d);
+          },
+          close() {
+            sock.readyState = WebSocket.CLOSED;
+          },
+        };
+        lastSocket = sock;
+        queueMicrotask(() => sock.onopen?.());
+        return sock as unknown as WebSocket;
+      };
+      return { factory, getSocket: () => lastSocket! };
+    };
+
+    const defaultRig = makeMockWsFactory();
+    const defaultClient = new BrowserSignalingClient({
+      peerId: peerA,
+      wsUrl: "ws://127.0.0.1:3000/ws/v1/signaling",
+      webSocketFactory: defaultRig.factory,
+    });
+    const defaultFrames: unknown[] = [];
+    defaultClient.onServerFrame((f) => defaultFrames.push(f));
+    await defaultClient.connect();
+
+    expect(() =>
+      defaultClient.send({
+        type: "signal.relay",
+        roomId,
+        toPeerId: peerB,
+        envelope: { nonce: "N".repeat(32), ciphertext: bigCiphertext },
+      }),
+    ).toThrow();
+    defaultRig.getSocket().onmessage?.({
+      data: JSON.stringify({
+        type: "signal.deliver",
+        roomId,
+        fromPeerId: peerB,
+        envelope: { nonce: "N".repeat(32), ciphertext: bigCiphertext },
+      }),
+    });
+    expect(defaultFrames).toHaveLength(0);
+    defaultClient.disconnect();
+
+    const raisedRig = makeMockWsFactory();
+    const raisedClient = new BrowserSignalingClient({
+      peerId: peerA,
+      wsUrl: "ws://127.0.0.1:3000/ws/v1/signaling",
+      maxSignalPayloadBytes: 65_536,
+      webSocketFactory: raisedRig.factory,
+    });
+    const raisedFrames: unknown[] = [];
+    raisedClient.onServerFrame((f) => raisedFrames.push(f));
+    await raisedClient.connect();
+
+    raisedClient.send({
+      type: "signal.relay",
+      roomId,
+      toPeerId: peerB,
+      envelope: { nonce: "N".repeat(32), ciphertext: bigCiphertext },
+    });
+    expect(raisedRig.getSocket().sent).toHaveLength(1);
+
+    raisedRig.getSocket().onmessage?.({
+      data: JSON.stringify({
+        type: "signal.deliver",
+        roomId,
+        fromPeerId: peerB,
+        envelope: { nonce: "N".repeat(32), ciphertext: bigCiphertext },
+      }),
+    });
+    expect(raisedFrames).toHaveLength(1);
+    raisedClient.disconnect();
+  });
 });
 
 describe("HTTP Auth Client CSRF & Off-Thread KDF", () => {
@@ -410,5 +840,93 @@ describe("HTTP Auth Client CSRF & Off-Thread KDF", () => {
     expect(sha256Hex(actual.signalingKey)).toBe(sha256Hex(expected.signalingKey));
     expect(sha256Hex(actual.roomAuthKey)).toBe(sha256Hex(expected.roomAuthKey));
     expect(sha256Hex(actual.roomAppKey)).toBe(sha256Hex(expected.roomAppKey));
+  });
+
+  test("HttpAuthClient.getMe() recovers csrfToken on reload and refuses to restore session without CSRF capability", async () => {
+    let lastLogoutCsrf: string | null = null;
+    let includeCsrfInMe = true;
+
+    const mockFetch: typeof fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      const hdrs = new Headers(init?.headers);
+      if (url.endsWith("/api/v1/auth/me")) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            user: {
+              id: "usr_019a0000000070008000000000000077",
+              username: "reloaded_alice",
+              displayName: "Alice Reloaded",
+              createdAt: 1_763_000_000_000,
+            },
+            ...(includeCsrfInMe ? { csrfToken: "csrf_recovered_from_me_77" } : {}),
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/auth/logout")) {
+        lastLogoutCsrf = hdrs.get("x-csrf-token");
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const reloadedClient = new HttpAuthClient({
+      baseUrl: "http://127.0.0.1:3000",
+      fetchImpl: mockFetch,
+      enableBroadcastChannel: false,
+      csrfSyncTimeoutMs: 10,
+    });
+    const restored = await reloadedClient.getMe();
+    expect(restored?.username).toBe("reloaded_alice");
+    expect(reloadedClient.hasCsrfToken()).toBe(true);
+    await reloadedClient.logout();
+    expect(lastLogoutCsrf).toBe("csrf_recovered_from_me_77");
+    reloadedClient.dispose();
+
+    // When /auth/me omits csrfToken and no sibling tab answers, getMe() returns null rather than broken auth
+    includeCsrfInMe = false;
+    const unrecoverableClient = new HttpAuthClient({
+      baseUrl: "http://127.0.0.1:3000",
+      fetchImpl: mockFetch,
+      enableBroadcastChannel: false,
+      csrfSyncTimeoutMs: 10,
+    });
+    expect(await unrecoverableClient.getMe()).toBeNull();
+    expect(unrecoverableClient.getCurrentUser()).toBeNull();
+    expect(unrecoverableClient.hasCsrfToken()).toBe(false);
+    unrecoverableClient.dispose();
+  });
+
+  test("RoomRuntimeSlot prevents obsolete join attempt failure from clearing newer active runtime", () => {
+    const slot = new RoomRuntimeSlot<{ id: string }>();
+
+    // Attempt #1 starts
+    const gen1 = slot.beginAttempt();
+    const rt1 = { id: "runtime_1" };
+    expect(slot.installIfCurrent(gen1, rt1)).toBe(true);
+    expect(slot.current).toBe(rt1);
+
+    // User triggers teardown + Attempt #2 before Attempt #1's catch block runs
+    expect(slot.takeActiveForTeardown()).toBe(rt1);
+    const gen2 = slot.beginAttempt();
+    const rt2 = { id: "runtime_2" };
+    expect(slot.installIfCurrent(gen2, rt2)).toBe(true);
+    expect(slot.current).toBe(rt2);
+
+    // Attempt #1 fails late and runs clearIfOwned(rt1) -> MUST NOT touch rt2!
+    expect(slot.isCurrentAttempt(gen1)).toBe(false);
+    expect(slot.clearIfOwned(rt1)).toBe(false);
+    expect(slot.current).toBe(rt2);
+
+    // Stale installIfCurrent from an even older attempt is also rejected
+    expect(slot.installIfCurrent(gen1, { id: "stale" })).toBe(false);
+    expect(slot.current).toBe(rt2);
   });
 });
