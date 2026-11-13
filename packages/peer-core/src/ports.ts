@@ -162,7 +162,9 @@ export interface RoomPeerEngineOptions {
   chunkStorage: ChunkStoragePort;
   events?: RoomPeerEngineEvents;
   maxInFlightPerPeer?: number;
+  requestTimeoutMs?: number;
   helloAuthTimeoutMs?: number;
+  maxSignalPayloadBytes?: number;
   now?: () => number;
 }
 

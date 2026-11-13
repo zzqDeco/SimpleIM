@@ -2,6 +2,7 @@ import {
   ContractValidationError,
   isValidUuid,
   MAX_CHAT_BODY_BYTES,
+  MAX_CHAT_LAMPORT,
   MAX_SYNC_MESSAGES,
   type ChatMessageEnvelope,
   type PeerIdentityCert,
@@ -75,6 +76,11 @@ export class ChatSyncManager {
       throw new ContractValidationError("Invalid replyToMsgId UUID");
     }
 
+    if (this.lamport >= MAX_CHAT_LAMPORT) {
+      throw new ContractValidationError(
+        "Local Lamport clock reached maximum safe bound",
+      );
+    }
     this.lamport += 1;
     const createdAt = this.now();
     const envelope = signChatMessage({
@@ -95,7 +101,10 @@ export class ChatSyncManager {
     message: ChatMessageEnvelope,
     isHistoricalSync: boolean,
   ): boolean {
-    if (!verifyChatMessage(message, this.serverSignPubKey, this.roomId)) {
+    if (
+      message.lamport > MAX_CHAT_LAMPORT ||
+      !verifyChatMessage(message, this.serverSignPubKey, this.roomId)
+    ) {
       return false;
     }
     if (this.messagesById.has(message.msgId)) {
