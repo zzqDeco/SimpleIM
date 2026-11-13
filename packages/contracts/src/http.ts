@@ -60,6 +60,7 @@ export type AuthResponse = WebAuthResponse | CliAuthResponse;
 export interface MeResponse {
   ok: true;
   user: UserProfile;
+  csrfToken?: string;
 }
 
 export interface PeerIdentityCertPayload {

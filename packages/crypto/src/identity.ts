@@ -2,6 +2,7 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import {
+  buildHashPageSignInput,
   buildPopSignMessage,
   canonicalizeChatSignInput,
   canonicalizeFileManifestSignInput,
@@ -9,8 +10,10 @@ import {
   isValidChatMessageEnvelope,
   isValidFileManifest,
   isValidPeerIdentityCert,
+  MAX_SWARM_FILE_CHUNKS,
   sanitizeFileName,
   SWARM_CHUNK_SIZE,
+  SWARM_HASH_PAGE_CHUNKS,
   type ChatMessageEnvelope,
   type ClientKind,
   type FileManifest,
@@ -425,7 +428,28 @@ export function verifyChatMessage(
   );
 }
 
-export async function createSignedFileManifestFromChunks(params: {
+export function computeHashPageDigest(
+  fileId: string,
+  pageIndex: number,
+  pageChunkHashes: readonly string[],
+): string {
+  return sha256Hex(buildHashPageSignInput(fileId, pageIndex, pageChunkHashes));
+}
+
+export function verifyHashPage(
+  fileId: string,
+  pageIndex: number,
+  pageChunkHashes: readonly string[],
+  expectedPageDigestHex: string,
+): boolean {
+  const actual = computeHashPageDigest(fileId, pageIndex, pageChunkHashes);
+  return constantTimeEqual(
+    utf8ToBytes(actual),
+    utf8ToBytes(expectedPageDigestHex.toLowerCase()),
+  );
+}
+
+export async function createSignedFileManifestWithPages(params: {
   roomId: string;
   fileName: string;
   fileSize: number;
@@ -434,11 +458,16 @@ export async function createSignedFileManifestFromChunks(params: {
   senderCert: PeerIdentityCert;
   peerSignPrivKey: Uint8Array | string;
   fileId?: string;
-}): Promise<FileManifest> {
+}): Promise<{ manifest: FileManifest; chunkHashPages: string[][] }> {
   const safeName = sanitizeFileName(params.fileName);
   const totalChunks =
     params.fileSize === 0 ? 0 : Math.ceil(params.fileSize / SWARM_CHUNK_SIZE);
-  const chunkHashes: string[] = [];
+  if (totalChunks > MAX_SWARM_FILE_CHUNKS) {
+    throw new Error(
+      `File exceeds maximum Swarm limit (${MAX_SWARM_FILE_CHUNKS} chunks / 2 GiB)`,
+    );
+  }
+  const allChunkHashes: string[] = [];
   const wholeHasher = sha256.create();
 
   for (let i = 0; i < totalChunks; i++) {
@@ -448,7 +477,7 @@ export async function createSignedFileManifestFromChunks(params: {
     if (bytes.byteLength !== len) {
       throw new Error(`Chunk ${i} length mismatch: expected ${len}, got ${bytes.byteLength}`);
     }
-    chunkHashes.push(sha256Hex(bytes));
+    allChunkHashes.push(sha256Hex(bytes));
     wholeHasher.update(bytes);
   }
 
@@ -461,6 +490,20 @@ export async function createSignedFileManifestFromChunks(params: {
 
   const fileId = params.fileId ?? generateUuidV7();
   const mimeType = params.mimeType || "application/octet-stream";
+
+  const chunkHashPages: string[][] = [];
+  for (let i = 0; i < allChunkHashes.length; i += SWARM_HASH_PAGE_CHUNKS) {
+    chunkHashPages.push(allChunkHashes.slice(i, i + SWARM_HASH_PAGE_CHUNKS));
+  }
+
+  const isPaged = totalChunks > SWARM_HASH_PAGE_CHUNKS;
+  const inlineChunkHashes = isPaged ? [] : allChunkHashes;
+  const hashPageHashes = isPaged
+    ? chunkHashPages.map((pageHashes, pageIndex) =>
+        computeHashPageDigest(fileId, pageIndex, pageHashes),
+      )
+    : undefined;
+
   const signBytes = canonicalizeFileManifestSignInput({
     fileId,
     roomId: params.roomId,
@@ -470,11 +513,12 @@ export async function createSignedFileManifestFromChunks(params: {
     chunkSize: SWARM_CHUNK_SIZE,
     totalChunks,
     fileSha256: finalFileSha256,
-    chunkHashes,
+    chunkHashes: inlineChunkHashes,
+    ...(hashPageHashes !== undefined ? { hashPageHashes } : {}),
   });
   const senderSig = signEd25519(params.peerSignPrivKey, signBytes);
 
-  return {
+  const manifest: FileManifest = {
     fileId,
     roomId: params.roomId,
     fileName: safeName,
@@ -483,10 +527,27 @@ export async function createSignedFileManifestFromChunks(params: {
     chunkSize: SWARM_CHUNK_SIZE,
     totalChunks,
     fileSha256: finalFileSha256,
-    chunkHashes,
+    chunkHashes: inlineChunkHashes,
+    ...(hashPageHashes !== undefined ? { hashPageHashes } : {}),
     senderCert: params.senderCert,
     senderSig,
   };
+
+  return { manifest, chunkHashPages };
+}
+
+export async function createSignedFileManifestFromChunks(params: {
+  roomId: string;
+  fileName: string;
+  fileSize: number;
+  mimeType?: string;
+  readChunk: (chunkIndex: number, offset: number, length: number) => Promise<Uint8Array>;
+  senderCert: PeerIdentityCert;
+  peerSignPrivKey: Uint8Array | string;
+  fileId?: string;
+}): Promise<FileManifest> {
+  const { manifest } = await createSignedFileManifestWithPages(params);
+  return manifest;
 }
 
 export function verifyFileManifest(
@@ -513,6 +574,9 @@ export function verifyFileManifest(
     totalChunks: manifest.totalChunks,
     fileSha256: manifest.fileSha256,
     chunkHashes: manifest.chunkHashes,
+    ...(manifest.hashPageHashes !== undefined
+      ? { hashPageHashes: manifest.hashPageHashes }
+      : {}),
   });
   return verifyEd25519(
     manifest.senderCert.payload.peerSignPubKey,

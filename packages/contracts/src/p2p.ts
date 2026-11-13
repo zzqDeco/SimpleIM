@@ -21,9 +21,16 @@ export const SWARM_PROTOCOL_VERSION = 1;
 
 export const HELLO_AUTH_TIMEOUT_MS = 10_000;
 export const MAX_CHAT_BODY_BYTES = 16_384;
+export const MAX_CHAT_LAMPORT = 9_007_199_253_700_000;
 export const MAX_SYNC_MESSAGES = 500;
 export const MAX_PEERS_PER_ROOM = 16;
 export const MAX_POISON_STRIKES = 3;
+
+export const SWARM_HASH_PAGE_CHUNKS = 512; // 32 MiB inline hash threshold
+export const MAX_SWARM_FILE_CHUNKS = 32_768; // 2 GiB maximum single-file chunks
+export const MAX_SWARM_HASH_PAGES = Math.ceil(
+  MAX_SWARM_FILE_CHUNKS / SWARM_HASH_PAGE_CHUNKS,
+); // 64 pages max
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -99,6 +106,7 @@ export interface FileManifest {
   totalChunks: number;
   fileSha256: string;
   chunkHashes: string[];
+  hashPageHashes?: string[];
   senderCert: PeerIdentityCert;
   senderSig: string;
 }
@@ -106,6 +114,19 @@ export interface FileManifest {
 export interface FileAnnounceFrame {
   type: "file.announce";
   manifest: FileManifest;
+}
+
+export interface FileHashPageRequestFrame {
+  type: "file.hash_page_request";
+  fileId: string;
+  pageIndices: number[];
+}
+
+export interface FileHashPageFrame {
+  type: "file.hash_page";
+  fileId: string;
+  pageIndex: number;
+  chunkHashes: string[];
 }
 
 export interface SyncSummaryFrame {
@@ -131,6 +152,8 @@ export type PostAuthControlFrame =
   | PresencePongFrame
   | ChatMessageFrame
   | FileAnnounceFrame
+  | FileHashPageRequestFrame
+  | FileHashPageFrame
   | SyncSummaryFrame
   | SyncRequestFrame
   | SyncBatchFrame;
@@ -172,6 +195,16 @@ export function canonicalizeChatSignInput(input: {
   return new TextEncoder().encode(`simpleim/v1/chat-msg\0${canonical}`);
 }
 
+export function buildHashPageSignInput(
+  fileId: string,
+  pageIndex: number,
+  chunkHashes: readonly string[],
+): Uint8Array {
+  return new TextEncoder().encode(
+    `simpleim/v1/hash-page\0${fileId}:${pageIndex}\0${chunkHashes.join(",")}`,
+  );
+}
+
 export function canonicalizeFileManifestSignInput(input: {
   fileId: string;
   roomId: string;
@@ -182,8 +215,9 @@ export function canonicalizeFileManifestSignInput(input: {
   totalChunks: number;
   fileSha256: string;
   chunkHashes: string[];
+  hashPageHashes?: string[];
 }): Uint8Array {
-  const canonical = JSON.stringify({
+  const payloadObj: Record<string, unknown> = {
     fileId: input.fileId,
     roomId: input.roomId,
     fileName: input.fileName,
@@ -193,7 +227,11 @@ export function canonicalizeFileManifestSignInput(input: {
     totalChunks: input.totalChunks,
     fileSha256: input.fileSha256,
     chunkHashes: input.chunkHashes,
-  });
+  };
+  if (input.hashPageHashes !== undefined) {
+    payloadObj.hashPageHashes = input.hashPageHashes;
+  }
+  const canonical = JSON.stringify(payloadObj);
   return new TextEncoder().encode(`simpleim/v1/file-manifest\0${canonical}`);
 }
 
@@ -207,6 +245,7 @@ export function isValidChatMessageEnvelope(
     typeof value.lamport !== "number" ||
     !Number.isSafeInteger(value.lamport) ||
     value.lamport < 1 ||
+    value.lamport > MAX_CHAT_LAMPORT ||
     typeof value.createdAt !== "number" ||
     !Number.isSafeInteger(value.createdAt) ||
     value.createdAt <= 0 ||
@@ -240,16 +279,36 @@ export function isValidFileManifest(value: unknown): value is FileManifest {
     typeof value.totalChunks !== "number" ||
     !Number.isSafeInteger(value.totalChunks) ||
     value.totalChunks < 0 ||
+    value.totalChunks > MAX_SWARM_FILE_CHUNKS ||
     !isValidSha256Hex(value.fileSha256) ||
-    !Array.isArray(value.chunkHashes) ||
-    value.chunkHashes.length !== value.totalChunks ||
-    !value.chunkHashes.every(isValidSha256Hex)
+    !Array.isArray(value.chunkHashes)
   ) {
     return false;
   }
   const expectedChunks =
     value.fileSize === 0 ? 0 : Math.ceil(value.fileSize / SWARM_CHUNK_SIZE);
   if (value.totalChunks !== expectedChunks) return false;
+
+  if (value.totalChunks <= SWARM_HASH_PAGE_CHUNKS) {
+    if (
+      value.hashPageHashes !== undefined ||
+      value.chunkHashes.length !== value.totalChunks ||
+      !value.chunkHashes.every(isValidSha256Hex)
+    ) {
+      return false;
+    }
+  } else {
+    const expectedPages = Math.ceil(value.totalChunks / SWARM_HASH_PAGE_CHUNKS);
+    if (
+      value.chunkHashes.length !== 0 ||
+      !Array.isArray(value.hashPageHashes) ||
+      value.hashPageHashes.length !== expectedPages ||
+      !value.hashPageHashes.every(isValidSha256Hex)
+    ) {
+      return false;
+    }
+  }
+
   try {
     if (sanitizeFileName(value.fileName) !== value.fileName) return false;
   } catch {
@@ -325,16 +384,78 @@ export function parsePostAuthControlFrame(raw: string): PostAuthControlFrame {
       return { type: obj.type, sentAt: obj.sentAt };
     }
     case "chat.message": {
-      if (!isValidChatMessageEnvelope(obj.message)) {
+      const candidate = obj.message !== undefined ? obj.message : obj;
+      if (!isValidChatMessageEnvelope(candidate)) {
         throw new ContractValidationError("Invalid chat.message envelope", "invalid_frame");
       }
-      return { type: "chat.message", message: obj.message };
+      return {
+        type: "chat.message",
+        message: {
+          msgId: candidate.msgId,
+          roomId: candidate.roomId,
+          lamport: candidate.lamport,
+          createdAt: candidate.createdAt,
+          body: candidate.body,
+          replyToMsgId: candidate.replyToMsgId,
+          authorCert: candidate.authorCert,
+          authorSig: candidate.authorSig,
+        },
+      };
     }
     case "file.announce": {
       if (!isValidFileManifest(obj.manifest)) {
         throw new ContractValidationError("Invalid file.announce manifest", "invalid_frame");
       }
       return { type: "file.announce", manifest: obj.manifest };
+    }
+    case "file.hash_page_request": {
+      if (
+        !isValidUuid(obj.fileId) ||
+        !Array.isArray(obj.pageIndices) ||
+        obj.pageIndices.length < 1 ||
+        obj.pageIndices.length > MAX_SWARM_HASH_PAGES ||
+        !obj.pageIndices.every(
+          (idx): idx is number =>
+            typeof idx === "number" &&
+            Number.isInteger(idx) &&
+            idx >= 0 &&
+            idx < MAX_SWARM_HASH_PAGES,
+        )
+      ) {
+        throw new ContractValidationError(
+          "Invalid file.hash_page_request",
+          "invalid_frame",
+        );
+      }
+      return {
+        type: "file.hash_page_request",
+        fileId: obj.fileId,
+        pageIndices: Array.from(new Set(obj.pageIndices)),
+      };
+    }
+    case "file.hash_page": {
+      if (
+        !isValidUuid(obj.fileId) ||
+        typeof obj.pageIndex !== "number" ||
+        !Number.isInteger(obj.pageIndex) ||
+        obj.pageIndex < 0 ||
+        obj.pageIndex >= MAX_SWARM_HASH_PAGES ||
+        !Array.isArray(obj.chunkHashes) ||
+        obj.chunkHashes.length < 1 ||
+        obj.chunkHashes.length > SWARM_HASH_PAGE_CHUNKS ||
+        !obj.chunkHashes.every(isValidSha256Hex)
+      ) {
+        throw new ContractValidationError(
+          "Invalid file.hash_page",
+          "invalid_frame",
+        );
+      }
+      return {
+        type: "file.hash_page",
+        fileId: obj.fileId,
+        pageIndex: obj.pageIndex,
+        chunkHashes: obj.chunkHashes,
+      };
     }
     case "sync.summary": {
       if (
