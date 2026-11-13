@@ -1,0 +1,34 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Standalone compiled CLI binaries
+apps/cli/bin/
+simpleim
+simpleim-*
+
+# Runtime data, local databases & temp chunk files
+.runtime/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.simpleim.part
+*.simpleim.bitfield
+
+# Environment & secrets (NEVER commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor & OS metadata
+.DS_Store
+.idea/
+.vscode/
+playwright-report/
+test-results/
