@@ -29,6 +29,12 @@ export interface MetaResponse {
   limits: ServerLimits;
 }
 
+export interface VersionResponse {
+  ok: true;
+  version: string;
+  sha: string;
+}
+
 export interface RegisterRequest {
   username: string;
   password: string;

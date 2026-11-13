@@ -34,6 +34,8 @@ export interface SimpleImServerOptions {
   readonly serverIdentityPrivateKey?: string;
   readonly serverKeyId?: string;
   readonly nodeEnv?: string;
+  readonly version?: string;
+  readonly commitSha?: string;
   readonly allowedOrigins?: readonly string[];
   readonly stunUrls?: readonly string[];
   readonly coturnUrls?: readonly string[];
@@ -167,6 +169,8 @@ export function createSimpleImServer(
     allowedOrigins,
     secureCookies,
     trustProxy,
+    version: options.version,
+    commitSha: options.commitSha,
   });
 
   const wsHandler = new WsHandler({

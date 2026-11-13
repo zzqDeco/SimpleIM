@@ -1103,4 +1103,27 @@ describe("SimpleIM Server Integration Suite", () => {
     const closed = await closePromise;
     expect(closed.code).toBe(1009);
   });
+
+  test("9. GET /api/v1/version reports immutable release metadata and custom stunUrls overrides default STUN endpoints", async () => {
+    const srv = startTestServer({
+      version: "v0.1.0",
+      commitSha: "453129c0123456789abcdef0123456789abcdef0",
+      stunUrls: ["stun:120.25.210.202:3478"],
+    });
+
+    const verRes = await fetch(`${srv.url}/api/v1/version`);
+    expect(verRes.status).toBe(200);
+    expect(await verRes.json()).toEqual({
+      ok: true,
+      version: "v0.1.0",
+      sha: "453129c0123456789abcdef0123456789abcdef0",
+    });
+
+    const metaRes = await fetch(`${srv.url}/api/v1/meta`);
+    expect(metaRes.status).toBe(200);
+    const meta = (await metaRes.json()) as MetaResponse;
+    expect(meta.iceServers).toEqual([
+      { urls: ["stun:120.25.210.202:3478"] },
+    ]);
+  });
 });

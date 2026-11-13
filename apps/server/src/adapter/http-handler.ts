@@ -4,6 +4,7 @@ import type {
   ErrorCode,
   MeResponse,
   PeerCertResponse,
+  VersionResponse,
   WebAuthResponse,
 } from "@simpleim/contracts";
 import type { AuthService, IssuedAuthSession } from "../app/index.ts";
@@ -36,6 +37,8 @@ export interface HttpHandlerDependencies {
   readonly allowedOrigins: ReadonlySet<string>;
   readonly secureCookies: boolean;
   readonly trustProxy: boolean;
+  readonly version?: string;
+  readonly commitSha?: string;
 }
 
 export class HttpHandler {
@@ -45,6 +48,8 @@ export class HttpHandler {
   private readonly allowedOrigins: ReadonlySet<string>;
   private readonly secureCookies: boolean;
   private readonly trustProxy: boolean;
+  private readonly version: string;
+  private readonly commitSha: string;
 
   constructor(deps: HttpHandlerDependencies) {
     this.authService = deps.authService;
@@ -53,6 +58,8 @@ export class HttpHandler {
     this.allowedOrigins = deps.allowedOrigins;
     this.secureCookies = deps.secureCookies;
     this.trustProxy = deps.trustProxy;
+    this.version = deps.version ?? "0.1.0";
+    this.commitSha = deps.commitSha ?? "unknown";
   }
 
   async handle(
@@ -109,6 +116,23 @@ export class HttpHandler {
 
       if (method === "GET" && path === "/healthz") {
         const res = this.jsonResponse(200, { ok: true }, corsHeaders);
+        this.logBoundary("info", "http.request", {
+          corrId,
+          method,
+          path,
+          status: 200,
+          durationMs: this.clock.nowMs() - startMs,
+        });
+        return res;
+      }
+
+      if (method === "GET" && path === "/api/v1/version") {
+        const payload: VersionResponse = {
+          ok: true,
+          version: this.version,
+          sha: this.commitSha,
+        };
+        const res = this.jsonResponse(200, payload, corsHeaders);
         this.logBoundary("info", "http.request", {
           corrId,
           method,
