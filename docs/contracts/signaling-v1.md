@@ -16,6 +16,10 @@ All HTTP endpoints are JSON-encoded (`Content-Type: application/json; charset=ut
 
 ## 1. Metadata & ICE Configuration
 
+### `GET /healthz` & `GET /api/v1/version`
+- `GET /healthz` returns `{ "ok": true }` for container and reverse-proxy liveness probes.
+- `GET /api/v1/version` returns `{ "ok": true, "version": "v0.1.0", "sha": "<commit-sha>" }` so immutable release verification can assert the exact deployed container revision.
+
 ### `GET /api/v1/meta`
 Public endpoint returning the server's `Ed25519` identity public key and ICE bootstrap configuration. When called with an authenticated session and `COTURN_SHARED_SECRET` is configured, includes short-lived HMAC TURN credentials.
 

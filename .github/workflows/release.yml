@@ -1,0 +1,372 @@
+name: Release production
+
+on:
+  push:
+    branches: ["release/v*"]
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  ACR_REGISTRY_PUBLIC_HOST: ${{ vars.ACR_REGISTRY_PUBLIC_HOST }}
+  ACR_REGISTRY_PULL_HOST: ${{ vars.ACR_REGISTRY_PULL_HOST }}
+  ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require new semantic release branch from current main
+        id: check
+        env:
+          CREATED: ${{ github.event.created }}
+          FORCED: ${{ github.event.forced }}
+          REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          [[ "$CREATED" == true && "$FORCED" == false ]] || { echo 'Published release branches are permanent archives; use a new version.' >&2; exit 1; }
+          [[ "$REF_NAME" =~ ^release/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+          version=${REF_NAME#release/}
+          main_sha=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+          [[ "$SOURCE_SHA" == "$main_sha" ]] || { echo 'Release source must exactly match current main.' >&2; exit 1; }
+          if gh api "repos/$GH_REPO/git/ref/tags/$version" >/dev/null 2>&1; then
+            echo 'This release tag already exists and must never be rewritten.' >&2; exit 1
+          fi
+          printf 'version=%s\nsha=%s\n' "$version" "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check registry configuration
+        run: |
+          python3 ops/manifest.py registry-check \
+            --registry-public-host "$ACR_REGISTRY_PUBLIC_HOST" \
+            --registry-pull-host "$ACR_REGISTRY_PULL_HOST" \
+            --registry-namespace "$ACR_NAMESPACE"
+
+  verify:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  images:
+    needs: [validate, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BUILDX_NO_DEFAULT_OCI_ARTIFACT: "1"
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Compile standalone Linux x64 CLI binary
+        run: |
+          bun install --frozen-lockfile
+          bun build --compile --target=bun-linux-x64 apps/cli/src/main.ts --outfile simpleim-linux-x64
+          chmod +x simpleim-linux-x64
+          ./simpleim-linux-x64 --help >/dev/null
+          sha256sum simpleim-linux-x64 > simpleim-linux-x64.sha256
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.36.1
+
+      - name: Determine registry mode (ACR or GHCR + SSH bundle)
+        id: mode
+        env:
+          HAS_ACR_SECRET: ${{ secrets.ACR_PUSH_PASSWORD != '' }}
+        run: |
+          if [[ -n "$ACR_REGISTRY_PUBLIC_HOST" && -n "$ACR_REGISTRY_PULL_HOST" && -n "$ACR_NAMESPACE" && "$HAS_ACR_SECRET" == "true" ]]; then
+            echo "use_acr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_acr=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Aliyun ACR
+        if: steps.mode.outputs.use_acr == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ vars.ACR_REGISTRY_PUBLIC_HOST }}
+          username: ${{ secrets.ACR_PUSH_USERNAME }}
+          password: ${{ secrets.ACR_PUSH_PASSWORD }}
+
+      - name: Build and push immutable images to Aliyun ACR
+        if: steps.mode.outputs.use_acr == 'true'
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p .runtime/digests
+          for pair in "server:deploy/server.Dockerfile" "web:deploy/web.Dockerfile"; do
+            svc="${pair%%:*}"
+            df="${pair#*:}"
+            pub="$ACR_REGISTRY_PUBLIC_HOST/$ACR_NAMESPACE/simpleim-$svc"
+            pull="$ACR_REGISTRY_PULL_HOST/$ACR_NAMESPACE/simpleim-$svc"
+            tag="$pub:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            docker buildx build --platform linux/amd64 \
+              --file "$df" \
+              --output type=image,push=true,oci-artifact=false \
+              --provenance=mode=min \
+              --build-arg "VERSION=$VERSION" \
+              --build-arg "COMMIT_SHA=$SHA" \
+              --label "org.opencontainers.image.source=https://github.com/$REPO" \
+              --label "org.opencontainers.image.revision=$SHA" \
+              --label "org.opencontainers.image.version=$VERSION" \
+              --tag "$tag" \
+              --metadata-file "/tmp/${svc}-meta.json" .
+            digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "/tmp/${svc}-meta.json")
+            python3 -c 'import json,sys; json.dump({"service":sys.argv[1],"image":sys.argv[2]+"@"+sys.argv[3]}, open(f".runtime/digests/{sys.argv[1]}.json","w"))' "$svc" "$pull" "$digest"
+          done
+
+          for pair in "caddy:caddy:2.11.7-alpine" "coturn:coturn/coturn:4.6-alpine"; do
+            svc="${pair%%:*}"
+            upstream="${pair#*:}"
+            pub="$ACR_REGISTRY_PUBLIC_HOST/$ACR_NAMESPACE/simpleim-$svc"
+            pull="$ACR_REGISTRY_PULL_HOST/$ACR_NAMESPACE/simpleim-$svc"
+            tag="$pub:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            docker pull --platform linux/amd64 "$upstream"
+            printf 'FROM %s\n' "$upstream" | docker build --platform linux/amd64 \
+              --label "org.opencontainers.image.source=https://github.com/$REPO" \
+              --tag "$tag" --file - .
+            docker push "$tag"
+            digest=$(docker image inspect "$tag" --format '{{json .RepoDigests}}' | python3 -c 'import json,sys; prefix=sys.argv[1]+"@"; print(next(x.split("@",1)[1] for x in json.load(sys.stdin) if x.startswith(prefix)))' "$pub")
+            python3 -c 'import json,sys; json.dump({"service":sys.argv[1],"image":sys.argv[2]+"@"+sys.argv[3]}, open(f".runtime/digests/{sys.argv[1]}.json","w"))' "$svc" "$pull" "$digest"
+          done
+
+      - name: Log in to GHCR for portable release publishing
+        if: steps.mode.outputs.use_acr != 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build, publish GHCR images, and export portable offline layer archive
+        if: steps.mode.outputs.use_acr != 'true'
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p .runtime/digests
+          lower_repo=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+          server_local="simpleim-server:${VERSION}-${SHA:0:12}"
+          web_local="simpleim-web:${VERSION}-${SHA:0:12}"
+          caddy_local="simpleim-caddy:2.11.7-alpine"
+          coturn_local="simpleim-coturn:4.6-alpine"
+
+          docker buildx build --platform linux/amd64 --load \
+            --file deploy/server.Dockerfile \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "COMMIT_SHA=$SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$REPO" \
+            --label "org.opencontainers.image.revision=$SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --tag "$server_local" \
+            --tag "ghcr.io/${lower_repo}-server:${VERSION}" .
+
+          docker buildx build --platform linux/amd64 --load \
+            --file deploy/web.Dockerfile \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "COMMIT_SHA=$SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$REPO" \
+            --label "org.opencontainers.image.revision=$SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --tag "$web_local" \
+            --tag "ghcr.io/${lower_repo}-web:${VERSION}" .
+
+          docker push "ghcr.io/${lower_repo}-server:${VERSION}" || true
+          docker push "ghcr.io/${lower_repo}-web:${VERSION}" || true
+
+          docker pull --platform linux/amd64 caddy:2.11.7-alpine
+          docker tag caddy:2.11.7-alpine "$caddy_local"
+          docker pull --platform linux/amd64 coturn/coturn:4.6-alpine
+          docker tag coturn/coturn:4.6-alpine "$coturn_local"
+
+          docker save "$server_local" "$web_local" "$caddy_local" "$coturn_local" | gzip -6 > simpleim-images.tar.gz
+
+          python3 -c 'import json,sys; json.dump({"service":"server","image":sys.argv[1]}, open(".runtime/digests/server.json","w"))' "$server_local"
+          python3 -c 'import json,sys; json.dump({"service":"web","image":sys.argv[1]}, open(".runtime/digests/web.json","w"))' "$web_local"
+          python3 -c 'import json,sys; json.dump({"service":"caddy","image":sys.argv[1]}, open(".runtime/digests/caddy.json","w"))' "$caddy_local"
+          python3 -c 'import json,sys; json.dump({"service":"coturn","image":sys.argv[1]}, open(".runtime/digests/coturn.json","w"))' "$coturn_local"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-digests
+          path: .runtime/digests/*.json
+          retention-days: 30
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: simpleim-cli-linux-x64
+          path: |
+            simpleim-linux-x64
+            simpleim-linux-x64.sha256
+          retention-days: 30
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.mode.outputs.use_acr != 'true'
+        with:
+          name: simpleim-image-archive
+          path: simpleim-images.tar.gz
+          retention-days: 7
+
+  manifest:
+    needs: [validate, images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-digests
+          path: .runtime/digests
+
+      - name: Generate release manifest
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          HAS_ACR_SECRET: ${{ secrets.ACR_PUSH_PASSWORD != '' }}
+        run: |
+          if [[ "$HAS_ACR_SECRET" == "true" && -n "$ACR_REGISTRY_PUBLIC_HOST" && -n "$ACR_REGISTRY_PULL_HOST" && -n "$ACR_NAMESPACE" ]]; then
+            python3 ops/manifest.py create --repository "$REPOSITORY" --version "$RELEASE_VERSION" \
+              --sha "$RELEASE_SHA" --main-sha "$RELEASE_SHA" --digests .runtime/digests \
+              --registry-public-host "$ACR_REGISTRY_PUBLIC_HOST" \
+              --registry-pull-host "$ACR_REGISTRY_PULL_HOST" \
+              --registry-namespace "$ACR_NAMESPACE" > release-manifest.json
+          else
+            python3 ops/manifest.py create --repository "$REPOSITORY" --version "$RELEASE_VERSION" \
+              --sha "$RELEASE_SHA" --main-sha "$RELEASE_SHA" --digests .runtime/digests > release-manifest.json
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-manifest
+          path: release-manifest.json
+          retention-days: 90
+
+  deploy:
+    needs: [validate, manifest]
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    concurrency:
+      group: simpleim-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-manifest
+
+      - name: Download image bundle when ACR pull is not used
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: simpleim-image-archive
+
+      - name: Recheck current main and immutable archive immediately before deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          main_sha=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+          branch_sha=$(gh api "repos/$GH_REPO/git/ref/heads/release/$RELEASE_VERSION" --jq .object.sha)
+          [[ "$main_sha" == "$RELEASE_SHA" && "$branch_sha" == "$RELEASE_SHA" ]] || { echo 'Release source changed while images were building; create a new release from checked main.' >&2; exit 1; }
+
+      - name: Deploy immutable release over pinned-host SSH
+        run: bash ops/ci-deploy.sh apply
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+          REGISTRY_USERNAME: ${{ secrets.ACR_PULL_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.ACR_PULL_PASSWORD }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          PRODUCTION_SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+          PRODUCTION_SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+          PRODUCTION_SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+          PRODUCTION_SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
+
+      - name: Verify public internet HTTPS & certificate chain reachability
+        env:
+          PUBLIC_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+          PUBLIC_PORT: ${{ vars.PUBLIC_HTTPS_PORT || '8444' }}
+          EXPECTED_VER: ${{ needs.validate.outputs.version }}
+        run: |
+          curl --fail --silent --show-error --retry 10 --retry-delay 2 --max-time 10 \
+            "https://${PUBLIC_HOST}:${PUBLIC_PORT}/healthz" | grep -q '"ok":true'
+          curl --fail --silent --show-error --max-time 10 \
+            "https://${PUBLIC_HOST}:${PUBLIC_PORT}/api/v1/version" | grep -q "\"version\":\"${EXPECTED_VER}\""
+
+  publish:
+    needs: [validate, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-manifest
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: simpleim-cli-linux-x64
+
+      - name: Create permanent release tag and GitHub release only after deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          branch_sha=$(gh api "repos/$GH_REPO/git/ref/heads/release/$RELEASE_VERSION" --jq .object.sha)
+          [[ "$branch_sha" == "$RELEASE_SHA" ]] || { echo 'Release archive moved during deployment.' >&2; exit 1; }
+          if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_VERSION" >/dev/null 2>&1; then
+            tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_VERSION" --jq .object.sha)
+            [[ "$tag_sha" == "$RELEASE_SHA" ]] || exit 1
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f "ref=refs/tags/$RELEASE_VERSION" -f "sha=$RELEASE_SHA" >/dev/null
+          fi
+          gh release create "$RELEASE_VERSION" \
+            release-manifest.json \
+            simpleim-linux-x64 \
+            simpleim-linux-x64.sha256 \
+            --verify-tag \
+            --title "$RELEASE_VERSION" \
+            --generate-notes

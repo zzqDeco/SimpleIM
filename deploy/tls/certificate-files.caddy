@@ -1,0 +1,2 @@
+# Host-provisioned or teamie-caddy synced public TLS certificate pair.
+tls /etc/caddy/tls/fullchain.pem /etc/caddy/tls/privkey.pem

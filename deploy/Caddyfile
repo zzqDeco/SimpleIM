@@ -1,8 +1,11 @@
 {
 	admin off
+	auto_https disable_redirects
+	default_sni {$TLS_SERVER_NAME}
 }
 
 {$SITE_ADDRESS} {
+	import /etc/caddy/issuer.caddy
 	encode zstd gzip
 
 	header {

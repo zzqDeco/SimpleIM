@@ -1,22 +1,35 @@
-# Example Coturn configuration for SimpleIM symmetric-NAT WebRTC relay
-# Copy to deploy/turnserver.conf and match static-auth-secret with COTURN_SHARED_SECRET.
+# Hardened Coturn configuration for SimpleIM STUN + symmetric-NAT WebRTC relay.
+# Provision on host at /srv/simpleim/config/turnserver.conf (mode 0640) and match
+# static-auth-secret with COTURN_SHARED_SECRET in /srv/simpleim/config/production.env.
 
 listening-port=3478
-tls-listening-port=5349
 fingerprint
 use-auth-secret
 static-auth-secret=REPLACE_WITH_COTURN_SHARED_SECRET
-realm=im.example.com
+realm=simpleim.local
 
-# Set to your server's public IPv4 address:
-# external-ip=203.0.113.10
+# On cloud VPC 1:1 NAT (e.g. Aliyun ECS), map public IP to private NIC IP:
+# external-ip=203.0.113.10/172.17.0.10
 
 min-port=49152
-max-port=65535
-no-multicast-peers
+max-port=49407
+log-file=stdout
+simple-log
+pidfile="/tmp/turnserver.pid"
+
+no-tcp-relay
+no-tls
+no-dtls
 no-cli
+no-multicast-peers
 no-loopback-peers
+
+# Block SSRF / internal network relay probes
+denied-peer-ip=0.0.0.0-0.255.255.255
 denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
 denied-peer-ip=172.16.0.0-172.31.255.255
 denied-peer-ip=192.168.0.0-192.168.255.255
-denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=224.0.0.0-255.255.255.255

@@ -35,9 +35,15 @@ if (import.meta.main) {
     process.env.SERVER_IDENTITY_PRIVATE_KEY?.trim() || undefined;
   const serverKeyId = process.env.SERVER_KEY_ID?.trim() || "srvk_2026_01";
   const allowedOrigins = parseCsvEnv(process.env.ALLOWED_ORIGINS);
+  const stunUrls =
+    process.env.STUN_URLS !== undefined
+      ? parseCsvEnv(process.env.STUN_URLS)
+      : undefined;
   const coturnUrls = parseCsvEnv(process.env.COTURN_URLS);
   const coturnSharedSecret =
     process.env.COTURN_SHARED_SECRET?.trim() || undefined;
+  const version = process.env.APP_VERSION?.trim() || SERVER_VERSION;
+  const commitSha = process.env.COMMIT_SHA?.trim() || "unknown";
   const secureCookies =
     process.env.SECURE_COOKIES === "true" ||
     (process.env.SECURE_COOKIES === undefined &&
@@ -50,7 +56,10 @@ if (import.meta.main) {
     sqlitePath,
     serverIdentityPrivateKey,
     serverKeyId,
+    version,
+    commitSha,
     allowedOrigins,
+    stunUrls,
     coturnUrls,
     coturnSharedSecret,
     secureCookies,
