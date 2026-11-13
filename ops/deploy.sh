@@ -119,10 +119,23 @@ probe_and_verify_stack() {
   done
 
   if [[ "$enable_coturn" == "true" ]]; then
-    local turn_cid
-    turn_cid=$(docker ps --filter "label=com.docker.compose.project=simpleim" --filter "label=com.docker.compose.service=coturn" --format '{{.ID}}')
+    local turn_cid turn_ok=0 turn_attempt turn_state
+    turn_cid=$(docker ps -a --filter "label=com.docker.compose.project=simpleim" --filter "label=com.docker.compose.service=coturn" --format '{{.ID}}')
     if [[ -z "$turn_cid" ]]; then
-      echo "ERROR: Service coturn is enabled but not running." >&2
+      echo "ERROR: Service coturn is enabled but missing." >&2
+      return 1
+    fi
+    for turn_attempt in $(seq 1 15); do
+      turn_state=$(docker inspect -f '{{.State.Status}}:{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$turn_cid" 2>/dev/null || true)
+      if [[ "$turn_state" == "running:healthy" ]] && ss -tln | awk '{print $4}' | grep -Eq '(^|:)3478$'; then
+        turn_ok=1
+        break
+      fi
+      sleep 2
+    done
+    if [[ "$turn_ok" -ne 1 ]]; then
+      echo "ERROR: Service coturn failed health/port probe (state=${turn_state:-unknown})." >&2
+      docker logs --tail 25 "$turn_cid" >&2 || true
       return 1
     fi
   fi
