@@ -201,7 +201,7 @@ export class HttpHandler {
       }
 
       if (method === "GET" && path === "/api/v1/auth/me") {
-        const { auth } = this.requireAuthenticated(
+        const { auth, authMethod } = this.requireAuthenticated(
           req,
           url,
           originHeader,
@@ -211,6 +211,9 @@ export class HttpHandler {
         const payload: MeResponse = {
           ok: true,
           user: toUserProfile(auth.user),
+          ...(authMethod === "cookie"
+            ? { csrfToken: auth.expectedCsrfToken }
+            : {}),
         };
         const res = this.jsonResponse(200, payload, corsHeaders);
         this.logBoundary("info", "auth.me", {

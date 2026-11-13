@@ -98,8 +98,19 @@ export class SignalingService {
     this.peerIdToConnectionId.set(handle.peerId, handle.connectionId);
   }
 
-  joinRoom(connectionId: string, roomId: string): void {
+  consumeInboundFrameBudget(connectionId: string): void {
+    this.requireConnection(connectionId);
     this.enforceConnectionRateLimit(connectionId);
+  }
+
+  joinRoom(
+    connectionId: string,
+    roomId: string,
+    options?: { rateLimitAlreadyChecked?: boolean },
+  ): void {
+    if (!options?.rateLimitAlreadyChecked) {
+      this.enforceConnectionRateLimit(connectionId);
+    }
     const peer = this.requireConnection(connectionId);
 
     if (!isValidRoomIdHex(roomId)) {
@@ -165,8 +176,14 @@ export class SignalingService {
     }
   }
 
-  leaveRoom(connectionId: string, roomId: string): void {
-    this.enforceConnectionRateLimit(connectionId);
+  leaveRoom(
+    connectionId: string,
+    roomId: string,
+    options?: { rateLimitAlreadyChecked?: boolean },
+  ): void {
+    if (!options?.rateLimitAlreadyChecked) {
+      this.enforceConnectionRateLimit(connectionId);
+    }
     const peer = this.requireConnection(connectionId);
 
     if (!isValidRoomIdHex(roomId)) {
@@ -206,8 +223,11 @@ export class SignalingService {
     roomId: string,
     toPeerId: string,
     envelope: EncryptedEnvelope,
+    options?: { rateLimitAlreadyChecked?: boolean },
   ): void {
-    this.enforceConnectionRateLimit(connectionId);
+    if (!options?.rateLimitAlreadyChecked) {
+      this.enforceConnectionRateLimit(connectionId);
+    }
     const peer = this.requireConnection(connectionId);
 
     if (!isValidRoomIdHex(roomId) || !isValidPeerId(toPeerId)) {

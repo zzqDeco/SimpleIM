@@ -45,12 +45,15 @@ export interface WsSocketLike {
   close(code?: number, reason?: string): void;
 }
 
+const MAX_CONSECUTIVE_RATE_LIMITED_FRAMES = 16;
+
 export interface WsHandlerDependencies {
   readonly authService: AuthService;
   readonly signalingService: SignalingService;
   readonly logger: LoggerPort;
   readonly clock: ClockPort;
   readonly allowedOrigins: ReadonlySet<string>;
+  readonly maxSignalPayloadBytes?: number;
 }
 
 export class WsHandler {
@@ -59,6 +62,8 @@ export class WsHandler {
   private readonly logger: LoggerPort;
   private readonly clock: ClockPort;
   private readonly allowedOrigins: ReadonlySet<string>;
+  private readonly maxSignalPayloadBytes: number;
+  private readonly consecutiveRateLimits = new Map<string, number>();
 
   constructor(deps: WsHandlerDependencies) {
     this.authService = deps.authService;
@@ -66,6 +71,8 @@ export class WsHandler {
     this.logger = deps.logger;
     this.clock = deps.clock;
     this.allowedOrigins = deps.allowedOrigins;
+    this.maxSignalPayloadBytes =
+      deps.maxSignalPayloadBytes ?? MAX_SIGNAL_FRAME_BYTES;
   }
 
   handleUpgrade(
@@ -226,7 +233,7 @@ export class WsHandler {
         ? textEncoder.encode(rawMessage).byteLength
         : rawMessage.byteLength;
 
-    if (byteLength > MAX_SIGNAL_FRAME_BYTES) {
+    if (byteLength > this.maxSignalPayloadBytes) {
       this.logger.warn("ws.frame.oversized", {
         corrId,
         peerId,
@@ -234,7 +241,37 @@ export class WsHandler {
         errorCode: "payload_too_large",
         durationMs: Math.max(0, Math.round(this.clock.nowMs() - startMs)),
       });
-      ws.close(1009, "Signaling frame exceeds 32 KiB limit");
+      ws.close(
+        1009,
+        `Signaling frame exceeds ${this.maxSignalPayloadBytes}-byte limit`,
+      );
+      return;
+    }
+
+    try {
+      this.signalingService.consumeInboundFrameBudget(connectionId);
+      this.consecutiveRateLimits.delete(connectionId);
+    } catch (err) {
+      const code: ErrorCode =
+        err instanceof DomainError ? err.code : "rate_limited";
+      const message =
+        err instanceof DomainError
+          ? err.message
+          : "Signaling frame rate limit exceeded";
+      const consecutive =
+        (this.consecutiveRateLimits.get(connectionId) ?? 0) + 1;
+      this.consecutiveRateLimits.set(connectionId, consecutive);
+      this.sendErrorFrame(ws, code, message);
+      this.logger.warn("ws.frame.error", {
+        corrId,
+        peerId,
+        userId,
+        errorCode: code,
+        durationMs: Math.max(0, Math.round(this.clock.nowMs() - startMs)),
+      });
+      if (consecutive >= MAX_CONSECUTIVE_RATE_LIMITED_FRAMES) {
+        ws.close(1008, "Signaling rate limit exceeded");
+      }
       return;
     }
 
@@ -268,15 +305,21 @@ export class WsHandler {
         maybeRoomId = parsedJson.roomId;
       }
 
-      const frame = parseClientSignalingFrame(parsedJson);
+      const frame = parseClientSignalingFrame(parsedJson, {
+        maxFrameBytes: this.maxSignalPayloadBytes,
+      });
       maybeRoomId = frame.roomId;
 
       switch (frame.type) {
         case "room.join":
-          this.signalingService.joinRoom(connectionId, frame.roomId);
+          this.signalingService.joinRoom(connectionId, frame.roomId, {
+            rateLimitAlreadyChecked: true,
+          });
           break;
         case "room.leave":
-          this.signalingService.leaveRoom(connectionId, frame.roomId);
+          this.signalingService.leaveRoom(connectionId, frame.roomId, {
+            rateLimitAlreadyChecked: true,
+          });
           break;
         case "signal.relay":
           this.signalingService.relaySignal(
@@ -284,6 +327,7 @@ export class WsHandler {
             frame.roomId,
             frame.toPeerId,
             frame.envelope,
+            { rateLimitAlreadyChecked: true },
           );
           break;
       }
@@ -325,6 +369,7 @@ export class WsHandler {
 
   onClose(ws: WsSocketLike): void {
     const { connectionId, corrId, peerId, userId, connectedAt } = ws.data;
+    this.consecutiveRateLimits.delete(connectionId);
     this.signalingService.disconnectPeer(connectionId);
     this.logger.info("ws.close", {
       corrId,

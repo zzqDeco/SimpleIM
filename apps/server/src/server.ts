@@ -33,6 +33,7 @@ export interface SimpleImServerOptions {
   readonly sqlitePath?: string;
   readonly serverIdentityPrivateKey?: string;
   readonly serverKeyId?: string;
+  readonly nodeEnv?: string;
   readonly allowedOrigins?: readonly string[];
   readonly stunUrls?: readonly string[];
   readonly coturnUrls?: readonly string[];
@@ -89,9 +90,20 @@ export function createSimpleImServer(
     timeCost: options.passwordHashTimeCost,
   });
 
+  const effectiveNodeEnv = options.nodeEnv ?? process.env.NODE_ENV;
+  const requireExplicitKey = effectiveNodeEnv === "production";
+  const isPersistentSqlite =
+    sqlitePath !== ":memory:" && !sqlitePath.startsWith("file::memory:");
+  const persistedKeyPath =
+    !options.serverIdentityPrivateKey && !requireExplicitKey && isPersistentSqlite
+      ? `${sqlitePath}.identity.key`
+      : undefined;
+
   const identitySigner = new ServerIdentitySigner({
     serverKeyId: options.serverKeyId,
     privateKeyBase64Url: options.serverIdentityPrivateKey,
+    persistedKeyPath,
+    requireExplicitKey,
     coturnUrls: options.coturnUrls,
     coturnSharedSecret: options.coturnSharedSecret,
     turnTtlSeconds: options.turnTtlSeconds,
@@ -109,6 +121,16 @@ export function createSimpleImServer(
       options.limits?.maxSignalPayloadBytes ??
       DEFAULT_SERVER_LIMITS.maxSignalPayloadBytes,
   };
+
+  if (
+    !Number.isInteger(limits.maxSignalPayloadBytes) ||
+    limits.maxSignalPayloadBytes < 1_024 ||
+    limits.maxSignalPayloadBytes > 262_144
+  ) {
+    throw new Error(
+      `Invalid limits.maxSignalPayloadBytes (${limits.maxSignalPayloadBytes}); expected 1024..262144`,
+    );
+  }
 
   const authService = new AuthService({
     userRepo,
@@ -153,6 +175,7 @@ export function createSimpleImServer(
     logger,
     clock,
     allowedOrigins,
+    maxSignalPayloadBytes: limits.maxSignalPayloadBytes,
   });
 
   const server = Bun.serve<WsConnectionData>({
@@ -168,7 +191,10 @@ export function createSimpleImServer(
       return httpHandler.handle(req, url, directIp);
     },
     websocket: {
-      maxPayloadLength: 262_144,
+      maxPayloadLength: Math.min(
+        524_288,
+        Math.max(limits.maxSignalPayloadBytes + 4_096, 65_536),
+      ),
       idleTimeout: 120,
       open(ws) {
         wsHandler.onOpen(ws);

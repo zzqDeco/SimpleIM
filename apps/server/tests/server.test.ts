@@ -978,23 +978,24 @@ describe("SimpleIM Server Integration Suite", () => {
       wsClient.ws.send(JSON.stringify({ type: "room.leave", roomId: room1 }));
       wsClient.ws.send(JSON.stringify({ type: "room.leave", roomId: room2 }));
 
-      // 6th frame exceeds connection token bucket (capacity: 5) -> rate_limited
+      // 6th frame exceeds connection token bucket (capacity: 5) BEFORE JSON parsing -> rate_limited
       wsClient.ws.send(JSON.stringify({ type: "room.join", roomId: room1 }));
       expect(await wsClient.nextFrame()).toMatchObject({
         type: "error",
         code: "rate_limited",
-        roomId: room1,
       });
       expect(srv.signalingService.getActiveRoomCount()).toBe(0);
 
       const closed = wsClient.waitForClose();
       wsClient.close();
       await closed;
+      const originalPubKey = srv.serverSignPubKey;
       await srv.stop(true);
       srv.sqliteDb.close(false);
 
-      // Restart server against same SQLite file: user & session persist, zero room tables exist
+      // Restart server against same SQLite file: user, session, AND signing key persist, zero room tables exist
       const srvRestarted = startTestServer({ sqlitePath: dbPath });
+      expect(srvRestarted.serverSignPubKey).toBe(originalPubKey);
       const meRes = await fetch(`${srvRestarted.url}/api/v1/auth/me`, {
         headers: { Authorization: `Bearer ${auth.sessionToken}` },
       });
@@ -1003,5 +1004,103 @@ describe("SimpleIM Server Integration Suite", () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
+  });
+
+  test("8. Production requires explicit SERVER_IDENTITY_PRIVATE_KEY, cookie /auth/me recovers csrfToken, malformed WS frames consume pre-parse rate limit, and custom maxSignalPayloadBytes is enforced", async () => {
+    // 1. Production mode rejects startup without SERVER_IDENTITY_PRIVATE_KEY
+    expect(() =>
+      createSimpleImServer({
+        port: 0,
+        host: "127.0.0.1",
+        sqlitePath: ":memory:",
+        nodeEnv: "production",
+      }),
+    ).toThrow(/SERVER_IDENTITY_PRIVATE_KEY/);
+
+    const explicitKey = generateEd25519KeyPair();
+    const srv = startTestServer({
+      nodeEnv: "production",
+      serverIdentityPrivateKey: explicitKey.privateKeyBase64Url,
+      limits: {
+        maxPeersPerRoom: 4,
+        maxRoomsPerConnection: 2,
+        maxSignalPayloadBytes: 2_048,
+      },
+      wsFrameRateLimit: {
+        capacity: 2,
+        refillPerSecond: 0,
+      },
+    });
+    expect(srv.serverSignPubKey).toBe(explicitKey.publicKeyBase64Url);
+
+    // 2. Cookie-authenticated GET /api/v1/auth/me returns derived csrfToken usable on /peer-cert
+    const regWeb = await fetch(`${srv.url}/api/v1/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "cookie_reload",
+        password: "reload-password-123",
+        clientKind: "web",
+      }),
+    });
+    expect(regWeb.status).toBe(201);
+    const cookieHeader = extractCookiePair(regWeb.headers.get("set-cookie"));
+    const webAuth = (await regWeb.json()) as WebAuthResponse;
+
+    const meRes = await fetch(`${srv.url}/api/v1/auth/me`, {
+      headers: { Cookie: cookieHeader },
+    });
+    expect(meRes.status).toBe(200);
+    const meJson = (await meRes.json()) as {
+      ok: true;
+      csrfToken?: string;
+      user: { id: string };
+    };
+    expect(meJson.csrfToken).toBe(webAuth.csrfToken);
+
+    // 3. Malformed JSON frames consume pre-parse WS rate-limit tokens and sustained flood closes 1008
+    const regCli = await fetch(`${srv.url}/api/v1/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "ws_budget_cli",
+        password: "budget-password-123",
+        clientKind: "cli",
+      }),
+    });
+    const cliAuth = (await regCli.json()) as CliAuthResponse;
+    const ws1 = await openSignalingWs(
+      `${srv.wsUrl}?peerId=${generatePrefixedId("peer")}`,
+      { Authorization: `Bearer ${cliAuth.sessionToken}` },
+    );
+
+    ws1.ws.send("{not-valid-json-1");
+    expect(await ws1.nextFrame()).toMatchObject({
+      type: "error",
+      code: "invalid_frame",
+    });
+    ws1.ws.send("{not-valid-json-2");
+    expect(await ws1.nextFrame()).toMatchObject({
+      type: "error",
+      code: "invalid_frame",
+    });
+    // 3rd frame (even if valid JSON) is blocked BEFORE parsing because the 2 malformed frames exhausted capacity=2
+    ws1.ws.send(JSON.stringify({ type: "room.join", roomId: "a".repeat(64) }));
+    expect(await ws1.nextFrame()).toMatchObject({
+      type: "error",
+      code: "rate_limited",
+    });
+    ws1.close();
+    await ws1.waitForClose();
+
+    // 4. Configured limits.maxSignalPayloadBytes (2048 B) closes oversized frames with 1009
+    const ws2 = await openSignalingWs(
+      `${srv.wsUrl}?peerId=${generatePrefixedId("peer")}`,
+      { Authorization: `Bearer ${cliAuth.sessionToken}` },
+    );
+    const closePromise = ws2.waitForClose();
+    ws2.ws.send("z".repeat(2_500));
+    const closed = await closePromise;
+    expect(closed.code).toBe(1009);
   });
 });
