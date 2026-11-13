@@ -298,6 +298,7 @@ export async function runJoinCommand(
     serverUrl: api.serverUrl,
     sessionToken: creds.sessionToken,
     peerId,
+    maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
   });
   const transportFactory = new WeriftTransportFactory();
   const chunkStorage = new FsChunkStorageAdapter({
@@ -312,6 +313,7 @@ export async function runJoinCommand(
     serverSignPubKey: meta.serverSignPubKey,
     roomKeys,
     iceServers: meta.iceServers,
+    maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
     signaling,
     transportFactory,
     chunkStorage,

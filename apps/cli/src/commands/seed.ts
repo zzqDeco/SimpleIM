@@ -55,6 +55,7 @@ export async function runSeedCommand(
     serverUrl: api.serverUrl,
     sessionToken: creds.sessionToken,
     peerId,
+    maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
     onProtocolError: (err) => {
       logger.warn("seed.signaling.protocol_error", {
         roomIdPrefix: roomKeys.roomIdPrefix,
@@ -79,6 +80,7 @@ export async function runSeedCommand(
     serverSignPubKey: meta.serverSignPubKey,
     roomKeys,
     iceServers: meta.iceServers,
+    maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
     signaling,
     transportFactory,
     chunkStorage,

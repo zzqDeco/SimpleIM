@@ -45,6 +45,7 @@ import {
   LocalSharedFileRegistry,
   parseCliArgs,
   readPassphrase,
+  readVisiblePrompt,
   runCli,
   SeedQuotaController,
   StorageQuotaExceededError,
@@ -249,6 +250,14 @@ describe("PassphraseReader", () => {
     const passphrase = await promise;
     expect(passphrase).toBe("correct horse battery staple 🚀");
     expect(stderrOut).toBe("");
+
+    // Subsequent prompt on the SAME piped stream preserves unread lines from the first chunk!
+    const secondLine = await readVisiblePrompt({
+      prompt: "Next line: ",
+      stdin,
+      stderr: new PassThrough(),
+    });
+    expect(secondLine).toBe("second-line-ignored");
   });
 
   test("interactive TTY raw mode disables echo, handles backspace, and restores terminal state in finally", async () => {
@@ -501,7 +510,30 @@ describe("CliApiClient & CliSignalingClient", () => {
     expect(whoOut).toContain("@charlie");
     expect(whoOut).not.toContain("ses_cli_token_abc123");
 
-    // Run logout
+    // Run logout with a DIFFERENT --server -> must fail WITHOUT sending token or clearing local creds!
+    let leakedRequests = 0;
+    const wrongLogoutCode = await runCli(
+      [
+        "logout",
+        "--server",
+        "http://127.0.0.1:4999",
+        "--config-dir",
+        configDir,
+      ],
+      {
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        fetchImpl: (async () => {
+          leakedRequests += 1;
+          return Response.json({ ok: true });
+        }) as unknown as typeof fetch,
+      },
+    );
+    expect(wrongLogoutCode).toBe(1);
+    expect(leakedRequests).toBe(0);
+    expect(await store.load()).not.toBeNull();
+
+    // Run logout against matching server
     const outCode = await runCli(["logout", "--config-dir", configDir], {
       stdout: new PassThrough(),
       stderr: new PassThrough(),
@@ -514,6 +546,56 @@ describe("CliApiClient & CliSignalingClient", () => {
     await expect(api.getMe("ses_cli_token_abc123")).rejects.toBeInstanceOf(
       CliApiError,
     );
+  });
+
+  test("login reads both username and password from a single piped stdin chunk", async () => {
+    const configDir = await makeTempDir("login-single-chunk");
+    const userId = generatePrefixedId("usr");
+    let capturedBody: Record<string, unknown> | null = null;
+
+    const mockFetch = (async (
+      _input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({
+        ok: true,
+        sessionToken: "ses_piped_login_tok",
+        expiresAt: Date.now() + 86_400_000,
+        user: {
+          id: userId,
+          username: String(capturedBody.username),
+          displayName: String(capturedBody.username),
+          createdAt: 1_763_000_000_000,
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const stdin = new PassThrough();
+    stdin.end("charlie_pipe\nPipedSecretPass!42\n");
+
+    const code = await runCli(
+      [
+        "login",
+        "--server",
+        "http://127.0.0.1:3999",
+        "--password-stdin",
+        "--config-dir",
+        configDir,
+      ],
+      {
+        stdin,
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        fetchImpl: mockFetch,
+      },
+    );
+    expect(code).toBe(0);
+    expect(capturedBody).toMatchObject({
+      username: "charlie_pipe",
+      password: "PipedSecretPass!42",
+      clientKind: "cli",
+    });
   });
 
   test("CliSignalingClient passes Bearer header, parses server frames, and auto-reconnects with backoff", async () => {
@@ -594,6 +676,42 @@ describe("CliApiClient & CliSignalingClient", () => {
       expect(serverSockets.length).toBeGreaterThanOrEqual(2);
       expect(client.isConnected).toBe(true);
       expect(transitions).toEqual([true, false, true]);
+
+      // Verify configurable maxSignalPayloadBytes allows >32 KiB envelopes on both send & receive
+      const highLimitClient = new CliSignalingClient({
+        serverUrl: `http://127.0.0.1:${server.port}`,
+        sessionToken: "bearer_sig_tok_999",
+        peerId: generatePrefixedId("peer"),
+        maxSignalPayloadBytes: 65_536,
+        autoReconnect: false,
+      });
+      const highLimitReceived: ServerSignalingFrame[] = [];
+      highLimitClient.onServerFrame((f) => highLimitReceived.push(f));
+      await highLimitClient.connect();
+      const bigCiphertext = "Q".repeat(46_000);
+      expect(() =>
+        client.send({
+          type: "signal.relay",
+          roomId,
+          toPeerId: peerId,
+          envelope: { nonce: "N".repeat(32), ciphertext: bigCiphertext },
+        }),
+      ).toThrow();
+      const serverHighLimitSocket = serverSockets[serverSockets.length - 1]!;
+      serverHighLimitSocket.send(
+        JSON.stringify({
+          type: "signal.deliver",
+          roomId,
+          fromPeerId: peerId,
+          envelope: { nonce: "N".repeat(32), ciphertext: bigCiphertext },
+        }),
+      );
+      const highDeadline = Date.now() + 2_000;
+      while (highLimitReceived.length < 2 && Date.now() < highDeadline) {
+        await Bun.sleep(10);
+      }
+      expect(highLimitReceived[1]?.type).toBe("signal.deliver");
+      highLimitClient.disconnect();
 
       client.disconnect();
       expect(client.isConnected).toBe(false);
@@ -792,6 +910,128 @@ describe("FsChunkStorageAdapter", () => {
     ).rejects.toBeInstanceOf(StorageQuotaExceededError);
 
     await adapter.closeAll();
+  });
+
+  test("binds resumed bitfield to manifest, clears corrupted disk chunks, disambiguates full UUIDv7 collisions, and counts payload files with metadata-like suffixes", async () => {
+    const downloadDir = await makeTempDir("resume-binding");
+    const payloadA = randomBytes(SWARM_CHUNK_SIZE * 2);
+    const payloadB = randomBytes(SWARM_CHUNK_SIZE * 2);
+
+    // Two distinct UUIDv7 fileIds sharing the exact same first 8 chars ("019a8888")!
+    const fileIdA = "019a8888-1111-7000-8000-000000000001";
+    const fileIdB = "019a8888-2222-7000-8000-000000000002";
+    const fileIdC = "019a8888-3333-7000-8000-000000000003";
+
+    const manifestA = await createSignedManifestFixture({
+      roomId,
+      fileName: "shared-name.bin",
+      bytes: payloadA,
+      fileId: fileIdA,
+    });
+    const manifestB = await createSignedManifestFixture({
+      roomId,
+      fileName: "shared-name.bin",
+      bytes: payloadB,
+      fileId: fileIdB,
+    });
+    const manifestC = await createSignedManifestFixture({
+      roomId,
+      fileName: "shared-name.bin",
+      bytes: payloadB,
+      fileId: fileIdC,
+    });
+
+    // 1. Concurrent downloads with identical 8-char UUIDv7 prefix disambiguate via FULL fileId!
+    const adapter1 = new FsChunkStorageAdapter({ downloadDir });
+    await adapter1.initReceivingFile(manifestA);
+    await adapter1.initReceivingFile(manifestB);
+    await adapter1.initReceivingFile(manifestC);
+
+    await adapter1.writeVerifiedChunk(
+      manifestA.fileId,
+      0,
+      payloadA.subarray(0, SWARM_CHUNK_SIZE),
+    );
+    await adapter1.writeVerifiedChunk(
+      manifestA.fileId,
+      1,
+      payloadA.subarray(SWARM_CHUNK_SIZE),
+    );
+    await adapter1.writeVerifiedChunk(
+      manifestB.fileId,
+      0,
+      payloadB.subarray(0, SWARM_CHUNK_SIZE),
+    );
+
+    const activeEntries = await readdir(downloadDir);
+    expect(activeEntries).toContain(
+      `shared-name.bin.${fileIdB}.simpleim.part`,
+    );
+    expect(activeEntries).toContain(
+      `shared-name.bin.${fileIdC}.simpleim.part`,
+    );
+    await adapter1.closeAll();
+
+    // 2. Corrupt chunk 1 of manifestA's .part on disk while paused -> initReceivingFile must clear chunk 1!
+    const partPathA = join(downloadDir, "shared-name.bin.simpleim.part");
+    const rawPartA = new Uint8Array(await readFile(partPathA));
+    rawPartA[SWARM_CHUNK_SIZE] = (rawPartA[SWARM_CHUNK_SIZE]! ^ 0xff) & 0xff;
+    await writeFile(partPathA, rawPartA);
+
+    const adapter2 = new FsChunkStorageAdapter({ downloadDir });
+    const resumedA = await adapter2.initReceivingFile(manifestA);
+    expect(hasChunkInBitfield(resumedA.existingBitfield, 0)).toBe(true);
+    expect(hasChunkInBitfield(resumedA.existingBitfield, 1)).toBe(false);
+
+    // And a brand-new manifestD with same fileName & fileSize MUST NOT adopt manifestA's paused .part!
+    const manifestD = await createSignedManifestFixture({
+      roomId,
+      fileName: "shared-name.bin",
+      bytes: payloadB,
+      fileId: "019a8888-4444-7000-8000-000000000004",
+    });
+    const initD = await adapter2.initReceivingFile(manifestD);
+    expect(countChunksInBitfield(initD.existingBitfield, 2)).toBe(0);
+    await adapter2.closeAll();
+
+    // 3. Finalized user payload whose filename ends with .simpleim.bitfield counts toward maxStorageBytes!
+    const quotaDir = await makeTempDir("quota-suffix");
+    const quotaAdapter = new FsChunkStorageAdapter({
+      downloadDir: quotaDir,
+      maxStorageBytes: 50_000,
+    });
+    const disguisedPayload = randomBytes(40_000);
+    const disguisedManifest = await createSignedManifestFixture({
+      roomId,
+      fileName: "sneaky.simpleim.bitfield",
+      bytes: disguisedPayload,
+    });
+    await quotaAdapter.initReceivingFile(disguisedManifest);
+    await quotaAdapter.writeVerifiedChunk(
+      disguisedManifest.fileId,
+      0,
+      disguisedPayload,
+    );
+    await quotaAdapter.finalizeFile(disguisedManifest.fileId);
+
+    expect(await quotaAdapter.getUsedPayloadBytes()).toBe(40_000);
+    // Restarted adapter also counts finalized sneaky.simpleim.bitfield!
+    await quotaAdapter.closeAll();
+    const quotaAdapterRestarted = new FsChunkStorageAdapter({
+      downloadDir: quotaDir,
+      maxStorageBytes: 50_000,
+    });
+    expect(await quotaAdapterRestarted.getUsedPayloadBytes()).toBe(40_000);
+
+    const nextManifest = await createSignedManifestFixture({
+      roomId,
+      fileName: "extra.bin",
+      bytes: randomBytes(20_000),
+    });
+    await expect(
+      quotaAdapterRestarted.initReceivingFile(nextManifest),
+    ).rejects.toBeInstanceOf(StorageQuotaExceededError);
+    await quotaAdapterRestarted.closeAll();
   });
 });
 
