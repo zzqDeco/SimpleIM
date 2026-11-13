@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Architecture, Unit, Mesh & Browser<->CLI E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck all workspace packages, apps & E2E suites
+        run: bun run typecheck
+
+      - name: Enforce Clean Architecture & import boundaries
+        run: bun run test:arch
+
+      - name: Run unit, server SQLite, and 4-peer WebRTC Mesh + Swarm suites
+        run: bun test
+
+      - name: Build production Web SPA & standalone CLI binary
+        run: |
+          bun run build:web
+          bun run build:cli
+          ./apps/cli/bin/simpleim --help
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+
+      - name: Run Headless Chromium <-> CLI (werift) E2E acceptance
+        env:
+          CI: "true"
+        run: bun run test:e2e
+
+  delivery:
+    name: Production Containers, Caddyfile & Compose Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate production Docker Compose spec
+        run: |
+          docker compose -f deploy/compose.production.yaml --env-file deploy/.env.example config -q
+
+      - name: Validate Caddyfile syntax
+        run: |
+          docker run --rm --network none \
+            -e SITE_ADDRESS=im.example.com \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.9-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+      - name: Build & smoke-test production server and web images
+        run: |
+          docker build -t simpleim-server:ci -f deploy/server.Dockerfile \
+            --build-arg VERSION=ci --build-arg COMMIT_SHA="${GITHUB_SHA}" .
+          docker build -t simpleim-web:ci -f deploy/web.Dockerfile \
+            --build-arg VERSION=ci --build-arg COMMIT_SHA="${GITHUB_SHA}" .
+
+          KEY_SEED="$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=')"
+          docker run -d --name simpleim-server-smoke -p 127.0.0.1:13000:3000 \
+            -e SERVER_IDENTITY_PRIVATE_KEY="${KEY_SEED}" \
+            -e ALLOWED_ORIGINS="https://im.example.com" \
+            simpleim-server:ci
+          docker run -d --name simpleim-web-smoke -p 127.0.0.1:18080:80 \
+            simpleim-web:ci
+          trap 'docker rm -f simpleim-server-smoke simpleim-web-smoke >/dev/null 2>&1 || true' EXIT
+
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:13000/healthz >/dev/null 2>&1 && \
+               curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+
+          curl -fsS http://127.0.0.1:13000/healthz | grep -q '"ok":true'
+          curl -fsS http://127.0.0.1:13000/api/v1/meta | grep -q '"serverSignPubKey"'
+          curl -fsS http://127.0.0.1:18080/healthz | grep -q 'ok'
+          curl -fsS http://127.0.0.1:18080/ | grep -q '<div id="root">'

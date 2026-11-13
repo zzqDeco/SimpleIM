@@ -7,9 +7,9 @@
 [![WebRTC DataChannel](https://img.shields.io/badge/Transport-WebRTC_DataChannel-0f766e)](docs/contracts/p2p-v1.md)
 [![License: FSL-1.1-MIT](https://img.shields.io/badge/License-FSL--1.1--MIT-1e293b)](LICENSE)
 
-[Why SimpleIM](#why-simpleim) · [Highlights](#highlights) · [System Architecture](#system-architecture) · [Repository Layout](#repository-layout) · [Documentation Map](#documentation-map) · [Roadmap](#roadmap) · [License](#license)
+[Why SimpleIM](#why-simpleim) · [Highlights](#highlights) · [Quickstart](#quickstart) · [System Architecture](#system-architecture) · [Repository Layout](#repository-layout) · [Documentation Map](#documentation-map) · [License](#license)
 
-> **Status**: v1 architecture, protocol contracts, and engineering governance are finalized. Track the complete v1 implementation specification in [Issue #1](https://github.com/zzqDeco/SimpleIM/issues/1).
+> **Status**: **v1 complete** across `packages/contracts`, `packages/crypto`, `packages/peer-core`, `apps/server`, `apps/cli`, `apps/web`, cross-runtime Playwright E2E, CI, and `deploy/`. Specification: [Issue #1](https://github.com/zzqDeco/SimpleIM/issues/1).
 
 ---
 
@@ -34,6 +34,37 @@ SimpleIM combines a **tiny, zero-knowledge Bun rendezvous center** with a **100%
 | **Swarm Distributed File Transfer** | `64 KiB` binary chunks on a dedicated unordered `"file-swarm"` channel, `SHA-256` per-chunk verification, Rarest-First + Endgame multi-peer pulling, and SCTP backpressure guards |
 | **Constant-Memory Large Files** | Web Worker **OPFS (`FileSystemSyncAccessHandle`)** random-offset chunk I/O in browsers and sparse `.part` files on CLI—no multi-GB RAM buffering |
 | **Optional Headless Seed Peer** | Run `simpleim seed` on any VPS or NAS as an ordinary encrypted room peer to provide 24/7 online history catch-up and file seeding with zero server changes |
+
+---
+
+## Quickstart
+
+Requires **Bun >= 1.4**:
+
+```bash
+bun install
+
+# 1. Start the minimal zero-knowledge identity & signaling server (port 3000)
+bun run --cwd apps/server dev
+
+# 2. Start the React 19 + Web Worker (Argon2id + OPFS) web client (port 5173)
+bun run --cwd apps/web dev
+
+# 3. Join the same passphrase room from the CLI (or compile standalone binary)
+bun run build:cli
+./apps/cli/bin/simpleim register --server http://127.0.0.1:3000 --username cli_bob
+printf 'shared-room-secret\n' | ./apps/cli/bin/simpleim join --server http://127.0.0.1:3000 --passphrase-stdin
+```
+
+Run the full verification matrix locally:
+
+```bash
+bun run typecheck     # Strict TypeScript checks across all 6 workspace packages/apps
+bun test              # Architecture AST gate + crypto vectors + server SQLite + 4-peer WebRTC mesh E2E
+bun run test:e2e      # Real Headless Chromium (OPFS) <-> CLI (werift) Playwright E2E suite
+```
+
+For single-host production deployment with Docker Compose, automatic HTTPS Caddy, and optional `coturn`, see [`deploy/README.md`](deploy/README.md).
 
 ---
 
