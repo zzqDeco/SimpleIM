@@ -256,6 +256,10 @@ CADDY_IMAGE=${CADDY_IMAGE}
 COTURN_IMAGE=${COTURN_IMAGE}
 EOF
 
+  # Ensure non-secret bind-mounted config files are readable under cap_drop=[ALL] (no CAP_DAC_OVERRIDE)
+  chmod 0755 "$rel_dir"
+  chmod -R u+rwX,go+rX "$rel_dir/deploy"
+
   local compose_args=(
     --project-name simpleim
     --project-directory "$rel_dir/deploy"

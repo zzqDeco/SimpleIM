@@ -33,6 +33,7 @@ if [[ $mode == apply ]]; then
   name="$RELEASE_VERSION-$RELEASE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
   mkdir -p "$scratch/stage"
   cp -R deploy ops release-manifest.json "$scratch/stage/"
+  chmod -R u+rwX,go+rX "$scratch/stage/deploy" "$scratch/stage/ops" "$scratch/stage/release-manifest.json"
   ssh "${ssh_opts[@]}" "$remote" "mkdir -p /srv/simpleim/incoming /srv/simpleim/releases /srv/simpleim/state && chmod 0700 /srv/simpleim/state"
   bundle_items=(deploy ops release-manifest.json)
   if [[ -f simpleim-images.tar.gz ]]; then
