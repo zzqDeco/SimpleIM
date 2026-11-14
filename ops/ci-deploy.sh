@@ -31,12 +31,21 @@ if [[ $mode == apply ]]; then
   : "${RELEASE_VERSION:?}" "${RELEASE_SHA:?}"
   [[ $RELEASE_VERSION =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ && $RELEASE_SHA =~ ^[0-9a-f]{40}$ ]] || exit 1
   name="$RELEASE_VERSION-$RELEASE_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+  mkdir -p "$scratch/stage"
+  cp -R deploy ops release-manifest.json "$scratch/stage/"
+  ssh "${ssh_opts[@]}" "$remote" "mkdir -p /srv/simpleim/incoming /srv/simpleim/releases /srv/simpleim/state && chmod 0700 /srv/simpleim/state"
   bundle_items=(deploy ops release-manifest.json)
   if [[ -f simpleim-images.tar.gz ]]; then
-    bundle_items+=(simpleim-images.tar.gz)
+    if ! ssh "${ssh_opts[@]}" "$remote" "flock -w 120 /srv/simpleim/state/deploy.lock python3 - index-cache --cache-dir /srv/simpleim/state/oci-blobs --seed-docker" < ops/oci_delta.py > "$scratch/remote-blobs.txt"; then
+      : > "$scratch/remote-blobs.txt"
+    fi
+    python3 ops/oci_delta.py pack \
+      --input simpleim-images.tar.gz \
+      --remote-blobs "$scratch/remote-blobs.txt" \
+      --output "$scratch/stage/simpleim-images-delta.tar.gz"
+    bundle_items+=(simpleim-images-delta.tar.gz)
   fi
-  tar -czf "$scratch/bundle.tgz" "${bundle_items[@]}"
-  ssh "${ssh_opts[@]}" "$remote" "mkdir -p /srv/simpleim/incoming /srv/simpleim/releases"
+  tar -czf "$scratch/bundle.tgz" -C "$scratch/stage" "${bundle_items[@]}"
   scp "${ssh_opts[@]}" "$scratch/bundle.tgz" "$remote:/srv/simpleim/incoming/$name.tgz"
   command="umask 022 && mkdir '/srv/simpleim/releases/$name' && tar -xzf '/srv/simpleim/incoming/$name.tgz' --no-same-owner --no-same-permissions -C '/srv/simpleim/releases/$name' && rm '/srv/simpleim/incoming/$name.tgz' && bash '/srv/simpleim/releases/$name/ops/deploy.sh' apply '/srv/simpleim/releases/$name'"
 else

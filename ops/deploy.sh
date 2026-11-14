@@ -228,8 +228,13 @@ rollout_release_dir() {
     TLS_CERT_DIR="$TLS_DIR" bash "$rel_dir/ops/sync-tls-cert.sh" "$tls_name"
   fi
 
-  # Load bundled offline layer archive if present (avoids Mainland China Docker Hub / GHCR timeouts)
-  if [[ -f "$rel_dir/simpleim-images.tar.gz" ]]; then
+  # Load bundled offline or delta OCI layer archive if present (avoids Mainland China Docker Hub / GHCR timeouts)
+  if [[ -f "$rel_dir/simpleim-images-delta.tar.gz" ]]; then
+    python3 "$rel_dir/ops/oci_delta.py" unpack-to-docker \
+      --input "$rel_dir/simpleim-images-delta.tar.gz" \
+      --cache-dir "$STATE_DIR/oci-blobs" | docker load >/dev/null
+    rm -f "$rel_dir/simpleim-images-delta.tar.gz"
+  elif [[ -f "$rel_dir/simpleim-images.tar.gz" ]]; then
     gzip -dc "$rel_dir/simpleim-images.tar.gz" | docker load >/dev/null
     rm -f "$rel_dir/simpleim-images.tar.gz"
   fi
