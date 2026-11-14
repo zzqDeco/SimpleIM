@@ -65,7 +65,21 @@ export async function runSeedCommand(
     },
   });
 
-  const transportFactory = new WeriftTransportFactory();
+  const transportFactory = new WeriftTransportFactory({
+    onNetworkDiagnostic: (diag) => {
+      logger.warn("seed.network.degraded", {
+        roomIdPrefix: roomKeys.roomIdPrefix,
+        errorCode: diag.code,
+        meta: {
+          syscall: diag.syscall ?? null,
+          errnoCode: diag.errnoCode ?? null,
+          hasStunServer: diag.hasStunServer,
+          hasTurnServer: diag.hasTurnServer,
+          explicitHostCount: diag.explicitHostCount,
+        },
+      });
+    },
+  });
   const chunkStorage = new FsChunkStorageAdapter({
     downloadDir: cmd.storageDir,
     maxStorageBytes,

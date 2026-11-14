@@ -42,15 +42,19 @@ import {
   CredentialStore,
   executeJoinInputLine,
   FsChunkStorageAdapter,
+  isMdnsIceCandidate,
   LocalSharedFileRegistry,
   parseCliArgs,
+  probeNetworkInterfaces,
   readPassphrase,
   readVisiblePrompt,
   runCli,
   SeedQuotaController,
   StorageQuotaExceededError,
+  stripMdnsCandidatesFromSdp,
   StructuredLogger,
   WeriftTransportFactory,
+  type WeriftNetworkDiagnostic,
 } from "../src/main.ts";
 
 const tempDirs: string[] = [];
@@ -1392,6 +1396,246 @@ describe("Real WeriftTransportFactory P2P Loopback", () => {
       connB.close();
       expect(connA.state).toBe("closed");
       expect(connB.state).toBe("closed");
+    }
+  });
+
+  test("Issue #20 regression: probeNetworkInterfaces, mDNS SDP/ICE filtering, and no_usable_ice_path error", async () => {
+    const throwingGetIfAddrs = () => {
+      throw Object.assign(
+        new Error("A system error occurred: getifaddrs returned an error"),
+        {
+          code: "ERR_SYSTEM_ERROR",
+          syscall: "getifaddrs",
+          errno: 1,
+        },
+      );
+    };
+
+    const failedProbe = probeNetworkInterfaces(throwingGetIfAddrs);
+    expect(failedProbe).toEqual({
+      ok: false,
+      code: "ERR_SYSTEM_ERROR",
+      syscall: "getifaddrs",
+      message: "A system error occurred: getifaddrs returned an error",
+    });
+
+    const healthyProbe = probeNetworkInterfaces(() => ({
+      lo: [
+        {
+          address: "127.0.0.1",
+          netmask: "255.0.0.0",
+          family: "IPv4",
+          mac: "00:00:00:00:00:00",
+          internal: true,
+          cidr: "127.0.0.1/8",
+        },
+      ],
+      eth0: [
+        {
+          address: "10.0.0.15",
+          netmask: "255.255.255.0",
+          family: "IPv4",
+          mac: "02:42:0a:00:00:0f",
+          internal: false,
+          cidr: "10.0.0.15/24",
+        },
+      ],
+    }));
+    expect(healthyProbe).toEqual({ ok: true, ipv4Count: 1, ipv6Count: 0 });
+
+    // mDNS candidate detection keeps srflx/relay/IPv4 candidates while matching .local hostnames
+    expect(
+      isMdnsIceCandidate(
+        "candidate:2999745851 1 udp 2122260223 e5f6a7b8-1234-4abc-9def-0123456789ab.local 54321 typ host generation 0",
+      ),
+    ).toBe(true);
+    expect(
+      isMdnsIceCandidate(
+        "a=candidate:1 1 UDP 2122260223 ABCD-1234.LOCAL 60000 typ host",
+      ),
+    ).toBe(true);
+    expect(
+      isMdnsIceCandidate(
+        "candidate:842163049 1 udp 1686052607 203.0.113.42 51234 typ srflx raddr e5f6a7b8.local rport 0 generation 0",
+      ),
+    ).toBe(false);
+    expect(
+      isMdnsIceCandidate(
+        "candidate:1 1 udp 2122260223 127.0.0.1 54321 typ host",
+      ),
+    ).toBe(false);
+
+    const sampleSdp = [
+      "v=0",
+      "a=fingerprint:sha-256 AA:BB:CC:DD",
+      "a=candidate:1 1 udp 2122260223 e5f6a7b8-1234.local 54321 typ host",
+      "a=candidate:2 1 udp 2122260223 127.0.0.1 54322 typ host",
+      "",
+    ].join("\r\n");
+    const strippedSdp = stripMdnsCandidatesFromSdp(sampleSdp);
+    expect(strippedSdp).not.toContain(".local");
+    expect(strippedSdp).toContain("a=fingerprint:sha-256 AA:BB:CC:DD");
+    expect(strippedSdp).toContain("127.0.0.1 54322 typ host");
+
+    // When getifaddrs fails AND neither explicit host addresses nor TURN servers exist, reject deterministically
+    const diagnostics: WeriftNetworkDiagnostic[] = [];
+    const unusableFactory = new WeriftTransportFactory({
+      networkInterfacesImpl: throwingGetIfAddrs,
+      iceAdditionalHostAddresses: [],
+      onNetworkDiagnostic: (d) => diagnostics.push(d),
+    });
+    const unusableConn = unusableFactory.createPeerConnection({
+      localPeerId: "peer_a",
+      remotePeerId: "peer_b",
+      isInitiator: true,
+      iceServers: [],
+    });
+    try {
+      expect(diagnostics.map((d) => d.code)).toEqual([
+        "network_interfaces_unavailable",
+        "no_usable_ice_path",
+      ]);
+      await expect(unusableConn.createOffer()).rejects.toThrow(
+        /Unsupported restricted network environment/,
+      );
+    } finally {
+      unusableConn.close();
+    }
+  });
+
+  test("Issue #20 regression: completes full WebRTC loopback under getifaddrs ERR_SYSTEM_ERROR while ignoring SDP & trickle .local mDNS candidates without instantiating MdnsLookup", async () => {
+    const throwingGetIfAddrs = () => {
+      throw Object.assign(
+        new Error("A system error occurred: getifaddrs returned an error"),
+        {
+          code: "ERR_SYSTEM_ERROR",
+          syscall: "getifaddrs",
+          errno: 1,
+        },
+      );
+    };
+
+    const diagnosticsA: WeriftNetworkDiagnostic[] = [];
+    const factoryA = new WeriftTransportFactory({
+      networkInterfacesImpl: throwingGetIfAddrs,
+      onNetworkDiagnostic: (d) => diagnosticsA.push(d),
+    });
+    const factoryB = new WeriftTransportFactory({
+      networkInterfacesImpl: throwingGetIfAddrs,
+    });
+
+    const peerAId = "peer_019a000000007000800000000000010a";
+    const peerBId = "peer_019a000000007000800000000000010b";
+
+    const connA = factoryA.createPeerConnection({
+      localPeerId: peerAId,
+      remotePeerId: peerBId,
+      isInitiator: true,
+      iceServers: [],
+    });
+    // Second connection on same factory should not duplicate factory-level warning
+    const dummyConn = factoryA.createPeerConnection({
+      localPeerId: peerAId,
+      remotePeerId: "peer_019a000000007000800000000000010c",
+      isInitiator: true,
+      iceServers: [],
+    });
+    dummyConn.close();
+    expect(diagnosticsA.length).toBe(1);
+    expect(diagnosticsA[0]?.code).toBe("network_interfaces_unavailable");
+    expect(diagnosticsA[0]?.syscall).toBe("getifaddrs");
+    expect(diagnosticsA[0]?.errnoCode).toBe("ERR_SYSTEM_ERROR");
+
+    const connB = factoryB.createPeerConnection({
+      localPeerId: peerBId,
+      remotePeerId: peerAId,
+      isInitiator: false,
+      iceServers: [],
+    });
+
+    try {
+      // Queue pre-SDP trickle .local mDNS candidates (exact browser behavior!)
+      await connB.addIceCandidate({
+        candidate:
+          "candidate:111 1 udp 2122260223 9f8e7d6c-aaaa-4bbb-8ccc-111122223333.local 51001 typ host generation 0",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+      });
+      await connA.addIceCandidate({
+        candidate:
+          "candidate:222 1 udp 2122260223 1a2b3c4d-dddd-4eee-8fff-444455556666.local 51002 typ host generation 0",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+      });
+
+      connA.onLocalIceCandidate((cand) => {
+        void connB.addIceCandidate(cand);
+      });
+      connA.onLocalIceEnd(() => {
+        void connB.endIceCandidates();
+      });
+      connB.onLocalIceCandidate((cand) => {
+        void connA.addIceCandidate(cand);
+      });
+      connB.onLocalIceEnd(() => {
+        void connA.endIceCandidates();
+      });
+
+      const rawOfferSdp = await connA.createOffer();
+      // Inject an embedded a=candidate:... .local line into SDP offer as well
+      const offerWithMdns = `${rawOfferSdp}a=candidate:333 1 udp 2122260223 offer-embedded.local 52001 typ host\r\n`;
+
+      const rawAnswerSdp = await connB.acceptOfferAndCreateAnswer(offerWithMdns);
+      const answerWithMdns = `${rawAnswerSdp}a=candidate:444 1 udp 2122260223 answer-embedded.local 52002 typ host\r\n`;
+      await connA.acceptAnswer(answerWithMdns);
+
+      // Also feed post-SDP live trickle .local candidates
+      await connA.addIceCandidate({
+        candidate:
+          "candidate:555 1 udp 2122260223 live-trickle-a.local 53001 typ host",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+      });
+      await connB.addIceCandidate({
+        candidate:
+          "candidate:666 1 udp 2122260223 live-trickle-b.local 53002 typ host",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+      });
+
+      // Verify internal werift config never enabled host NIC enumeration and never instantiated MdnsLookup!
+      for (const conn of [connA, connB]) {
+        const internalPc = (
+          conn as unknown as {
+            pc: {
+              config: { iceUseIpv4: boolean; iceUseIpv6: boolean };
+              iceTransports: Array<{ connection: { lookup?: unknown } }>;
+            };
+          }
+        ).pc;
+        expect(internalPc.config.iceUseIpv4).toBe(false);
+        expect(internalPc.config.iceUseIpv6).toBe(false);
+        for (const transport of internalPc.iceTransports) {
+          expect(transport.connection.lookup).toBeUndefined();
+        }
+      }
+
+      await Promise.all([
+        waitForChannelOpen(connA.controlChannel),
+        waitForChannelOpen(connB.controlChannel),
+      ]);
+
+      const msgPromise = new Promise<string>((resolve) => {
+        connB.controlChannel.onTextMessage((t) => resolve(t));
+      });
+      connA.controlChannel.sendText("hello-from-restricted-container");
+      expect(await msgPromise).toBe("hello-from-restricted-container");
+
+      // Yield for any async dgram socket callbacks to ensure zero delayed crashes
+      await Bun.sleep(50);
+    } finally {
+      connA.close();
+      connB.close();
     }
   });
 });

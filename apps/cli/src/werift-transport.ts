@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import {
   CONTROL_CHANNEL_ID,
   CONTROL_CHANNEL_LABEL,
@@ -27,6 +28,109 @@ import {
   type RTCIceServer,
 } from "werift";
 
+export interface NetworkInterfaceProbeSuccess {
+  readonly ok: true;
+  readonly ipv4Count: number;
+  readonly ipv6Count: number;
+}
+
+export interface NetworkInterfaceProbeFailure {
+  readonly ok: false;
+  readonly code: string;
+  readonly syscall?: string;
+  readonly message: string;
+}
+
+export type NetworkInterfaceProbeResult =
+  | NetworkInterfaceProbeSuccess
+  | NetworkInterfaceProbeFailure;
+
+export interface WeriftNetworkDiagnostic {
+  readonly code: "network_interfaces_unavailable" | "no_usable_ice_path";
+  readonly message: string;
+  readonly syscall?: string;
+  readonly errnoCode?: string;
+  readonly hasStunServer: boolean;
+  readonly hasTurnServer: boolean;
+  readonly explicitHostCount: number;
+}
+
+export function probeNetworkInterfaces(
+  networkInterfacesImpl: typeof os.networkInterfaces = os.networkInterfaces,
+): NetworkInterfaceProbeResult {
+  try {
+    const interfaces = networkInterfacesImpl();
+    let ipv4Count = 0;
+    let ipv6Count = 0;
+    for (const entries of Object.values(interfaces)) {
+      if (!entries) continue;
+      for (const entry of entries) {
+        if (entry.internal) continue;
+        const family = String(entry.family);
+        if (family === "IPv4" || family === "4") {
+          ipv4Count += 1;
+        } else if (family === "IPv6" || family === "6") {
+          ipv6Count += 1;
+        }
+      }
+    }
+    return { ok: true, ipv4Count, ipv6Count };
+  } catch (err) {
+    const errObj = err as {
+      code?: unknown;
+      syscall?: unknown;
+      message?: unknown;
+    };
+    const code =
+      typeof errObj?.code === "string" && errObj.code.length > 0
+        ? errObj.code
+        : "ERR_NETWORK_INTERFACES";
+    const syscall =
+      typeof errObj?.syscall === "string" && errObj.syscall.length > 0
+        ? errObj.syscall
+        : undefined;
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      code,
+      ...(syscall !== undefined ? { syscall } : {}),
+      message,
+    };
+  }
+}
+
+export function isMdnsIceCandidate(rawCandidate: string): boolean {
+  let normalized = rawCandidate.trim();
+  if (normalized.startsWith("a=")) {
+    normalized = normalized.slice(2).trimStart();
+  }
+  if (normalized.toLowerCase().startsWith("candidate:")) {
+    normalized = normalized.slice("candidate:".length).trimStart();
+  }
+  if (normalized.length === 0) {
+    return false;
+  }
+  const wsTokens = normalized.split(/\s+/);
+  const spaceTokens = normalized.split(" ");
+  const hostA = wsTokens[4]?.toLowerCase() ?? "";
+  const hostB = spaceTokens[4]?.toLowerCase() ?? "";
+  return hostA.includes(".local") || hostB.includes(".local");
+}
+
+export function stripMdnsCandidatesFromSdp(sdp: string): string {
+  const lineEnding = sdp.includes("\r\n") ? "\r\n" : "\n";
+  return sdp
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trimStart();
+      if (!trimmed.toLowerCase().startsWith("a=candidate:")) {
+        return true;
+      }
+      return !isMdnsIceCandidate(trimmed);
+    })
+    .join(lineEnding);
+}
+
 type LocalIceCandidatePayload = Extract<
   SignalingInnerPayload,
   { kind: "ice-candidate" }
@@ -35,12 +139,14 @@ type LocalIceCandidatePayload = Extract<
 interface MappedIceConfig {
   iceServers: RTCIceServer[];
   hasStunServer: boolean;
+  hasTurnServer: boolean;
   forceTurnTCP: boolean;
 }
 
 function mapContractIceServers(configs: readonly IceServerConfig[]): MappedIceConfig {
   const iceServers: RTCIceServer[] = [];
   let hasStunServer = false;
+  let hasTurnServer = false;
   let forceTurnTCP = false;
 
   for (const entry of configs) {
@@ -66,6 +172,9 @@ function mapContractIceServers(configs: readonly IceServerConfig[]): MappedIceCo
         }
         const hostPort = trimmed.replace(/^turns?:/, "").split("?")[0] ?? "";
         if (hostPort) {
+          if (entry.username && entry.credential) {
+            hasTurnServer = true;
+          }
           iceServers.push({
             urls: `turn:${hostPort}`,
             ...(entry.username !== undefined ? { username: entry.username } : {}),
@@ -78,7 +187,7 @@ function mapContractIceServers(configs: readonly IceServerConfig[]): MappedIceCo
     }
   }
 
-  return { iceServers, hasStunServer, forceTurnTCP };
+  return { iceServers, hasStunServer, hasTurnServer, forceTurnTCP };
 }
 
 const WERIFT_SDP_MAX_MESSAGE_SIZE = 262_144; // 256 KiB so browsers allow 65,582 B Swarm chunk frames
@@ -280,26 +389,67 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
   private readonly stateChangeHandlers = new Set<
     (state: PeerTransportState) => void
   >();
+  private readonly disableMdns: boolean;
+  private readonly unusableEnvironmentError: Error | null;
 
   constructor(params: {
     remotePeerId: string;
     isInitiator: boolean;
     iceServers: IceServerConfig[];
+    networkProbe: NetworkInterfaceProbeResult;
     icePortRange?: [number, number];
     iceAdditionalHostAddresses?: string[];
     iceUseIpv6?: boolean;
+    disableMdns?: boolean;
+    onNoUsableIcePath?: (diag: WeriftNetworkDiagnostic) => void;
   }) {
     this.remotePeerId = params.remotePeerId;
     this.isInitiator = params.isInitiator;
 
     const mapped = mapContractIceServers(params.iceServers);
+    const additionalHostAddresses = params.iceAdditionalHostAddresses ?? [
+      "127.0.0.1",
+    ];
+    const networkInterfacesAvailable = params.networkProbe.ok;
+    const hasNonLoopbackInterface =
+      params.networkProbe.ok &&
+      params.networkProbe.ipv4Count + params.networkProbe.ipv6Count > 0;
+    this.disableMdns = params.disableMdns ?? !hasNonLoopbackInterface;
+
+    if (
+      !params.networkProbe.ok &&
+      additionalHostAddresses.length === 0 &&
+      !mapped.hasTurnServer
+    ) {
+      const detail = params.networkProbe.syscall
+        ? `${params.networkProbe.syscall} (${params.networkProbe.code})`
+        : params.networkProbe.code;
+      const msg =
+        `Unsupported restricted network environment: os.networkInterfaces() failed [${detail}] ` +
+        `and neither explicit host addresses nor TURN relay servers are configured.`;
+      this.unusableEnvironmentError = new Error(msg);
+      params.onNoUsableIcePath?.({
+        code: "no_usable_ice_path",
+        message: msg,
+        ...(params.networkProbe.syscall !== undefined
+          ? { syscall: params.networkProbe.syscall }
+          : {}),
+        errnoCode: params.networkProbe.code,
+        hasStunServer: mapped.hasStunServer,
+        hasTurnServer: mapped.hasTurnServer,
+        explicitHostCount: 0,
+      });
+    } else {
+      this.unusableEnvironmentError = null;
+    }
+
     const peerConfig: Partial<PeerConfig> = {
       iceServers: mapped.iceServers,
-      iceUseIpv4: true,
-      iceUseIpv6: params.iceUseIpv6 ?? false,
-      iceAdditionalHostAddresses: params.iceAdditionalHostAddresses ?? [
-        "127.0.0.1",
-      ],
+      iceUseIpv4: networkInterfacesAvailable,
+      iceUseIpv6: networkInterfacesAvailable
+        ? (params.iceUseIpv6 ?? false)
+        : false,
+      iceAdditionalHostAddresses: additionalHostAddresses,
       forceTurnTCP: mapped.forceTurnTCP,
       ...(params.icePortRange !== undefined
         ? { icePortRange: params.icePortRange }
@@ -388,6 +538,30 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     return mapPcState(this.pc.connectionState);
   }
 
+  private guardMdnsLookupErrors(): void {
+    for (const iceTransport of this.pc.iceTransports) {
+      const conn = iceTransport.connection as unknown as {
+        lookup?: {
+          mdnsInstance?: {
+            listenerCount?: (event: string) => number;
+            on?: (event: string, listener: (err: unknown) => void) => void;
+          };
+        };
+      };
+      const mdnsInstance = conn.lookup?.mdnsInstance;
+      if (
+        mdnsInstance &&
+        typeof mdnsInstance.listenerCount === "function" &&
+        typeof mdnsInstance.on === "function" &&
+        mdnsInstance.listenerCount("error") === 0
+      ) {
+        mdnsInstance.on("error", () => {
+          // Prevent unhandled EventEmitter 'error' crash if UDP 5353 bind fails
+        });
+      }
+    }
+  }
+
   private async ensureUniqueDtlsCert(): Promise<void> {
     if (!this.localDtlsCertPromise) {
       this.localDtlsCertPromise = (async () => {
@@ -417,6 +591,9 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     if (this.closed) {
       throw new Error("PeerConnection is closed");
     }
+    if (this.unusableEnvironmentError) {
+      throw this.unusableEnvironmentError;
+    }
     await this.ensureUniqueDtlsCert();
 
     this.deferLocalIce = true;
@@ -437,10 +614,23 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     if (this.closed) {
       throw new Error("PeerConnection is closed");
     }
+    if (this.unusableEnvironmentError) {
+      throw this.unusableEnvironmentError;
+    }
     await this.ensureUniqueDtlsCert();
 
     this.remoteFingerprintCache = extractSdpSha256Fingerprint(offerSdp);
-    await this.pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+    const sanitizedOfferSdp = this.disableMdns
+      ? stripMdnsCandidatesFromSdp(offerSdp)
+      : offerSdp;
+    try {
+      await this.pc.setRemoteDescription({
+        type: "offer",
+        sdp: sanitizedOfferSdp,
+      });
+    } finally {
+      this.guardMdnsLookupErrors();
+    }
     this.remoteDescriptionReady = true;
     await this.flushPendingRemoteIce();
 
@@ -463,7 +653,17 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
       throw new Error("PeerConnection is closed");
     }
     this.remoteFingerprintCache = extractSdpSha256Fingerprint(answerSdp);
-    await this.pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    const sanitizedAnswerSdp = this.disableMdns
+      ? stripMdnsCandidatesFromSdp(answerSdp)
+      : answerSdp;
+    try {
+      await this.pc.setRemoteDescription({
+        type: "answer",
+        sdp: sanitizedAnswerSdp,
+      });
+    } finally {
+      this.guardMdnsLookupErrors();
+    }
     this.remoteDescriptionReady = true;
     await this.flushPendingRemoteIce();
   }
@@ -509,6 +709,9 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     sdpMid?: string | null,
     sdpMLineIndex?: number | null,
   ): Promise<void> {
+    if (this.disableMdns && isMdnsIceCandidate(rawCandidate)) {
+      return;
+    }
     try {
       await this.pc.addIceCandidate({
         candidate: rawCandidate,
@@ -517,6 +720,8 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
       });
     } catch {
       // Safely ignore unsupported browser candidate extensions (e.g. typ prflx / mDNS)
+    } finally {
+      this.guardMdnsLookupErrors();
     }
   }
 
@@ -674,13 +879,19 @@ export interface WeriftTransportFactoryOptions {
   icePortRange?: [number, number];
   iceAdditionalHostAddresses?: string[];
   iceUseIpv6?: boolean;
+  disableMdns?: boolean;
+  networkInterfacesImpl?: typeof os.networkInterfaces;
+  onNetworkDiagnostic?: (diagnostic: WeriftNetworkDiagnostic) => void;
 }
 
 export class WeriftTransportFactory implements PeerTransportFactoryPort {
   private readonly options?: WeriftTransportFactoryOptions;
+  private readonly networkProbe: NetworkInterfaceProbeResult;
+  private degradedWarningReported = false;
 
   constructor(options?: WeriftTransportFactoryOptions) {
     this.options = options;
+    this.networkProbe = probeNetworkInterfaces(options?.networkInterfacesImpl);
   }
 
   createPeerConnection(params: {
@@ -689,10 +900,36 @@ export class WeriftTransportFactory implements PeerTransportFactoryPort {
     isInitiator: boolean;
     iceServers: IceServerConfig[];
   }): PeerConnectionPort {
+    const mapped = mapContractIceServers(params.iceServers);
+    const explicitHostCount = (
+      this.options?.iceAdditionalHostAddresses ?? ["127.0.0.1"]
+    ).length;
+
+    if (!this.networkProbe.ok && !this.degradedWarningReported) {
+      this.degradedWarningReported = true;
+      const detail = this.networkProbe.syscall
+        ? `${this.networkProbe.syscall} (${this.networkProbe.code})`
+        : this.networkProbe.code;
+      this.options?.onNetworkDiagnostic?.({
+        code: "network_interfaces_unavailable",
+        message:
+          `Host network interface enumeration unavailable [${detail}]; ` +
+          `disabled mDNS (.local) and NIC scan, falling back to explicit/STUN/TURN ICE candidates.`,
+        ...(this.networkProbe.syscall !== undefined
+          ? { syscall: this.networkProbe.syscall }
+          : {}),
+        errnoCode: this.networkProbe.code,
+        hasStunServer: mapped.hasStunServer,
+        hasTurnServer: mapped.hasTurnServer,
+        explicitHostCount,
+      });
+    }
+
     return new WeriftPeerConnectionAdapter({
       remotePeerId: params.remotePeerId,
       isInitiator: params.isInitiator,
       iceServers: params.iceServers,
+      networkProbe: this.networkProbe,
       ...(this.options?.icePortRange !== undefined
         ? { icePortRange: this.options.icePortRange }
         : {}),
@@ -701,6 +938,12 @@ export class WeriftTransportFactory implements PeerTransportFactoryPort {
         : {}),
       ...(this.options?.iceUseIpv6 !== undefined
         ? { iceUseIpv6: this.options.iceUseIpv6 }
+        : {}),
+      ...(this.options?.disableMdns !== undefined
+        ? { disableMdns: this.options.disableMdns }
+        : {}),
+      ...(this.options?.onNetworkDiagnostic !== undefined
+        ? { onNoUsableIcePath: this.options.onNetworkDiagnostic }
         : {}),
     });
   }

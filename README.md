@@ -66,6 +66,8 @@ bun run test:e2e      # Real Headless Chromium (OPFS) <-> CLI (werift) Playwrigh
 
 For single-host production deployment with Docker Compose, automatic HTTPS Caddy, and optional `coturn`, see [`deploy/README.md`](deploy/README.md).
 
+> **Restricted Container / Sandbox Note (`apps/cli`)**: Direct WebRTC DataChannels require outbound UDP (or TCP/TLS TURN via `coturn` when UDP is blocked). In restricted Linux containers where `os.networkInterfaces()` (`getifaddrs`) is unavailable, `WeriftTransportFactory` automatically disables host NIC enumeration and `.local` mDNS multicast lookups, falling back cleanly to explicit host / STUN / TURN candidates without crashing.
+
 ---
 
 ## System Architecture
