@@ -1156,6 +1156,7 @@ describe("Interactive join Slash Commands", () => {
       localPeerId: peerId,
       start: async () => {},
       stop: async () => {},
+      updateLocalCert: () => {},
       isCenterConnected: () => true,
       getVerifiedPeers: () => [
         {
@@ -1633,6 +1634,97 @@ describe("Real WeriftTransportFactory P2P Loopback", () => {
 
       // Yield for any async dgram socket callbacks to ensure zero delayed crashes
       await Bun.sleep(50);
+    } finally {
+      connA.close();
+      connB.close();
+    }
+  });
+
+  test("Linux dgram ECONNREFUSED regression: werift UDP ICE sockets safely absorb ICMP recvmsg ECONNREFUSED errors without crashing Bun", async () => {
+    const factoryA = new WeriftTransportFactory();
+    const factoryB = new WeriftTransportFactory();
+
+    const peerAId = "peer_019a000000007000800000000000020a";
+    const peerBId = "peer_019a000000007000800000000000020b";
+
+    const connA = factoryA.createPeerConnection({
+      localPeerId: peerAId,
+      remotePeerId: peerBId,
+      isInitiator: true,
+      iceServers: [],
+    });
+    const connB = factoryB.createPeerConnection({
+      localPeerId: peerBId,
+      remotePeerId: peerAId,
+      isInitiator: false,
+      iceServers: [],
+    });
+
+    try {
+      connA.onLocalIceCandidate((cand) => {
+        void connB.addIceCandidate(cand);
+      });
+      connA.onLocalIceEnd(() => {
+        void connB.endIceCandidates();
+      });
+      connB.onLocalIceCandidate((cand) => {
+        void connA.addIceCandidate(cand);
+      });
+      connB.onLocalIceEnd(() => {
+        void connA.endIceCandidates();
+      });
+
+      const offer = await connA.createOffer();
+      const answer = await connB.acceptOfferAndCreateAnswer(offer);
+      await connA.acceptAnswer(answer);
+
+      await Promise.all([
+        waitForChannelOpen(connA.controlChannel),
+        waitForChannelOpen(connB.controlChannel),
+      ]);
+
+      // Inspect every underlying dgram.Socket created by werift UdpTransport and emit ECONNREFUSED directly
+      let emittedErrorCount = 0;
+      for (const conn of [connA, connB]) {
+        const internalPc = (
+          conn as unknown as {
+            pc: {
+              iceTransports: Array<{
+                connection: {
+                  protocols: Array<{
+                    transport?: { socket?: EventEmitter };
+                    turn?: { transport?: { socket?: EventEmitter } };
+                  }>;
+                };
+              }>;
+            };
+          }
+        ).pc;
+
+        for (const iceTransport of internalPc.iceTransports) {
+          for (const proto of iceTransport.connection.protocols) {
+            const sock = proto.transport?.socket ?? proto.turn?.transport?.socket;
+            if (sock) {
+              expect(sock.listenerCount("error")).toBeGreaterThan(0);
+              const icmpErr = Object.assign(new Error("recvmsg ECONNREFUSED"), {
+                code: "ECONNREFUSED",
+                errno: -111,
+                syscall: "recvmsg",
+              });
+              expect(() => sock.emit("error", icmpErr)).not.toThrow();
+              emittedErrorCount += 1;
+            }
+          }
+        }
+      }
+      expect(emittedErrorCount).toBeGreaterThanOrEqual(2);
+
+      // Verify active WebRTC DataChannel continues delivering messages cleanly after transient ICMP error
+      const msgPromise = new Promise<string>((resolve) => {
+        connB.controlChannel.onTextMessage((t) => resolve(t));
+      });
+      connA.controlChannel.sendText("alive-after-econnrefused");
+      expect(await msgPromise).toBe("alive-after-econnrefused");
     } finally {
       connA.close();
       connB.close();
