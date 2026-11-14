@@ -1,622 +1,98 @@
-import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
-import type {
-  ChatMessageEnvelope,
-  FileManifest,
-  UserProfile,
-} from "@simpleim/contracts";
-import {
-  generateEd25519KeyPair,
-  generatePrefixedId,
-  wipeRoomKeys,
-  type DerivedRoomKeys,
-  type Ed25519KeyPair,
-} from "@simpleim/crypto";
-import {
-  createRoomPeerEngine,
-  type RoomPeerEngine,
-  type SwarmTransferProgress,
-  type VerifiedPeerInfo,
-} from "@simpleim/peer-core";
-import { HttpApiError, HttpAuthClient } from "./api/http-client.ts";
-import { AuthView } from "./components/AuthView.tsx";
-import { JoinRoomView, type JoinPhase } from "./components/JoinRoomView.tsx";
-import { RoomWorkspace } from "./components/RoomWorkspace.tsx";
-import { deriveRoomKeysOffThread } from "./crypto/kdf-client.ts";
-import {
-  createBrowserFileChunkReader,
-  OpfsChunkStorageAdapter,
-} from "./storage/opfs-chunk-storage.ts";
-import { BrowserSignalingClient } from "./transport/browser-signaling.ts";
-import { BrowserWebRtcTransportFactory } from "./transport/browser-webrtc.ts";
+import { useRef, type ReactElement } from "react";
+import { NoticeBanner } from "./design-system/index.ts";
+import { AuthScreen } from "./features/auth/AuthScreen.tsx";
+import { JoinRoomScreen } from "./features/lobby/JoinRoomScreen.tsx";
+import { RoomScreen } from "./features/room/RoomScreen.tsx";
+import { useAuthSession } from "./hooks/useAuthSession.ts";
+import { useRoomSession } from "./hooks/useRoomSession.ts";
+import { I18nProvider, useI18n } from "./i18n/I18nProvider.tsx";
+import { ThemeProvider } from "./theme/ThemeProvider.tsx";
 
-interface ActiveRoomRuntime {
-  engine: RoomPeerEngine;
-  roomKeys: DerivedRoomKeys;
-  localSignKeyPair: Ed25519KeyPair;
-  chunkStorage: OpfsChunkStorageAdapter;
-  localPeerId: string;
-  roomIdPrefix: string;
-}
+export { RoomRuntimeSlot } from "./state/runtime-slot.ts";
 
-export class RoomRuntimeSlot<T> {
-  current: T | null = null;
-  generation = 0;
+function AppShell(): ReactElement {
+  const { t } = useI18n();
+  const leaveRoomRef = useRef<() => Promise<void>>(async () => {});
 
-  beginAttempt(): number {
-    this.generation += 1;
-    return this.generation;
-  }
+  const auth = useAuthSession({
+    onBeforeSessionReset: () => leaveRoomRef.current(),
+  });
 
-  isCurrentAttempt(gen: number): boolean {
-    return this.generation === gen;
-  }
+  const room = useRoomSession({
+    user: auth.user,
+    authClient: auth.authClient,
+    onSessionExpired: auth.expireToReauth,
+  });
 
-  installIfCurrent(gen: number, runtime: T): boolean {
-    if (this.generation !== gen) {
-      return false;
-    }
-    this.current = runtime;
-    return true;
-  }
+  leaveRoomRef.current = room.leaveRoom;
 
-  clearIfOwned(runtime: T | null): boolean {
-    if (runtime !== null && this.current === runtime) {
-      this.current = null;
-      return true;
-    }
-    return false;
-  }
-
-  takeActiveForTeardown(): T | null {
-    this.generation += 1;
-    const active = this.current;
-    this.current = null;
-    return active;
-  }
-}
-
-async function cleanupRuntimeInstance(rt: ActiveRoomRuntime): Promise<void> {
-  try {
-    await rt.engine.stop();
-  } catch {
-    // Ignore shutdown errors
-  }
-  try {
-    wipeRoomKeys(rt.roomKeys);
-    rt.localSignKeyPair.privateKeyBytes.fill(0);
-  } catch {
-    // Ignore wipe errors
-  }
-  try {
-    await rt.chunkStorage.closeAll();
-  } catch {
-    // Ignore OPFS cleanup errors
-  }
-}
-
-function mergeOrderedMessages(
-  existing: ChatMessageEnvelope[],
-  incoming: ChatMessageEnvelope[],
-): ChatMessageEnvelope[] {
-  const byId = new Map<string, ChatMessageEnvelope>();
-  for (const m of existing) {
-    byId.set(m.msgId, m);
-  }
-  for (const m of incoming) {
-    byId.set(m.msgId, m);
-  }
-  return Array.from(byId.values()).sort(
-    (a, b) =>
-      a.lamport - b.lamport ||
-      a.createdAt - b.createdAt ||
-      a.msgId.localeCompare(b.msgId),
-  );
-}
-
-function mergeOrderedFiles(
-  existing: FileManifest[],
-  incoming: FileManifest[],
-): FileManifest[] {
-  const byId = new Map<string, FileManifest>();
-  for (const f of existing) {
-    byId.set(f.fileId, f);
-  }
-  for (const f of incoming) {
-    byId.set(f.fileId, f);
-  }
-  return Array.from(byId.values());
-}
-
-export function App(): ReactElement {
-  const authClientRef = useRef<HttpAuthClient | null>(null);
-  if (!authClientRef.current) {
-    authClientRef.current = new HttpAuthClient();
-  }
-  const authClient = authClientRef.current;
-
-  const runtimeSlotRef = useRef<RoomRuntimeSlot<ActiveRoomRuntime> | null>(null);
-  if (!runtimeSlotRef.current) {
-    runtimeSlotRef.current = new RoomRuntimeSlot<ActiveRoomRuntime>();
-  }
-  const runtimeSlot = runtimeSlotRef.current;
-
-  const [bootstrapping, setBootstrapping] = useState(true);
-  const [user, setUser] = useState<UserProfile | null>(null);
-  const [authNotice, setAuthNotice] = useState<string | null>(null);
-
-  const [joinPhase, setJoinPhase] = useState<JoinPhase>("idle");
-  const [joinError, setJoinError] = useState<string | null>(null);
-
-  const [inRoom, setInRoom] = useState(false);
-  const [roomIdPrefix, setRoomIdPrefix] = useState("");
-  const [localPeerId, setLocalPeerId] = useState("");
-  const [centerConnected, setCenterConnected] = useState(false);
-  const [peers, setPeers] = useState<VerifiedPeerInfo[]>([]);
-  const [messages, setMessages] = useState<ChatMessageEnvelope[]>([]);
-  const [files, setFiles] = useState<FileManifest[]>([]);
-  const [transfers, setTransfers] = useState<Map<string, SwarmTransferProgress>>(
-    () => new Map(),
-  );
-  const [securityNotice, setSecurityNotice] = useState<string | null>(null);
-
-  const teardownActiveRoom = useCallback(async (): Promise<void> => {
-    const rt = runtimeSlot.takeActiveForTeardown();
-
-    setInRoom(false);
-    setJoinPhase("idle");
-    setRoomIdPrefix("");
-    setLocalPeerId("");
-    setCenterConnected(false);
-    setPeers([]);
-    setMessages([]);
-    setFiles([]);
-    setTransfers(new Map());
-    setSecurityNotice(null);
-
-    if (!rt) return;
-    await cleanupRuntimeInstance(rt);
-  }, [runtimeSlot]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const unsubscribeCrossTab = authClient.onCrossTabSessionReset((nextUser) => {
-      void teardownActiveRoom().then(() => {
-        if (cancelled) return;
-        setUser(nextUser);
-        setJoinError(null);
-        if (nextUser === null) {
-          setAuthNotice("Signed out from another browser tab.");
-        }
-      });
-    });
-
-    void authClient
-      .getMe()
-      .then((restoredUser) => {
-        if (!cancelled) {
-          setUser(restoredUser);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setUser(null);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setBootstrapping(false);
-        }
-      });
-
-    const handlePageHide = (): void => {
-      void teardownActiveRoom();
-    };
-    window.addEventListener("pagehide", handlePageHide);
-
-    return () => {
-      cancelled = true;
-      window.removeEventListener("pagehide", handlePageHide);
-      unsubscribeCrossTab();
-      void teardownActiveRoom();
-    };
-  }, [authClient, teardownActiveRoom]);
-
-  const handleLogin = async (params: {
-    username: string;
-    password: string;
-  }): Promise<void> => {
-    await teardownActiveRoom();
-    const loggedIn = await authClient.login(params);
-    setAuthNotice(null);
-    setJoinError(null);
-    setUser(loggedIn);
-  };
-
-  const handleRegister = async (params: {
-    username: string;
-    password: string;
-    displayName?: string;
-  }): Promise<void> => {
-    await teardownActiveRoom();
-    const registered = await authClient.register(params);
-    setAuthNotice(null);
-    setJoinError(null);
-    setUser(registered);
-  };
-
-  const handleSignOut = async (): Promise<void> => {
-    await teardownActiveRoom();
-    try {
-      await authClient.logout();
-    } finally {
-      setUser(null);
-      setJoinError(null);
-    }
-  };
-
-  const handleJoinRoom = async (passphrase: string): Promise<void> => {
-    if (!user) return;
-    await teardownActiveRoom();
-
-    const myGen = runtimeSlot.beginAttempt();
-    setJoinError(null);
-    setJoinPhase("deriving");
-
-    let derivedKeys: DerivedRoomKeys | null = null;
-    let signKeyPair: Ed25519KeyPair | null = null;
-    let chunkStorage: OpfsChunkStorageAdapter | null = null;
-    let engine: RoomPeerEngine | null = null;
-    let createdRuntime: ActiveRoomRuntime | null = null;
-
-    try {
-      derivedKeys = await deriveRoomKeysOffThread(passphrase);
-      if (!runtimeSlot.isCurrentAttempt(myGen)) {
-        wipeRoomKeys(derivedKeys);
-        return;
-      }
-
-      setJoinPhase("connecting");
-      const peerId = generatePrefixedId("peer");
-      signKeyPair = generateEd25519KeyPair();
-
-      const [meta, cert] = await Promise.all([
-        authClient.getMeta(),
-        authClient.issuePeerCert({
-          userId: user.id,
-          peerId,
-          peerSignKeyPair: signKeyPair,
-        }),
-      ]);
-
-      if (!runtimeSlot.isCurrentAttempt(myGen)) {
-        wipeRoomKeys(derivedKeys);
-        signKeyPair.privateKeyBytes.fill(0);
-        return;
-      }
-
-      const signaling = new BrowserSignalingClient({
-        peerId,
-        maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
-      });
-      const transportFactory = new BrowserWebRtcTransportFactory();
-      chunkStorage = new OpfsChunkStorageAdapter();
-
-      const activeEngine = createRoomPeerEngine({
-        localPeerId: peerId,
-        localCert: cert,
-        localSignKeyPair: signKeyPair,
-        serverSignPubKey: meta.serverSignPubKey,
-        roomKeys: derivedKeys,
-        iceServers: meta.iceServers,
-        maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
-        signaling,
-        transportFactory,
-        chunkStorage,
-        events: {
-          onCenterConnectionChange: (connected) => {
-            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-            setCenterConnected(connected);
-          },
-          onPeersChange: (nextPeers) => {
-            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-            setPeers([...nextPeers]);
-          },
-          onPeerAuthRejected: (_remotePeerId, reason) => {
-            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-            setSecurityNotice(
-              `Quarantined peer failed HELLO_AUTH verification (${reason}) and was disconnected.`,
-            );
-          },
-          onChatMessage: (msg) => {
-            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-            setMessages((prev) =>
-              mergeOrderedMessages(prev, [
-                ...activeEngine.getMessages(),
-                msg,
-              ]),
-            );
-          },
-          onFileAnnounced: (manifest) => {
-            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-            setFiles((prev) =>
-              mergeOrderedFiles(prev, [...activeEngine.getFiles(), manifest]),
-            );
-            const prog = activeEngine.getTransferProgress(manifest.fileId);
-            if (prog) {
-              setTransfers((prev) => {
-                const next = new Map(prev);
-                next.set(manifest.fileId, { ...prog });
-                return next;
-              });
-            }
-          },
-          onTransferProgress: (progress) => {
-            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-            setTransfers((prev) => {
-              const next = new Map(prev);
-              next.set(progress.fileId, { ...progress });
-              return next;
-            });
-          },
-          onTransferCompleted: (manifest) => {
-            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-            const prog = activeEngine.getTransferProgress(manifest.fileId);
-            setTransfers((prev) => {
-              const next = new Map(prev);
-              next.set(
-                manifest.fileId,
-                prog
-                  ? { ...prog, status: "seeding" }
-                  : {
-                      fileId: manifest.fileId,
-                      fileName: manifest.fileName,
-                      fileSize: manifest.fileSize,
-                      totalChunks: manifest.totalChunks,
-                      completedChunks: manifest.totalChunks,
-                      bytesCompleted: manifest.fileSize,
-                      downloadSpeedBytesPerSec: 0,
-                      availableSeeders: 1,
-                      availablePeersWithChunks: 1,
-                      status: "seeding",
-                    },
-              );
-              return next;
-            });
-          },
-          onError: (err) => {
-            if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-            setSecurityNotice(err.message);
-          },
-        },
-      });
-      engine = activeEngine;
-
-      createdRuntime = {
-        engine: activeEngine,
-        roomKeys: derivedKeys,
-        localSignKeyPair: signKeyPair,
-        chunkStorage,
-        localPeerId: peerId,
-        roomIdPrefix: derivedKeys.roomIdPrefix,
-      };
-      if (!runtimeSlot.installIfCurrent(myGen, createdRuntime)) {
-        await cleanupRuntimeInstance(createdRuntime);
-        return;
-      }
-
-      await activeEngine.start();
-
-      if (
-        !runtimeSlot.isCurrentAttempt(myGen) ||
-        runtimeSlot.current !== createdRuntime
-      ) {
-        runtimeSlot.clearIfOwned(createdRuntime);
-        await cleanupRuntimeInstance(createdRuntime);
-        return;
-      }
-
-      setLocalPeerId(peerId);
-      setRoomIdPrefix(derivedKeys.roomIdPrefix);
-      setCenterConnected(activeEngine.isCenterConnected());
-      setPeers(activeEngine.getVerifiedPeers());
-      setMessages(activeEngine.getMessages());
-      setFiles(activeEngine.getFiles());
-      setJoinPhase("idle");
-      setInRoom(true);
-    } catch (err) {
-      runtimeSlot.clearIfOwned(createdRuntime);
-      if (engine) {
-        try {
-          await engine.stop();
-        } catch {
-          // Ignore
-        }
-      }
-      if (derivedKeys) {
-        wipeRoomKeys(derivedKeys);
-      }
-      if (signKeyPair) {
-        signKeyPair.privateKeyBytes.fill(0);
-      }
-      if (chunkStorage) {
-        try {
-          await chunkStorage.closeAll();
-        } catch {
-          // Ignore
-        }
-      }
-
-      if (runtimeSlot.isCurrentAttempt(myGen)) {
-        setJoinPhase("idle");
-        if (
-          err instanceof HttpApiError &&
-          (err.status === 401 || err.code === "csrf_invalid")
-        ) {
-          setUser(null);
-          setAuthNotice("Please sign in again to issue a fresh peer certificate.");
-        } else {
-          setJoinError(
-            err instanceof Error ? err.message : "Failed to join encrypted room",
-          );
-        }
-      }
-    }
-  };
-
-  const handleSendMessage = async (
-    body: string,
-    replyToMsgId: string | null,
-  ): Promise<void> => {
-    const rt = runtimeSlot.current;
-    if (!rt) {
-      throw new Error("Room session is not active");
-    }
-    const sent = await rt.engine.sendChatMessage(body, replyToMsgId);
-    setMessages((prev) =>
-      mergeOrderedMessages(prev, [...rt.engine.getMessages(), sent]),
-    );
-  };
-
-  const handleShareFiles = async (selectedFiles: File[]): Promise<void> => {
-    const rt = runtimeSlot.current;
-    if (!rt) {
-      throw new Error("Room session is not active");
-    }
-    for (const file of selectedFiles) {
-      const manifest = await rt.engine.shareFile({
-        fileName: file.name,
-        fileSize: file.size,
-        mimeType: file.type || "application/octet-stream",
-        readChunk: createBrowserFileChunkReader(file),
-      });
-      rt.chunkStorage.attachLocalSourceBlob(manifest.fileId, file);
-      setFiles((prev) =>
-        mergeOrderedFiles(prev, [...rt.engine.getFiles(), manifest]),
-      );
-      const prog = rt.engine.getTransferProgress(manifest.fileId);
-      setTransfers((prev) => {
-        const next = new Map(prev);
-        next.set(
-          manifest.fileId,
-          prog
-            ? { ...prog }
-            : {
-                fileId: manifest.fileId,
-                fileName: manifest.fileName,
-                fileSize: manifest.fileSize,
-                totalChunks: manifest.totalChunks,
-                completedChunks: manifest.totalChunks,
-                bytesCompleted: manifest.fileSize,
-                downloadSpeedBytesPerSec: 0,
-                availableSeeders: 1,
-                availablePeersWithChunks: 1,
-                status: "seeding",
-              },
-        );
-        return next;
-      });
-    }
-  };
-
-  const handleDownloadFile = async (fileId: string): Promise<void> => {
-    const rt = runtimeSlot.current;
-    if (!rt) return;
-    await rt.engine.downloadFile(fileId);
-    const prog = rt.engine.getTransferProgress(fileId);
-    if (prog) {
-      setTransfers((prev) => {
-        const next = new Map(prev);
-        next.set(fileId, { ...prog });
-        return next;
-      });
-    }
-  };
-
-  const handleCancelDownload = async (fileId: string): Promise<void> => {
-    const rt = runtimeSlot.current;
-    if (!rt) return;
-    await rt.engine.cancelDownload(fileId);
-    const prog = rt.engine.getTransferProgress(fileId);
-    setTransfers((prev) => {
-      const next = new Map(prev);
-      if (prog) {
-        next.set(fileId, { ...prog });
-      }
-      return next;
-    });
-  };
-
-  const handleSaveFile = async (manifest: FileManifest): Promise<void> => {
-    const rt = runtimeSlot.current;
-    if (!rt) return;
-    await rt.chunkStorage.triggerBrowserDownload(
-      manifest.fileId,
-      manifest.fileName,
-      manifest.mimeType,
-    );
-  };
-
-  const canSaveFile = (fileId: string): boolean => {
-    const rt = runtimeSlot.current;
-    return rt ? rt.chunkStorage.isSaveAvailable(fileId) : false;
-  };
-
-  if (bootstrapping) {
+  if (auth.bootstrapping) {
     return (
-      <div className="centered-shell">
-        <main className="centered-main">
-          <div className="alert-banner alert-info" role="status">
-            <span className="spinner-dot" aria-hidden="true" />
-            <span>Initializing SimpleIM workspace…</span>
+      <div className="screen-shell">
+        <main className="centered-stage">
+          <div className="dialog-column">
+            <NoticeBanner tone="info" loading>
+              {t("app.loading")}
+            </NoticeBanner>
           </div>
         </main>
       </div>
     );
   }
 
-  if (!user) {
+  if (!auth.user) {
     return (
-      <AuthView
-        onLogin={handleLogin}
-        onRegister={handleRegister}
-        externalNotice={authNotice}
+      <AuthScreen
+        onLogin={auth.login}
+        onRegister={auth.register}
+        externalNoticeKey={auth.authNoticeKey}
       />
     );
   }
 
-  if (!inRoom) {
+  if (!room.inRoom) {
     return (
-      <JoinRoomView
-        user={user}
-        joinPhase={joinPhase}
-        error={joinError}
-        onJoinRoom={handleJoinRoom}
-        onSignOut={handleSignOut}
+      <JoinRoomScreen
+        user={auth.user}
+        joinPhase={room.joinPhase}
+        joinFailure={room.joinFailure}
+        onClearJoinFailure={room.clearJoinFailure}
+        onJoinRoom={room.joinRoom}
+        onSignOut={auth.signOut}
       />
     );
   }
 
   return (
-    <RoomWorkspace
-      user={user}
-      localPeerId={localPeerId}
-      roomIdPrefix={roomIdPrefix}
-      centerConnected={centerConnected}
-      peers={peers}
-      messages={messages}
-      files={files}
-      transfers={transfers}
-      securityNotice={securityNotice}
-      onDismissNotice={() => setSecurityNotice(null)}
-      onSendMessage={handleSendMessage}
-      onShareFiles={handleShareFiles}
-      onDownloadFile={handleDownloadFile}
-      onCancelDownload={handleCancelDownload}
-      onSaveFile={handleSaveFile}
-      canSaveFile={canSaveFile}
-      onLeaveRoom={teardownActiveRoom}
-      onSignOut={handleSignOut}
+    <RoomScreen
+      user={auth.user}
+      localPeerId={room.localPeerId}
+      roomIdPrefix={room.roomIdPrefix}
+      centerConnected={room.centerConnected}
+      peers={room.peers}
+      messages={room.messages}
+      files={room.files}
+      transfers={room.transfers}
+      securityEvent={room.securityEvent}
+      onDismissSecurityEvent={room.dismissSecurityEvent}
+      onSendMessage={room.sendMessage}
+      onShareFiles={room.shareFiles}
+      onDownloadFile={room.downloadFile}
+      onCancelDownload={room.cancelDownload}
+      onSaveFile={room.saveFile}
+      canSaveFile={room.canSaveFile}
+      onLeaveRoom={room.leaveRoom}
+      onSignOut={auth.signOut}
     />
+  );
+}
+
+export function App(): ReactElement {
+  return (
+    <ThemeProvider>
+      <I18nProvider>
+        <AppShell />
+      </I18nProvider>
+    </ThemeProvider>
   );
 }

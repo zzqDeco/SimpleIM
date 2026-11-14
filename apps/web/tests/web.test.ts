@@ -1,8 +1,13 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { createElement } from "react";
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
+  ERROR_CODES,
   hasChunkInBitfield,
   SWARM_CHUNK_SIZE,
+  type ChatMessageEnvelope,
   type FileManifest,
 } from "@simpleim/contracts";
 import {
@@ -11,9 +16,43 @@ import {
   issuePeerIdentityCert,
   sha256Hex,
 } from "@simpleim/crypto";
-import { RoomRuntimeSlot } from "../src/App.tsx";
-import { HttpAuthClient } from "../src/api/http-client.ts";
+import { HttpApiError, HttpAuthClient } from "../src/api/http-client.ts";
 import { deriveRoomKeysOffThread } from "../src/crypto/kdf-client.ts";
+import {
+  Byline,
+  NoticeBanner,
+  ProgressBar,
+  StatusIcon,
+  Subline,
+  TextField,
+} from "../src/design-system/index.ts";
+import { formatAppFailure, toAppFailure } from "../src/i18n/error-catalog.ts";
+import {
+  detectBrowserLocale,
+  LOCALE_OPTIONS,
+  readStoredLocale,
+  resolveInitialLocale,
+  translate,
+  TRANSLATIONS,
+  writeStoredLocale,
+} from "../src/i18n/registry.ts";
+import { LOCALE_CODES, type TranslationKey } from "../src/i18n/types.ts";
+import { deriveMessageViewModel } from "../src/state/message-vm.ts";
+import { RoomRuntimeSlot } from "../src/state/runtime-slot.ts";
+import {
+  countActiveDownloads,
+  deriveTransferViewModel,
+} from "../src/state/transfer-vm.ts";
+import {
+  validateAuthInput,
+  validateRoomPassphrase,
+} from "../src/state/validation.ts";
+import {
+  nextThemeMode,
+  readStoredThemeMode,
+  resolveEffectiveTheme,
+  writeStoredThemeMode,
+} from "../src/theme/theme-engine.ts";
 import {
   createBrowserFileChunkReader,
   OpfsChunkStorageAdapter,
@@ -928,5 +967,277 @@ describe("HTTP Auth Client CSRF & Off-Thread KDF", () => {
     // Stale installIfCurrent from an even older attempt is also rejected
     expect(slot.installIfCurrent(gen1, { id: "stale" })).toBe(false);
     expect(slot.current).toBe(rt2);
+  });
+});
+
+describe("Multi-Language i18n Engine & Error Code Catalog", () => {
+  test("maintains 100% key and interpolation placeholder parity across all 6 built-in locales", () => {
+    expect(LOCALE_OPTIONS.map((o) => o.code)).toEqual([...LOCALE_CODES]);
+
+    const baseKeys = Object.keys(TRANSLATIONS.en).sort() as TranslationKey[];
+    expect(baseKeys.length).toBeGreaterThan(70);
+
+    const extractPlaceholders = (tpl: string): string[] =>
+      Array.from(tpl.matchAll(/\{([a-zA-Z0-9_]+)\}/g), (m) => m[1]!).sort();
+
+    for (const locale of LOCALE_CODES) {
+      const dict = TRANSLATIONS[locale];
+      expect(Object.keys(dict).sort()).toEqual(baseKeys);
+      for (const key of baseKeys) {
+        const val = dict[key];
+        expect(val.trim().length, `${locale}:${key} must not be empty`).toBeGreaterThan(0);
+        expect(
+          extractPlaceholders(val),
+          `${locale}:${key} placeholder mismatch`,
+        ).toEqual(extractPlaceholders(TRANSLATIONS.en[key]));
+      }
+    }
+
+    expect(translate("zh-CN", "room.drawerToggle", { peers: 3, files: 5 })).toBe(
+      "成员 (3) · 文件 (5)",
+    );
+    expect(translate("ja", "room.files.peersRatio", { seeds: 2, peers: 4 })).toBe(
+      "ノード 2/4",
+    );
+  });
+
+  test("auto-detects browser language accurately and never writes to storage until explicitly changed", () => {
+    expect(detectBrowserLocale(["zh-CN", "en-US"])).toBe("zh-CN");
+    expect(detectBrowserLocale(["zh-Hans-SG"])).toBe("zh-CN");
+    expect(detectBrowserLocale(["zh-TW", "zh"])).toBe("zh-TW");
+    expect(detectBrowserLocale(["zh-HK"])).toBe("zh-TW");
+    expect(detectBrowserLocale(["zh-Hant-MO"])).toBe("zh-TW");
+    expect(detectBrowserLocale(["ja-JP", "en"])).toBe("ja");
+    expect(detectBrowserLocale(["ko-KR"])).toBe("ko");
+    expect(detectBrowserLocale(["es-419", "en"])).toBe("es");
+    expect(detectBrowserLocale(["fr-FR", "ja"])).toBe("ja");
+    expect(detectBrowserLocale(["de-DE", "fr-FR"])).toBe("en");
+    expect(detectBrowserLocale([])).toBe("en");
+
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+    };
+
+    expect(readStoredLocale(mockStorage)).toBeNull();
+    expect(resolveInitialLocale(mockStorage, ["ko-KR"])).toBe("ko");
+    // Zero storage writes during initial auto-detection
+    expect(store.size).toBe(0);
+
+    writeStoredLocale("es", mockStorage);
+    expect(Array.from(store.entries())).toEqual([["simpleim.locale", "es"]]);
+    expect(resolveInitialLocale(mockStorage, ["zh-CN"])).toBe("es");
+  });
+
+  test("maps every @simpleim/contracts ErrorCode to localized copy in all 6 languages", () => {
+    for (const code of ERROR_CODES) {
+      const failure = toAppFailure(new HttpApiError("raw server msg", 400, code));
+      expect(failure).toEqual({ kind: "api", code });
+      for (const locale of LOCALE_CODES) {
+        const localized = formatAppFailure(failure, (k, p) =>
+          translate(locale, k, p),
+        );
+        expect(localized.length).toBeGreaterThan(0);
+        expect(localized).not.toBe("raw server msg");
+      }
+    }
+  });
+});
+
+describe("Theme Engine, Pure State ViewModels & CSS Token Purity", () => {
+  test("resolves system/dark/light themes and writes to storage only on explicit change", () => {
+    expect(resolveEffectiveTheme("system", true)).toBe("dark");
+    expect(resolveEffectiveTheme("system", false)).toBe("light");
+    expect(resolveEffectiveTheme("dark", false)).toBe("dark");
+    expect(resolveEffectiveTheme("light", true)).toBe("light");
+
+    expect(nextThemeMode("system")).toBe("dark");
+    expect(nextThemeMode("dark")).toBe("light");
+    expect(nextThemeMode("light")).toBe("system");
+
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+    };
+    expect(readStoredThemeMode(mockStorage)).toBeNull();
+    expect(store.size).toBe(0);
+
+    writeStoredThemeMode("light", mockStorage);
+    expect(Array.from(store.entries())).toEqual([["simpleim.theme", "light"]]);
+    expect(readStoredThemeMode(mockStorage)).toBe("light");
+  });
+
+  test("validates auth and passphrase inputs and derives pure message & transfer ViewModels", () => {
+    expect(
+      validateAuthInput({
+        mode: "login",
+        username: "ab",
+        password: "x",
+        displayName: "",
+      }),
+    ).toBe("validation.username");
+    expect(
+      validateAuthInput({
+        mode: "login",
+        username: "alice",
+        password: "",
+        displayName: "",
+      }),
+    ).toBe("validation.passwordRequired");
+    expect(
+      validateAuthInput({
+        mode: "register",
+        username: "alice",
+        password: "short",
+        displayName: "",
+      }),
+    ).toBe("validation.passwordLength");
+    expect(
+      validateAuthInput({
+        mode: "register",
+        username: "alice",
+        password: "valid-password-123",
+        displayName: "x".repeat(33),
+      }),
+    ).toBe("validation.displayNameLength");
+    expect(
+      validateAuthInput({
+        mode: "register",
+        username: "Alice_01",
+        password: "valid-password-123",
+        displayName: "Alice",
+      }),
+    ).toBeNull();
+
+    expect(validateRoomPassphrase("")).toBe("validation.passphraseLength");
+    expect(validateRoomPassphrase("a".repeat(257))).toBe(
+      "validation.passphraseLength",
+    );
+    expect(validateRoomPassphrase("跨端共享群组口令")).toBeNull();
+
+    const manifest = buildDummyManifest({
+      fileId: "019a0000-0000-7000-8000-000000000901",
+      fileName: "archive.tar.zst",
+      fileSize: SWARM_CHUNK_SIZE * 4,
+      totalChunks: 4,
+    });
+    const senderPeerId = manifest.senderCert.payload.peerId;
+
+    const remoteAnnounced = deriveTransferViewModel(
+      manifest,
+      undefined,
+      "peer_other",
+      false,
+    );
+    expect(remoteAnnounced.status).toBe("announced");
+    expect(remoteAnnounced.canDownload).toBe(true);
+    expect(remoteAnnounced.canSave).toBe(false);
+
+    const ownSeed = deriveTransferViewModel(
+      manifest,
+      undefined,
+      senderPeerId,
+      true,
+    );
+    expect(ownSeed.status).toBe("seeding");
+    expect(ownSeed.percent).toBe(100);
+    expect(ownSeed.canSave).toBe(true);
+    expect(ownSeed.canDownload).toBe(false);
+
+    const progressMap = new Map([
+      [
+        manifest.fileId,
+        {
+          fileId: manifest.fileId,
+          fileName: manifest.fileName,
+          fileSize: manifest.fileSize,
+          totalChunks: 4,
+          completedChunks: 2,
+          bytesCompleted: SWARM_CHUNK_SIZE * 2,
+          downloadSpeedBytesPerSec: 2 * 1024 * 1024,
+          availableSeeders: 1,
+          availablePeersWithChunks: 2,
+          status: "downloading" as const,
+        },
+      ],
+    ]);
+    expect(countActiveDownloads([manifest], progressMap)).toBe(1);
+
+    const baseMsg: ChatMessageEnvelope = {
+      msgId: "019a0000-0000-7000-8000-000000000911",
+      roomId: "a".repeat(64),
+      lamport: 1,
+      createdAt: 1_763_047_215_000,
+      replyToMsgId: null,
+      body: "First terminal message",
+      authorCert: manifest.senderCert,
+      authorSig: "B".repeat(86),
+    };
+    const replyMsg: ChatMessageEnvelope = {
+      ...baseMsg,
+      msgId: "019a0000-0000-7000-8000-000000000912",
+      lamport: 2,
+      replyToMsgId: baseMsg.msgId,
+      body: "Reply body",
+    };
+    const byId = new Map([
+      [baseMsg.msgId, baseMsg],
+      [replyMsg.msgId, replyMsg],
+    ]);
+    const selfVm = deriveMessageViewModel(replyMsg, senderPeerId, byId);
+    expect(selfVm.isSelf).toBe(true);
+    expect(selfVm.runtimeTag).toBe("WEB");
+    expect(selfVm.quote?.resolvedAuthorHandle).toBe("@alice");
+    expect(selfVm.quote?.previewText).toBe("First terminal message");
+  });
+
+  test("renders cc-inspired design-system primitives cleanly and enforces zero hardcoded colors outside tokens.css", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        "div",
+        null,
+        createElement(
+          Byline,
+          null,
+          createElement("span", null, "@alice"),
+          createElement("span", null, "WEB"),
+        ),
+        createElement(StatusIcon, { status: "online" }),
+        createElement(Subline, null, "Quoted reply"),
+        createElement(ProgressBar, {
+          percent: 65,
+          ariaLabel: "transfer",
+        }),
+        createElement(NoticeBanner, { tone: "warning" }, "Alert"),
+        createElement(TextField, {
+          id: "prompt-id",
+          label: "Passphrase",
+          showPromptSigil: true,
+        }),
+      ),
+    );
+
+    expect(html).toContain(" · ");
+    expect(html).toContain("⎿");
+    expect(html).toContain("❯");
+    expect(html).toContain('aria-valuenow="65"');
+
+    const stylesDir = join(import.meta.dir, "../src/styles");
+    for (const cssFile of ["base.css", "design-system.css", "workspace.css"]) {
+      const content = readFileSync(join(stylesDir, cssFile), "utf8");
+      const hardcodedColorMatch = content.match(
+        /#[0-9a-fA-F]{3,8}\b|\brgba?\s*\(|\bhsla?\s*\(/,
+      );
+      expect(
+        hardcodedColorMatch,
+        `${cssFile} must use CSS variables from tokens.css only`,
+      ).toBeNull();
+    }
   });
 });
