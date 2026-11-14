@@ -1,6 +1,7 @@
 import type {
   ChatMessageEnvelope,
   ClientSignalingFrame,
+  ErrorCode,
   FileManifest,
   IceServerConfig,
   PeerIdentityCert,
@@ -8,6 +9,20 @@ import type {
   SignalingInnerPayload,
 } from "@simpleim/contracts";
 import type { DerivedRoomKeys, Ed25519KeyPair } from "@simpleim/crypto";
+
+export class SignalingServerError extends Error {
+  readonly code: ErrorCode;
+  readonly roomId?: string;
+
+  constructor(code: ErrorCode, serverMessage: string, roomId?: string) {
+    super(`Signaling error [${code}]: ${serverMessage}`);
+    this.name = "SignalingServerError";
+    this.code = code;
+    if (roomId !== undefined) {
+      this.roomId = roomId;
+    }
+  }
+}
 
 export type ChannelReadyState = "connecting" | "open" | "closing" | "closed";
 

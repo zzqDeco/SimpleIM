@@ -163,8 +163,9 @@ async function registerAndJoinRoomOnWeb(params: {
   await page.getByTestId("room-passphrase").fill(params.passphrase);
   await page.getByTestId("room-join-submit").click();
 
-  await expect(page.getByTestId("connection-badge")).toContainText(
-    "Center Signaling Active",
+  await expect(page.getByTestId("connection-badge")).toHaveAttribute(
+    "data-connection-state",
+    "connected",
     { timeout: 25_000 },
   );
 }
@@ -302,14 +303,16 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
         .getByTestId("file-list")
         .locator(".file-card", { hasText: "cli-telemetry.bin" });
       await expect(aliceCliFileCard).toBeVisible();
-      await aliceCliFileCard.getByRole("button", { name: "Download" }).click();
+      await aliceCliFileCard.getByTestId("file-download-button").click();
 
-      await expect(aliceCliFileCard).toContainText("Seeding", {
-        timeout: 25_000,
-      });
+      await expect(aliceCliFileCard).toHaveAttribute(
+        "data-transfer-status",
+        "seeding",
+        { timeout: 25_000 },
+      );
 
       const downloadPromise = pageAlice.waitForEvent("download");
-      await aliceCliFileCard.getByRole("button", { name: "Save File" }).click();
+      await aliceCliFileCard.getByTestId("file-save-button").click();
       const browserDownload = await downloadPromise;
       expect(browserDownload.suggestedFilename()).toBe("cli-telemetry.bin");
       const downloadedPath = await browserDownload.path();
@@ -332,7 +335,7 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
         pageAlice
           .getByTestId("file-list")
           .locator(".file-card", { hasText: "browser-capture.bin" }),
-      ).toContainText("Seeding");
+      ).toHaveAttribute("data-transfer-status", "seeding");
 
       let webAnnouncedFileId = "";
       await expect
@@ -364,11 +367,13 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       // 6. Stop central server completely -> verify P2P Direct survival across Web & CLI!
       await harness.call("stopCenterServer");
 
-      await expect(pageAlice.getByTestId("connection-badge")).toContainText(
-        "P2P Direct · Center Detached",
+      await expect(pageAlice.getByTestId("connection-badge")).toHaveAttribute(
+        "data-connection-state",
+        "detached",
       );
-      await expect(pageCarol.getByTestId("connection-badge")).toContainText(
-        "P2P Direct · Center Detached",
+      await expect(pageCarol.getByTestId("connection-badge")).toHaveAttribute(
+        "data-connection-state",
+        "detached",
       );
 
       await pageAlice
@@ -478,9 +483,7 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
 
       // Wait briefly and verify Room B has zero peers and never sees Alpha's message
       await pageB.waitForTimeout(800);
-      await expect(pageB.getByTestId("peer-list")).toContainText(
-        "No verified peers connected yet",
-      );
+      await expect(pageB.getByTestId("peer-list-empty")).toBeVisible();
       await expect(pageB.locator(".message-stream")).not.toContainText(
         "Confidential Alpha message",
       );
@@ -492,6 +495,85 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
     } finally {
       await contextA.close();
       await contextB.close();
+    }
+  });
+
+  test("auto-detects browser locale, switches 6 languages and system/dark/light theme live, and stores only non-sensitive preference keys", async ({
+    browser,
+  }) => {
+    const cluster = await harness.call<{
+      webOrigin: string;
+      apiUrl: string;
+      sqlitePath: string;
+    }>("startCluster");
+
+    const context = await browser.newContext({
+      locale: "zh-CN",
+      colorScheme: "light",
+    });
+    const page = await context.newPage();
+
+    try {
+      await page.goto(cluster.webOrigin);
+
+      // 1. Auto-detected zh-CN language and system light color-scheme without writing localStorage
+      await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+      await expect(page.locator("#auth-heading")).toHaveText("登录账号");
+
+      const initialKeys = await page.evaluate(() =>
+        Object.keys(window.localStorage),
+      );
+      expect(initialKeys).toEqual([]);
+
+      // 2. One-click theme switch: dark -> light -> system (plus live OS media query reaction)
+      await page.getByTestId("theme-mode-dark").click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+      await page.getByTestId("theme-mode-light").click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+
+      await page.getByTestId("theme-mode-system").click();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+      await page.emulateMedia({ colorScheme: "dark" });
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+      // 3. Live 6-locale switching without reload
+      const localeSelect = page.getByTestId("locale-select");
+
+      await localeSelect.selectOption("ja");
+      await expect(page.locator("html")).toHaveAttribute("lang", "ja");
+      await expect(page.locator("#auth-heading")).toHaveText("ログイン");
+
+      await localeSelect.selectOption("ko");
+      await expect(page.locator("html")).toHaveAttribute("lang", "ko");
+      await expect(page.locator("#auth-heading")).toHaveText("로그인");
+
+      await localeSelect.selectOption("es");
+      await expect(page.locator("html")).toHaveAttribute("lang", "es");
+      await expect(page.locator("#auth-heading")).toHaveText("Iniciar sesión");
+
+      await localeSelect.selectOption("zh-TW");
+      await expect(page.locator("html")).toHaveAttribute("lang", "zh-TW");
+      await expect(page.locator("#auth-heading")).toHaveText("登入帳號");
+
+      await localeSelect.selectOption("en");
+      await expect(page.locator("html")).toHaveAttribute("lang", "en");
+      await expect(page.locator("#auth-heading")).toHaveText("Sign in");
+
+      // 4. Verify localStorage holds exclusively non-sensitive UI preference enums
+      const finalStorage = await page.evaluate(() => ({
+        keys: Object.keys(window.localStorage).sort(),
+        locale: window.localStorage.getItem("simpleim.locale"),
+        theme: window.localStorage.getItem("simpleim.theme"),
+      }));
+      expect(finalStorage).toEqual({
+        keys: ["simpleim.locale", "simpleim.theme"],
+        locale: "en",
+        theme: "system",
+      });
+    } finally {
+      await context.close();
     }
   });
 });
