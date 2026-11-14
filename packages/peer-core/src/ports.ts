@@ -201,6 +201,7 @@ export interface RoomPeerEngine {
   readonly localPeerId: string;
   start(): Promise<void>;
   stop(): Promise<void>;
+  updateLocalCert(cert: PeerIdentityCert): void;
   isCenterConnected(): boolean;
   getVerifiedPeers(): VerifiedPeerInfo[];
   getMessages(): ChatMessageEnvelope[];

@@ -2426,4 +2426,105 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
       await bob.engine.stop();
     }
   });
+
+  test("10. updateLocalCert propagates renewed PeerIdentityCert to ChatSyncManager and MeshSessionManager for >24h sessions", async () => {
+    const ca = createTestServerCA();
+    const hub = new MockSignalingHub();
+    const network = new MockPeerTransportNetwork();
+    const roomKeys = deriveRoomKeys("cert-renewal-room", FAST_KDF);
+
+    let currentNow = 1_763_000_000_000;
+    const aliceKeyPair = generateEd25519KeyPair();
+    const initialAliceCert = issuePeerIdentityCert({
+      serverKeyId: ca.serverKeyId,
+      serverSignPrivKey: ca.keyPair.privateKeyBytes,
+      userId: "usr_alice_renew",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_01alice_renew",
+      peerSignPubKey: aliceKeyPair.publicKeyBase64Url,
+      clientKind: "web",
+      nowMs: currentNow,
+      ttlMs: 3_600_000, // 1 hour initial TTL
+    });
+
+    const aliceEngine = createRoomPeerEngine({
+      localPeerId: "peer_01alice_renew",
+      localCert: initialAliceCert,
+      localSignKeyPair: aliceKeyPair,
+      serverSignPubKey: ca.keyPair.publicKeyBase64Url,
+      roomKeys,
+      iceServers: [],
+      signaling: hub.createClient("peer_01alice_renew"),
+      transportFactory: network.createFactory().factory,
+      chunkStorage: new InMemoryChunkStorage(),
+      now: () => currentNow,
+    });
+
+    await aliceEngine.start();
+
+    // Advance simulated clock past initial 1h TTL (2 hours later) and renew Alice's cert in-place
+    currentNow += 2 * 3_600_000;
+    const renewedAliceCert = issuePeerIdentityCert({
+      serverKeyId: ca.serverKeyId,
+      serverSignPrivKey: ca.keyPair.privateKeyBytes,
+      userId: "usr_alice_renew",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_01alice_renew",
+      peerSignPubKey: aliceKeyPair.publicKeyBase64Url,
+      clientKind: "web",
+      nowMs: currentNow - 1_000,
+      ttlMs: 86_400_000,
+    });
+    aliceEngine.updateLocalCert(renewedAliceCert);
+
+    // Late-joining Bob verifies Alice via HELLO_AUTH at T+2h (would fail with cert_expired if old cert remained!)
+    const bobKeyPair = generateEd25519KeyPair();
+    const bobCert = issuePeerIdentityCert({
+      serverKeyId: ca.serverKeyId,
+      serverSignPrivKey: ca.keyPair.privateKeyBytes,
+      userId: "usr_bob_renew",
+      username: "bob",
+      displayName: "Bob",
+      peerId: "peer_02bob_renew",
+      peerSignPubKey: bobKeyPair.publicKeyBase64Url,
+      clientKind: "cli",
+      nowMs: currentNow - 1_000,
+      ttlMs: 86_400_000,
+    });
+    const bobEngine = createRoomPeerEngine({
+      localPeerId: "peer_02bob_renew",
+      localCert: bobCert,
+      localSignKeyPair: bobKeyPair,
+      serverSignPubKey: ca.keyPair.publicKeyBase64Url,
+      roomKeys,
+      iceServers: [],
+      signaling: hub.createClient("peer_02bob_renew"),
+      transportFactory: network.createFactory().factory,
+      chunkStorage: new InMemoryChunkStorage(),
+      now: () => currentNow,
+    });
+
+    try {
+      await bobEngine.start();
+      await waitFor(
+        () =>
+          aliceEngine.getVerifiedPeers().length === 1 &&
+          bobEngine.getVerifiedPeers().length === 1,
+      );
+
+      const sentAt2h = await aliceEngine.sendChatMessage(
+        "Signed with renewed 24h cert!",
+      );
+      expect(sentAt2h.authorCert.payload.exp).toBe(renewedAliceCert.payload.exp);
+      await waitFor(() => bobEngine.getMessages().length === 1);
+      expect(bobEngine.getMessages()[0]?.body).toBe(
+        "Signed with renewed 24h cert!",
+      );
+    } finally {
+      await aliceEngine.stop();
+      await bobEngine.stop();
+    }
+  });
 });

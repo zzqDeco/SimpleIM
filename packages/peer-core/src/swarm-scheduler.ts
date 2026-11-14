@@ -153,7 +153,7 @@ function chunkTieHash(seed: number, chunkIndex: number): number {
 export class SwarmScheduler {
   private readonly roomId: string;
   private readonly localPeerId: string;
-  private readonly localCert: PeerIdentityCert;
+  private localCert: PeerIdentityCert;
   private readonly localSignKeyPair: Ed25519KeyPair;
   private readonly serverSignPubKey: string;
   private readonly chunkStorage: ChunkStoragePort;
@@ -196,6 +196,10 @@ export class SwarmScheduler {
         this.insertVerifiedManifest(manifest, false);
       }
     }
+  }
+
+  updateLocalCert(nextCert: PeerIdentityCert): void {
+    this.localCert = nextCert;
   }
 
   async shareFile(input: ShareFileInput): Promise<FileManifest> {

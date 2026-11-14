@@ -102,7 +102,10 @@ export function RoomScreen({
   const [railOpen, setRailOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const composer = usePromptComposer({ onSendMessage });
+  const composer = usePromptComposer({
+    roomKey: selectedRoomId,
+    onSendMessage,
+  });
 
   const shareSelectedFiles = useCallback(
     (selected: File[]): void => {

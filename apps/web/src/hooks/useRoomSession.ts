@@ -66,6 +66,7 @@ interface ManagedRoomRecord {
   centerConnected: boolean;
   activeRuntime: ActiveRoomEngineInstance | null;
   startingPromise: Promise<void> | null;
+  disposed: boolean;
 }
 
 interface WorkspaceIdentityBundle {
@@ -99,6 +100,7 @@ async function stopRoomEngineOnly(entry: ManagedRoomRecord): Promise<void> {
 }
 
 async function destroyEntryKeysAndEngine(entry: ManagedRoomRecord): Promise<void> {
+  entry.disposed = true;
   await stopRoomEngineOnly(entry);
   try {
     wipeRoomKeys(entry.roomKeys);
@@ -229,7 +231,48 @@ export function useRoomSession({
     gen: number;
     promise: Promise<WorkspaceIdentityBundle>;
   } | null>(null);
+  const meshOpChainRef = useRef<Promise<void>>(Promise.resolve());
+  const inFlightJoinsRef = useRef<Map<string, Promise<boolean>>>(new Map());
   const activeUserIdRef = useRef<string | null>(null);
+
+  const isEntryLive = useCallback(
+    (
+      expectedGen: number,
+      roomId: string,
+      entry: ManagedRoomRecord,
+    ): boolean =>
+      workspaceGenRef.current === expectedGen &&
+      !entry.disposed &&
+      roomsRef.current.get(roomId) === entry,
+    [],
+  );
+
+  const propagateUpdatedCertToEngines = useCallback(
+    (freshCert: PeerIdentityCert): void => {
+      for (const entry of roomsRef.current.values()) {
+        if (!entry.disposed && entry.activeRuntime) {
+          try {
+            entry.activeRuntime.engine.updateLocalCert(freshCert);
+          } catch {
+            // Ignore stopped/mismatched engine update errors
+          }
+        }
+      }
+    },
+    [],
+  );
+
+  const runSerializedMeshOp = useCallback(
+    <T,>(task: () => Promise<T>): Promise<T> => {
+      const next = meshOpChainRef.current.then(task, task);
+      meshOpChainRef.current = next.then(
+        () => {},
+        () => {},
+      );
+      return next;
+    },
+    [],
+  );
 
   const [hydratedUserId, setHydratedUserId] = useState<string | null>(null);
   const [joinPhase, setJoinPhase] = useState<JoinPhase>("idle");
@@ -298,6 +341,54 @@ export function useRoomSession({
       expectedGen: number,
       currentUser: UserProfile,
     ): Promise<WorkspaceIdentityBundle> => {
+      const scheduleRenewal = (targetBundle: WorkspaceIdentityBundle): void => {
+        if (targetBundle.renewalTimer !== null) {
+          clearTimeout(targetBundle.renewalTimer);
+          targetBundle.renewalTimer = null;
+        }
+        const msUntilRenew = Math.max(
+          60_000,
+          targetBundle.cert.payload.exp - Date.now() - 10 * 60_000,
+        );
+        targetBundle.renewalTimer = setTimeout(() => {
+          if (
+            workspaceGenRef.current !== expectedGen ||
+            identityRef.current !== targetBundle
+          ) {
+            return;
+          }
+          void authClient
+            .issuePeerCert({
+              userId: currentUser.id,
+              peerId: targetBundle.peerId,
+              peerSignKeyPair: targetBundle.signKeyPair,
+            })
+            .then((freshCert) => {
+              if (
+                workspaceGenRef.current !== expectedGen ||
+                identityRef.current !== targetBundle
+              ) {
+                return;
+              }
+              targetBundle.cert = freshCert;
+              propagateUpdatedCertToEngines(freshCert);
+              scheduleRenewal(targetBundle);
+            })
+            .catch(() => {
+              // Retry before actual expiration if transient network error occurs
+              if (
+                workspaceGenRef.current === expectedGen &&
+                identityRef.current === targetBundle
+              ) {
+                targetBundle.renewalTimer = setTimeout(
+                  () => scheduleRenewal(targetBundle),
+                  60_000,
+                );
+              }
+            });
+        }, msUntilRenew);
+      };
+
       const existing = identityRef.current;
       if (
         existing &&
@@ -314,7 +405,36 @@ export function useRoomSession({
         return identityPromiseRef.current.promise;
       }
 
-      const promise = (async (): Promise<WorkspaceIdentityBundle> => {
+      // If the same user's identity bundle is near/past expiry (e.g. after sleep),
+      // renew its certificate in-place so running engines and signalingHub stay intact.
+      if (existing && existing.userId === currentUser.id) {
+        const renewTask = (async (): Promise<WorkspaceIdentityBundle> => {
+          const freshCert = await authClient.issuePeerCert({
+            userId: currentUser.id,
+            peerId: existing.peerId,
+            peerSignKeyPair: existing.signKeyPair,
+          });
+          if (
+            workspaceGenRef.current !== expectedGen ||
+            identityRef.current !== existing
+          ) {
+            throw new Error("Workspace session superseded");
+          }
+          existing.cert = freshCert;
+          propagateUpdatedCertToEngines(freshCert);
+          scheduleRenewal(existing);
+          return existing;
+        })();
+        const renewPromise = renewTask.finally(() => {
+          if (identityPromiseRef.current?.promise === renewPromise) {
+            identityPromiseRef.current = null;
+          }
+        });
+        identityPromiseRef.current = { gen: expectedGen, promise: renewPromise };
+        return renewPromise;
+      }
+
+      const initTask = (async (): Promise<WorkspaceIdentityBundle> => {
         const peerId = generatePrefixedId("peer");
         const signKeyPair = generateEd25519KeyPair();
 
@@ -352,66 +472,24 @@ export function useRoomSession({
             renewalTimer: null,
           };
 
-          const scheduleRenewal = (targetBundle: WorkspaceIdentityBundle) => {
-            const msUntilRenew = Math.max(
-              60_000,
-              targetBundle.cert.payload.exp - Date.now() - 10 * 60_000,
-            );
-            targetBundle.renewalTimer = setTimeout(() => {
-              if (
-                workspaceGenRef.current !== expectedGen ||
-                identityRef.current !== targetBundle
-              ) {
-                return;
-              }
-              void authClient
-                .issuePeerCert({
-                  userId: currentUser.id,
-                  peerId: targetBundle.peerId,
-                  peerSignKeyPair: targetBundle.signKeyPair,
-                })
-                .then((freshCert) => {
-                  if (
-                    workspaceGenRef.current !== expectedGen ||
-                    identityRef.current !== targetBundle
-                  ) {
-                    return;
-                  }
-                  targetBundle.cert = freshCert;
-                  scheduleRenewal(targetBundle);
-                })
-                .catch(() => {
-                  // Retry before actual expiration if transient network error occurs
-                  if (
-                    workspaceGenRef.current === expectedGen &&
-                    identityRef.current === targetBundle
-                  ) {
-                    targetBundle.renewalTimer = setTimeout(
-                      () => scheduleRenewal(targetBundle),
-                      60_000,
-                    );
-                  }
-                });
-            }, msUntilRenew);
-          };
-
           scheduleRenewal(bundle);
           identityRef.current = bundle;
           return bundle;
         } catch (err) {
           signKeyPair.privateKeyBytes.fill(0);
           throw err;
-        } finally {
-          if (identityPromiseRef.current?.gen === expectedGen) {
-            identityPromiseRef.current = null;
-          }
         }
       })();
+      const promise = initTask.finally(() => {
+        if (identityPromiseRef.current?.promise === promise) {
+          identityPromiseRef.current = null;
+        }
+      });
 
       identityPromiseRef.current = { gen: expectedGen, promise };
       return promise;
     },
-    [authClient],
+    [authClient, propagateUpdatedCertToEngines],
   );
 
   const startEngineForEntry = useCallback(
@@ -421,7 +499,7 @@ export function useRoomSession({
       entry: ManagedRoomRecord,
       identity: WorkspaceIdentityBundle,
     ): Promise<void> => {
-      if (entry.activeRuntime) return;
+      if (entry.disposed || entry.activeRuntime) return;
       if (entry.startingPromise) {
         await entry.startingPromise;
         return;
@@ -429,6 +507,9 @@ export function useRoomSession({
 
       const startTask = (async (): Promise<void> => {
         const roomId = entry.metadata.roomId;
+        if (!isEntryLive(expectedGen, roomId, entry)) {
+          return;
+        }
         const signalingPort = identity.signalingHub.createRoomPort(roomId);
         const transportFactory = new BrowserWebRtcTransportFactory();
         const chunkStorage = new OpfsChunkStorageAdapter();
@@ -450,30 +531,21 @@ export function useRoomSession({
             chunkStorage,
             events: {
               onCenterConnectionChange: (connected) => {
-                if (
-                  workspaceGenRef.current !== expectedGen ||
-                  roomsRef.current.get(roomId) !== entry
-                ) {
+                if (!isEntryLive(expectedGen, roomId, entry)) {
                   return;
                 }
                 entry.centerConnected = connected;
                 publishSnapshot(currentUser.id);
               },
               onPeersChange: (nextPeers) => {
-                if (
-                  workspaceGenRef.current !== expectedGen ||
-                  roomsRef.current.get(roomId) !== entry
-                ) {
+                if (!isEntryLive(expectedGen, roomId, entry)) {
                   return;
                 }
                 entry.peers = [...nextPeers];
                 publishSnapshot(currentUser.id);
               },
               onPeerAuthRejected: (_remotePeerId, reason) => {
-                if (
-                  workspaceGenRef.current !== expectedGen ||
-                  roomsRef.current.get(roomId) !== entry
-                ) {
+                if (!isEntryLive(expectedGen, roomId, entry)) {
                   return;
                 }
                 if (selectedRoomIdRef.current === roomId) {
@@ -481,11 +553,7 @@ export function useRoomSession({
                 }
               },
               onChatMessage: (msg) => {
-                if (
-                  workspaceGenRef.current !== expectedGen ||
-                  roomsRef.current.get(roomId) !== entry ||
-                  !activeEngine
-                ) {
+                if (!isEntryLive(expectedGen, roomId, entry) || !activeEngine) {
                   return;
                 }
                 entry.messages = mergeOrderedMessages(entry.messages, [
@@ -508,24 +576,16 @@ export function useRoomSession({
                       )
                     : entry.metadata.lastReadAt,
                 };
-                void vault.saveRoomMessages(
-                  currentUser.id,
-                  roomId,
-                  entry.messages,
-                );
-                void vault.saveRoom(
-                  currentUser.id,
-                  entry.metadata,
-                  entry.roomKeys,
-                );
+                void vault
+                  .saveRoomMessages(currentUser.id, roomId, entry.messages)
+                  .catch(() => {});
+                void vault
+                  .saveRoom(currentUser.id, entry.metadata, entry.roomKeys)
+                  .catch(() => {});
                 publishSnapshot(currentUser.id);
               },
               onFileAnnounced: (manifest) => {
-                if (
-                  workspaceGenRef.current !== expectedGen ||
-                  roomsRef.current.get(roomId) !== entry ||
-                  !activeEngine
-                ) {
+                if (!isEntryLive(expectedGen, roomId, entry) || !activeEngine) {
                   return;
                 }
                 entry.files = mergeOrderedFiles(entry.files, [
@@ -536,25 +596,20 @@ export function useRoomSession({
                 if (prog) {
                   entry.transfers.set(manifest.fileId, { ...prog });
                 }
-                void vault.saveRoomFiles(currentUser.id, roomId, entry.files);
+                void vault
+                  .saveRoomFiles(currentUser.id, roomId, entry.files)
+                  .catch(() => {});
                 publishSnapshot(currentUser.id);
               },
               onTransferProgress: (progress) => {
-                if (
-                  workspaceGenRef.current !== expectedGen ||
-                  roomsRef.current.get(roomId) !== entry
-                ) {
+                if (!isEntryLive(expectedGen, roomId, entry)) {
                   return;
                 }
                 entry.transfers.set(progress.fileId, { ...progress });
                 publishSnapshot(currentUser.id);
               },
               onTransferCompleted: (manifest) => {
-                if (
-                  workspaceGenRef.current !== expectedGen ||
-                  roomsRef.current.get(roomId) !== entry ||
-                  !activeEngine
-                ) {
+                if (!isEntryLive(expectedGen, roomId, entry) || !activeEngine) {
                   return;
                 }
                 const prog = activeEngine.getTransferProgress(manifest.fileId);
@@ -578,10 +633,7 @@ export function useRoomSession({
                 publishSnapshot(currentUser.id);
               },
               onError: (err) => {
-                if (
-                  workspaceGenRef.current !== expectedGen ||
-                  roomsRef.current.get(roomId) !== entry
-                ) {
+                if (!isEntryLive(expectedGen, roomId, entry)) {
                   return;
                 }
                 if (selectedRoomIdRef.current === roomId) {
@@ -604,7 +656,7 @@ export function useRoomSession({
           await activeEngine.start();
 
           if (
-            workspaceGenRef.current !== expectedGen ||
+            !isEntryLive(expectedGen, roomId, entry) ||
             entry.activeRuntime !== runtimeInstance
           ) {
             if (entry.activeRuntime === runtimeInstance) {
@@ -615,13 +667,27 @@ export function useRoomSession({
             return;
           }
 
+          const verifiedMessages = activeEngine.getMessages();
+          const verifiedFiles = activeEngine.getFiles();
+          const droppedInvalidMsgs =
+            verifiedMessages.length < entry.messages.length;
+          const droppedInvalidFiles = verifiedFiles.length < entry.files.length;
+
           entry.centerConnected = activeEngine.isCenterConnected();
           entry.peers = activeEngine.getVerifiedPeers();
-          entry.messages = mergeOrderedMessages(
-            entry.messages,
-            activeEngine.getMessages(),
-          );
-          entry.files = mergeOrderedFiles(entry.files, activeEngine.getFiles());
+          entry.messages = verifiedMessages;
+          entry.files = verifiedFiles;
+
+          if (droppedInvalidMsgs && isEntryLive(expectedGen, roomId, entry)) {
+            void vault
+              .saveRoomMessages(currentUser.id, roomId, entry.messages)
+              .catch(() => {});
+          }
+          if (droppedInvalidFiles && isEntryLive(expectedGen, roomId, entry)) {
+            void vault
+              .saveRoomFiles(currentUser.id, roomId, entry.files)
+              .catch(() => {});
+          }
           publishSnapshot(currentUser.id);
         } catch (err) {
           if (entry.activeRuntime?.engine === activeEngine) {
@@ -647,75 +713,91 @@ export function useRoomSession({
 
       await entry.startingPromise;
     },
-    [publishSnapshot, vault],
+    [isEntryLive, publishSnapshot, vault],
   );
 
   const rebalanceActiveMeshes = useCallback(
-    async (expectedGen: number, currentUser: UserProfile): Promise<void> => {
-      if (
-        workspaceGenRef.current !== expectedGen ||
-        roomsRef.current.size === 0
-      ) {
-        return;
-      }
-
-      const identity = await ensureIdentityBundle(expectedGen, currentUser);
-      if (workspaceGenRef.current !== expectedGen) return;
-
-      const sortedEntries = Array.from(roomsRef.current.values()).sort((a, b) =>
-        compareRoomOrder(a.metadata, b.metadata),
-      );
-      const maxActive = Math.min(
-        MAX_ACTIVE_MESH_ROOMS,
-        identity.meta.limits.maxRoomsPerConnection,
-      );
-      const desiredActiveIds = selectActiveMeshRoomIds(
-        sortedEntries.map((e) => e.metadata.roomId),
-        selectedRoomIdRef.current,
-        maxActive,
-      );
-
-      // 1. Demote standby rooms first so server per-WS room cap is never exceeded
-      for (const entry of sortedEntries) {
+    (expectedGen: number, currentUser: UserProfile): Promise<void> =>
+      runSerializedMeshOp(async () => {
         if (
-          !desiredActiveIds.has(entry.metadata.roomId) &&
-          (entry.activeRuntime !== null || entry.startingPromise !== null)
+          workspaceGenRef.current !== expectedGen ||
+          roomsRef.current.size === 0
         ) {
-          await stopRoomEngineOnly(entry);
+          return;
         }
-      }
-      if (workspaceGenRef.current !== expectedGen) return;
 
-      // 2. Promote active rooms concurrently (selected room first)
-      const entriesToStart = sortedEntries.filter(
-        (e) =>
-          desiredActiveIds.has(e.metadata.roomId) &&
-          e.activeRuntime === null &&
-          e.startingPromise === null,
-      );
-      entriesToStart.sort((a, b) => {
-        if (a.metadata.roomId === selectedRoomIdRef.current) return -1;
-        if (b.metadata.roomId === selectedRoomIdRef.current) return 1;
-        return 0;
-      });
+        const identity = await ensureIdentityBundle(expectedGen, currentUser);
+        if (
+          workspaceGenRef.current !== expectedGen ||
+          roomsRef.current.size === 0
+        ) {
+          return;
+        }
 
-      await Promise.allSettled(
-        entriesToStart.map((entry) =>
-          startEngineForEntry(expectedGen, currentUser, entry, identity),
-        ),
-      );
-      if (workspaceGenRef.current === expectedGen) {
-        publishSnapshot(currentUser.id);
-      }
-    },
-    [ensureIdentityBundle, publishSnapshot, startEngineForEntry],
+        const sortedEntries = Array.from(roomsRef.current.values())
+          .filter((e) => !e.disposed)
+          .sort((a, b) => compareRoomOrder(a.metadata, b.metadata));
+        const maxActive = Math.min(
+          MAX_ACTIVE_MESH_ROOMS,
+          identity.meta.limits.maxRoomsPerConnection,
+        );
+        const desiredActiveIds = selectActiveMeshRoomIds(
+          sortedEntries.map((e) => e.metadata.roomId),
+          selectedRoomIdRef.current,
+          maxActive,
+        );
+
+        // 1. Demote standby rooms first so server per-WS room cap is never exceeded
+        for (const entry of sortedEntries) {
+          if (
+            !desiredActiveIds.has(entry.metadata.roomId) &&
+            (entry.activeRuntime !== null || entry.startingPromise !== null)
+          ) {
+            await stopRoomEngineOnly(entry);
+          }
+        }
+        if (workspaceGenRef.current !== expectedGen) return;
+
+        // 2. Promote active rooms concurrently (selected room first)
+        const entriesToStart = sortedEntries.filter(
+          (e) =>
+            !e.disposed &&
+            desiredActiveIds.has(e.metadata.roomId) &&
+            e.activeRuntime === null &&
+            e.startingPromise === null,
+        );
+        entriesToStart.sort((a, b) => {
+          if (a.metadata.roomId === selectedRoomIdRef.current) return -1;
+          if (b.metadata.roomId === selectedRoomIdRef.current) return 1;
+          return 0;
+        });
+
+        await Promise.allSettled(
+          entriesToStart.map((entry) =>
+            startEngineForEntry(expectedGen, currentUser, entry, identity),
+          ),
+        );
+        if (workspaceGenRef.current === expectedGen) {
+          publishSnapshot(currentUser.id);
+        }
+      }),
+    [
+      ensureIdentityBundle,
+      publishSnapshot,
+      runSerializedMeshOp,
+      startEngineForEntry,
+    ],
   );
 
   const disconnectAllPreservingVault = useCallback(async (): Promise<void> => {
     workspaceGenRef.current += 1;
     identityPromiseRef.current = null;
+    inFlightJoinsRef.current.clear();
 
     const entries = Array.from(roomsRef.current.values());
+    for (const entry of entries) {
+      entry.disposed = true;
+    }
     roomsRef.current.clear();
     selectedRoomIdRef.current = null;
 
@@ -777,6 +859,7 @@ export function useRoomSession({
             centerConnected: false,
             activeRuntime: null,
             startingPromise: null,
+            disposed: false,
           });
         }
 
@@ -787,13 +870,15 @@ export function useRoomSession({
           const topRoomId = sorted[0]!.metadata.roomId;
           selectedRoomIdRef.current = topRoomId;
           const topEntry = roomsRef.current.get(topRoomId);
-          if (topEntry) {
+          if (topEntry && isEntryLive(myGen, topRoomId, topEntry)) {
             const readNow = Date.now();
             topEntry.metadata = {
               ...topEntry.metadata,
               lastReadAt: Math.max(topEntry.metadata.lastReadAt, readNow),
             };
-            void vault.saveRoom(user.id, topEntry.metadata, topEntry.roomKeys);
+            void vault
+              .saveRoom(user.id, topEntry.metadata, topEntry.roomKeys)
+              .catch(() => {});
           }
         } else {
           selectedRoomIdRef.current = null;
@@ -827,6 +912,7 @@ export function useRoomSession({
     };
   }, [
     disconnectAllPreservingVault,
+    isEntryLive,
     onSessionExpired,
     publishSnapshot,
     rebalanceActiveMeshes,
@@ -854,7 +940,6 @@ export function useRoomSession({
       setJoinPhase("deriving");
 
       let derivedKeys: DerivedRoomKeys | null = null;
-      let createdEntry: ManagedRoomRecord | null = null;
 
       try {
         derivedKeys = await deriveRoomKeysOffThread(passphrase);
@@ -862,140 +947,252 @@ export function useRoomSession({
           wipeRoomKeys(derivedKeys);
           return false;
         }
-
-        const existing = roomsRef.current.get(derivedKeys.roomId);
-        if (existing) {
-          wipeRoomKeys(derivedKeys);
-          derivedKeys = null;
-
-          const nowMs = Date.now();
-          const nextAlias =
-            alias !== undefined && sanitizeRoomAlias(alias) !== null
-              ? sanitizeRoomAlias(alias)
-              : existing.metadata.alias;
-          existing.metadata = {
-            ...existing.metadata,
-            alias: nextAlias,
-            lastActiveAt: nowMs,
-            lastReadAt: nowMs,
-          };
-          selectedRoomIdRef.current = existing.metadata.roomId;
-          setSecurityEvent(null);
-
-          await vault.saveRoom(user.id, existing.metadata, existing.roomKeys);
-          if (workspaceGenRef.current !== myGen) return false;
-
-          setJoinPhase("connecting");
-          await rebalanceActiveMeshes(myGen, user);
-          if (workspaceGenRef.current !== myGen) return false;
-
-          setJoinPhase("idle");
-          publishSnapshot(user.id);
-          return true;
-        }
-
-        setJoinPhase("connecting");
-        const identity = await ensureIdentityBundle(myGen, user);
-        if (workspaceGenRef.current !== myGen) {
-          wipeRoomKeys(derivedKeys);
-          return false;
-        }
-
-        // If we are already at the per-connection cap, demote 1 standby candidate before joining the new room
-        const maxActive = Math.min(
-          MAX_ACTIVE_MESH_ROOMS,
-          identity.meta.limits.maxRoomsPerConnection,
-        );
-        const currentlyActive = Array.from(roomsRef.current.values())
-          .filter((e) => e.activeRuntime !== null || e.startingPromise !== null)
-          .sort((a, b) => compareRoomOrder(a.metadata, b.metadata));
-        while (currentlyActive.length >= maxActive && maxActive > 0) {
-          const victim = currentlyActive.pop();
-          if (victim) {
-            await stopRoomEngineOnly(victim);
-          }
-        }
-        if (workspaceGenRef.current !== myGen) {
-          wipeRoomKeys(derivedKeys);
-          return false;
-        }
-
-        const nowMs = Date.now();
-        const metadata: VaultRoomMetadata = {
-          roomId: derivedKeys.roomId,
-          roomIdPrefix: derivedKeys.roomIdPrefix,
-          alias: sanitizeRoomAlias(alias),
-          pinned: false,
-          joinedAt: nowMs,
-          lastActiveAt: nowMs,
-          lastReadAt: nowMs,
-        };
-
-        createdEntry = {
-          metadata,
-          roomKeys: derivedKeys,
-          messages: [],
-          files: [],
-          transfers: new Map(),
-          peers: [],
-          centerConnected: false,
-          activeRuntime: null,
-          startingPromise: null,
-        };
-
-        roomsRef.current.set(metadata.roomId, createdEntry);
-        const prevSelectedId = selectedRoomIdRef.current;
-        selectedRoomIdRef.current = metadata.roomId;
-
-        try {
-          await startEngineForEntry(myGen, user, createdEntry, identity);
-        } catch (startErr) {
-          roomsRef.current.delete(metadata.roomId);
-          selectedRoomIdRef.current = prevSelectedId;
-          throw startErr;
-        }
-
-        if (workspaceGenRef.current !== myGen) {
-          roomsRef.current.delete(metadata.roomId);
-          await destroyEntryKeysAndEngine(createdEntry);
-          return false;
-        }
-
-        await vault.saveRoom(user.id, createdEntry.metadata, createdEntry.roomKeys);
-        if (workspaceGenRef.current !== myGen) return false;
-
-        setSecurityEvent(null);
-        setJoinPhase("idle");
-        publishSnapshot(user.id);
-        return true;
       } catch (err) {
-        if (createdEntry) {
-          roomsRef.current.delete(createdEntry.metadata.roomId);
-          await destroyEntryKeysAndEngine(createdEntry);
-        } else if (derivedKeys) {
+        if (derivedKeys) {
           wipeRoomKeys(derivedKeys);
         }
-
         if (workspaceGenRef.current === myGen) {
           setJoinPhase("idle");
-          publishSnapshot(user.id);
-          if (
-            err instanceof HttpApiError &&
-            (err.status === 401 || err.code === "csrf_invalid")
-          ) {
-            onSessionExpired();
-          } else {
-            setJoinFailure(toAppFailure(err));
-          }
+          setJoinFailure(toAppFailure(err));
         }
         return false;
       }
+
+      const targetRoomId = derivedKeys.roomId;
+      const joinDedupKey = `${myGen}:${targetRoomId}`;
+      const existingJoin = inFlightJoinsRef.current.get(joinDedupKey);
+      if (existingJoin) {
+        wipeRoomKeys(derivedKeys);
+        return existingJoin;
+      }
+
+      const keysToOwn = derivedKeys;
+      const joinTask = (async (): Promise<boolean> => {
+        let ownedKeys: DerivedRoomKeys | null = keysToOwn;
+        let createdEntry: ManagedRoomRecord | null = null;
+
+        try {
+          return await runSerializedMeshOp(async (): Promise<boolean> => {
+            if (workspaceGenRef.current !== myGen) {
+              if (ownedKeys) {
+                wipeRoomKeys(ownedKeys);
+                ownedKeys = null;
+              }
+              return false;
+            }
+
+            const existing = roomsRef.current.get(targetRoomId);
+            if (existing && !existing.disposed) {
+              if (ownedKeys) {
+                wipeRoomKeys(ownedKeys);
+                ownedKeys = null;
+              }
+
+              const nowMs = Date.now();
+              const nextAlias =
+                alias !== undefined && sanitizeRoomAlias(alias) !== null
+                  ? sanitizeRoomAlias(alias)
+                  : existing.metadata.alias;
+              existing.metadata = {
+                ...existing.metadata,
+                alias: nextAlias,
+                lastActiveAt: nowMs,
+                lastReadAt: nowMs,
+              };
+              selectedRoomIdRef.current = existing.metadata.roomId;
+              setSecurityEvent(null);
+
+              if (!isEntryLive(myGen, existing.metadata.roomId, existing)) {
+                return false;
+              }
+              await vault.saveRoom(
+                user.id,
+                existing.metadata,
+                existing.roomKeys,
+              );
+              if (!isEntryLive(myGen, existing.metadata.roomId, existing)) {
+                return false;
+              }
+
+              setJoinPhase("connecting");
+              const identity = await ensureIdentityBundle(myGen, user);
+              if (!isEntryLive(myGen, existing.metadata.roomId, existing)) {
+                return false;
+              }
+
+              if (!existing.activeRuntime && !existing.startingPromise) {
+                const maxActive = Math.min(
+                  MAX_ACTIVE_MESH_ROOMS,
+                  identity.meta.limits.maxRoomsPerConnection,
+                );
+                const currentlyActive = Array.from(roomsRef.current.values())
+                  .filter(
+                    (e) =>
+                      !e.disposed &&
+                      e !== existing &&
+                      (e.activeRuntime !== null || e.startingPromise !== null),
+                  )
+                  .sort((a, b) => compareRoomOrder(a.metadata, b.metadata));
+                while (currentlyActive.length >= maxActive && maxActive > 0) {
+                  const victim = currentlyActive.pop();
+                  if (victim) {
+                    await stopRoomEngineOnly(victim);
+                  }
+                }
+                if (!isEntryLive(myGen, existing.metadata.roomId, existing)) {
+                  return false;
+                }
+                await startEngineForEntry(myGen, user, existing, identity);
+              }
+
+              if (workspaceGenRef.current !== myGen) return false;
+              setJoinPhase("idle");
+              publishSnapshot(user.id);
+              return true;
+            }
+
+            setJoinPhase("connecting");
+            const identity = await ensureIdentityBundle(myGen, user);
+            if (workspaceGenRef.current !== myGen) {
+              if (ownedKeys) {
+                wipeRoomKeys(ownedKeys);
+                ownedKeys = null;
+              }
+              return false;
+            }
+
+            // Demote standby victims inside the serialized mesh op so per-WS cap is strictly respected
+            const maxActive = Math.min(
+              MAX_ACTIVE_MESH_ROOMS,
+              identity.meta.limits.maxRoomsPerConnection,
+            );
+            const currentlyActive = Array.from(roomsRef.current.values())
+              .filter(
+                (e) =>
+                  !e.disposed &&
+                  (e.activeRuntime !== null || e.startingPromise !== null),
+              )
+              .sort((a, b) => compareRoomOrder(a.metadata, b.metadata));
+            while (currentlyActive.length >= maxActive && maxActive > 0) {
+              const victim = currentlyActive.pop();
+              if (victim) {
+                await stopRoomEngineOnly(victim);
+              }
+            }
+            if (workspaceGenRef.current !== myGen || !ownedKeys) {
+              if (ownedKeys) {
+                wipeRoomKeys(ownedKeys);
+                ownedKeys = null;
+              }
+              return false;
+            }
+
+            const nowMs = Date.now();
+            const metadata: VaultRoomMetadata = {
+              roomId: ownedKeys.roomId,
+              roomIdPrefix: ownedKeys.roomIdPrefix,
+              alias: sanitizeRoomAlias(alias),
+              pinned: false,
+              joinedAt: nowMs,
+              lastActiveAt: nowMs,
+              lastReadAt: nowMs,
+            };
+
+            createdEntry = {
+              metadata,
+              roomKeys: ownedKeys,
+              messages: [],
+              files: [],
+              transfers: new Map(),
+              peers: [],
+              centerConnected: false,
+              activeRuntime: null,
+              startingPromise: null,
+              disposed: false,
+            };
+            ownedKeys = null;
+
+            roomsRef.current.set(metadata.roomId, createdEntry);
+            const prevSelectedId = selectedRoomIdRef.current;
+            selectedRoomIdRef.current = metadata.roomId;
+
+            try {
+              await startEngineForEntry(myGen, user, createdEntry, identity);
+            } catch (startErr) {
+              if (roomsRef.current.get(metadata.roomId) === createdEntry) {
+                roomsRef.current.delete(metadata.roomId);
+              }
+              if (selectedRoomIdRef.current === metadata.roomId) {
+                selectedRoomIdRef.current = prevSelectedId;
+              }
+              throw startErr;
+            }
+
+            if (!isEntryLive(myGen, metadata.roomId, createdEntry)) {
+              if (roomsRef.current.get(metadata.roomId) === createdEntry) {
+                roomsRef.current.delete(metadata.roomId);
+              }
+              await destroyEntryKeysAndEngine(createdEntry);
+              return false;
+            }
+
+            await vault.saveRoom(
+              user.id,
+              createdEntry.metadata,
+              createdEntry.roomKeys,
+            );
+            if (!isEntryLive(myGen, metadata.roomId, createdEntry)) {
+              return false;
+            }
+
+            setSecurityEvent(null);
+            setJoinPhase("idle");
+            publishSnapshot(user.id);
+            return true;
+          });
+        } catch (err) {
+          const failedEntry = createdEntry as ManagedRoomRecord | null;
+          if (failedEntry) {
+            if (
+              roomsRef.current.get(failedEntry.metadata.roomId) === failedEntry
+            ) {
+              roomsRef.current.delete(failedEntry.metadata.roomId);
+            }
+            await destroyEntryKeysAndEngine(failedEntry);
+          } else if (ownedKeys) {
+            wipeRoomKeys(ownedKeys);
+          }
+
+          if (workspaceGenRef.current === myGen) {
+            setJoinPhase("idle");
+            publishSnapshot(user.id);
+            if (
+              err instanceof HttpApiError &&
+              (err.status === 401 || err.code === "csrf_invalid")
+            ) {
+              onSessionExpired();
+            } else {
+              setJoinFailure(toAppFailure(err));
+            }
+          }
+          return false;
+        }
+      })();
+      const trackedJoinTask = joinTask.finally(() => {
+        if (inFlightJoinsRef.current.get(joinDedupKey) === trackedJoinTask) {
+          inFlightJoinsRef.current.delete(joinDedupKey);
+        }
+      });
+
+      inFlightJoinsRef.current.set(joinDedupKey, trackedJoinTask);
+      return trackedJoinTask;
     },
     [
       ensureIdentityBundle,
+      isEntryLive,
       onSessionExpired,
       publishSnapshot,
-      rebalanceActiveMeshes,
+      runSerializedMeshOp,
       startEngineForEntry,
       user,
       vault,
@@ -1007,7 +1204,7 @@ export function useRoomSession({
       if (!user) return;
       const myGen = workspaceGenRef.current;
       const entry = roomsRef.current.get(roomId);
-      if (!entry) return;
+      if (!entry || !isEntryLive(myGen, roomId, entry)) return;
 
       selectedRoomIdRef.current = roomId;
       setSecurityEvent(null);
@@ -1026,7 +1223,11 @@ export function useRoomSession({
           ...entry.metadata,
           lastReadAt: nextReadAt,
         };
-        void vault.saveRoom(user.id, entry.metadata, entry.roomKeys);
+        if (isEntryLive(myGen, roomId, entry)) {
+          void vault
+            .saveRoom(user.id, entry.metadata, entry.roomKeys)
+            .catch(() => {});
+        }
       }
 
       publishSnapshot(user.id);
@@ -1048,23 +1249,33 @@ export function useRoomSession({
         });
       }
     },
-    [onSessionExpired, publishSnapshot, rebalanceActiveMeshes, user, vault],
+    [
+      isEntryLive,
+      onSessionExpired,
+      publishSnapshot,
+      rebalanceActiveMeshes,
+      user,
+      vault,
+    ],
   );
 
   const renameRoomAlias = useCallback(
     async (roomId: string, alias: string | null): Promise<void> => {
       if (!user) return;
+      const myGen = workspaceGenRef.current;
       const entry = roomsRef.current.get(roomId);
-      if (!entry) return;
+      if (!entry || !isEntryLive(myGen, roomId, entry)) return;
 
       entry.metadata = {
         ...entry.metadata,
         alias: sanitizeRoomAlias(alias),
       };
       publishSnapshot(user.id);
-      await vault.saveRoom(user.id, entry.metadata, entry.roomKeys);
+      if (isEntryLive(myGen, roomId, entry)) {
+        await vault.saveRoom(user.id, entry.metadata, entry.roomKeys);
+      }
     },
-    [publishSnapshot, user, vault],
+    [isEntryLive, publishSnapshot, user, vault],
   );
 
   const togglePinRoom = useCallback(
@@ -1072,17 +1283,21 @@ export function useRoomSession({
       if (!user) return;
       const myGen = workspaceGenRef.current;
       const entry = roomsRef.current.get(roomId);
-      if (!entry) return;
+      if (!entry || !isEntryLive(myGen, roomId, entry)) return;
 
       entry.metadata = {
         ...entry.metadata,
         pinned: !entry.metadata.pinned,
       };
       publishSnapshot(user.id);
-      await vault.saveRoom(user.id, entry.metadata, entry.roomKeys);
-      await rebalanceActiveMeshes(myGen, user).catch(() => {});
+      if (isEntryLive(myGen, roomId, entry)) {
+        await vault.saveRoom(user.id, entry.metadata, entry.roomKeys);
+      }
+      if (workspaceGenRef.current === myGen) {
+        await rebalanceActiveMeshes(myGen, user).catch(() => {});
+      }
     },
-    [publishSnapshot, rebalanceActiveMeshes, user, vault],
+    [isEntryLive, publishSnapshot, rebalanceActiveMeshes, user, vault],
   );
 
   const leaveRoom = useCallback(
@@ -1092,12 +1307,15 @@ export function useRoomSession({
 
       const myGen = workspaceGenRef.current;
       const entry = roomsRef.current.get(targetRoomId);
+      if (entry) {
+        entry.disposed = true;
+      }
       roomsRef.current.delete(targetRoomId);
 
       if (selectedRoomIdRef.current === targetRoomId) {
-        const remaining = Array.from(roomsRef.current.values()).sort((a, b) =>
-          compareRoomOrder(a.metadata, b.metadata),
-        );
+        const remaining = Array.from(roomsRef.current.values())
+          .filter((e) => !e.disposed)
+          .sort((a, b) => compareRoomOrder(a.metadata, b.metadata));
         selectedRoomIdRef.current = remaining[0]?.metadata.roomId ?? null;
         setSecurityEvent(null);
       }
@@ -1119,14 +1337,20 @@ export function useRoomSession({
 
   const sendMessage = useCallback(
     async (body: string, replyToMsgId: string | null): Promise<void> => {
+      const myGen = workspaceGenRef.current;
       const selId = selectedRoomIdRef.current;
       const entry = selId ? roomsRef.current.get(selId) : undefined;
       const rt = entry?.activeRuntime;
-      if (!user || !entry || !rt) {
+      if (!user || !entry || !rt || !isEntryLive(myGen, entry.metadata.roomId, entry)) {
         throw new Error("Room session is not active");
       }
 
+      const roomId = entry.metadata.roomId;
       const sent = await rt.engine.sendChatMessage(body, replyToMsgId);
+      if (!isEntryLive(myGen, roomId, entry)) {
+        return;
+      }
+
       entry.messages = mergeOrderedMessages(entry.messages, [
         ...rt.engine.getMessages(),
         sent,
@@ -1139,30 +1363,41 @@ export function useRoomSession({
       };
       publishSnapshot(user.id);
 
+      if (!isEntryLive(myGen, roomId, entry)) {
+        return;
+      }
       await Promise.all([
-        vault.saveRoomMessages(user.id, entry.metadata.roomId, entry.messages),
+        vault.saveRoomMessages(user.id, roomId, entry.messages),
         vault.saveRoom(user.id, entry.metadata, entry.roomKeys),
       ]);
     },
-    [publishSnapshot, user, vault],
+    [isEntryLive, publishSnapshot, user, vault],
   );
 
   const shareFiles = useCallback(
     async (selectedFiles: File[]): Promise<void> => {
+      const myGen = workspaceGenRef.current;
       const selId = selectedRoomIdRef.current;
       const entry = selId ? roomsRef.current.get(selId) : undefined;
       const rt = entry?.activeRuntime;
-      if (!user || !entry || !rt) {
+      if (!user || !entry || !rt || !isEntryLive(myGen, entry.metadata.roomId, entry)) {
         throw new Error("Room session is not active");
       }
 
+      const roomId = entry.metadata.roomId;
       for (const file of selectedFiles) {
+        if (!isEntryLive(myGen, roomId, entry) || entry.activeRuntime !== rt) {
+          return;
+        }
         const manifest = await rt.engine.shareFile({
           fileName: file.name,
           fileSize: file.size,
           mimeType: file.type || "application/octet-stream",
           readChunk: createBrowserFileChunkReader(file),
         });
+        if (!isEntryLive(myGen, roomId, entry)) {
+          return;
+        }
         rt.chunkStorage.attachLocalSourceBlob(manifest.fileId, file);
         entry.files = mergeOrderedFiles(entry.files, [
           ...rt.engine.getFiles(),
@@ -1192,13 +1427,16 @@ export function useRoomSession({
         };
         publishSnapshot(user.id);
 
+        if (!isEntryLive(myGen, roomId, entry)) {
+          return;
+        }
         await Promise.all([
-          vault.saveRoomFiles(user.id, entry.metadata.roomId, entry.files),
+          vault.saveRoomFiles(user.id, roomId, entry.files),
           vault.saveRoom(user.id, entry.metadata, entry.roomKeys),
         ]);
       }
     },
-    [publishSnapshot, user, vault],
+    [isEntryLive, publishSnapshot, user, vault],
   );
 
   const downloadFile = useCallback(

@@ -15,6 +15,7 @@ import {
   generateEd25519KeyPair,
   issuePeerIdentityCert,
   sha256Hex,
+  wipeRoomKeys,
 } from "@simpleim/crypto";
 import { SignalingServerError } from "@simpleim/peer-core";
 import { HttpApiError, HttpAuthClient } from "../src/api/http-client.ts";
@@ -1542,5 +1543,114 @@ describe("Encrypted RoomVault, MultiplexedSignalingHub & Persistent Room List VM
     expect(activeSet.size).toBe(MAX_ACTIVE_MESH_ROOMS);
     expect(activeSet.has(tenRooms[9]!)).toBe(true);
     expect(activeSet.has(tenRooms[0]!)).toBe(true);
+  });
+
+  test("RoomVault refuses zeroized/wiped DerivedRoomKeys, and BrowserSignalingClient + MultiplexedSignalingHub settle aborted connects and preserve background reconnect", async () => {
+    // 1. Zeroized keys must never overwrite or resurrect vault entries
+    const backend = new InMemoryVaultBackend();
+    const vault = new RoomVault(backend);
+    const keys = deriveRoomKeys("wipe-guard-passphrase", {
+      m: 8,
+      t: 1,
+      p: 1,
+    });
+    const meta: VaultRoomMetadata = {
+      roomId: keys.roomId,
+      roomIdPrefix: keys.roomIdPrefix,
+      alias: "Guard Room",
+      pinned: false,
+      joinedAt: 1_000,
+      lastActiveAt: 1_000,
+      lastReadAt: 1_000,
+    };
+    wipeRoomKeys(keys);
+    await expect(vault.saveRoom("usr_guard", meta, keys)).rejects.toThrow(
+      /Refusing to persist wiped or invalid room keys/,
+    );
+    expect(await vault.loadWorkspace("usr_guard")).toEqual([]);
+
+    // 2. Detaching last room while WS is CONNECTING settles pending connect() without wedging hub,
+    // and offline connect() after a previous open preserves background auto-reconnect!
+    class ControlledWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+
+      readyState = ControlledWebSocket.CONNECTING;
+      binaryType: BinaryType = "blob";
+      onopen: ((ev: Event) => void) | null = null;
+      onmessage: ((ev: MessageEvent) => void) | null = null;
+      onerror: ((ev: Event) => void) | null = null;
+      onclose: ((ev: CloseEvent) => void) | null = null;
+
+      close(): void {
+        this.readyState = ControlledWebSocket.CLOSED;
+      }
+
+      triggerOpen(): void {
+        this.readyState = ControlledWebSocket.OPEN;
+        this.onopen?.(new Event("open"));
+      }
+
+      triggerClose(code = 1006): void {
+        this.readyState = ControlledWebSocket.CLOSED;
+        this.onclose?.({ code } as CloseEvent);
+      }
+    }
+
+    const createdSockets: ControlledWebSocket[] = [];
+    const client = new BrowserSignalingClient({
+      peerId: "peer_019a0000000070008000000000000999",
+      wsUrl: "ws://127.0.0.1:9999/ws/v1/signaling",
+      initialBackoffMs: 25,
+      maxBackoffMs: 60,
+      webSocketFactory: () => {
+        const s = new ControlledWebSocket();
+        createdSockets.push(s);
+        return s as unknown as WebSocket;
+      },
+    });
+    const hub = new MultiplexedSignalingHub(client);
+    const roomA = "a".repeat(64);
+    const roomB = "b".repeat(64);
+
+    // 2a. Start connecting Room A, then detach Room A while socket #0 is still CONNECTING
+    const portA1 = hub.createRoomPort(roomA);
+    const pendingConnect1 = portA1.connect();
+    expect(createdSockets.length).toBe(1);
+    portA1.disconnect();
+    await expect(pendingConnect1).rejects.toThrow(/disconnected/);
+
+    // Subsequent connect on the same hub must NOT wedge on a stuck connectPromise!
+    const portA2 = hub.createRoomPort(roomA);
+    const pendingConnect2 = portA2.connect();
+    expect(createdSockets.length).toBe(2);
+    createdSockets[1]!.triggerOpen();
+    await pendingConnect2;
+    expect(portA2.isConnected).toBe(true);
+
+    // 2b. Simulate temporary server outage: socket #1 closes unexpectedly -> schedules reconnect
+    createdSockets[1]!.triggerClose(1006);
+    expect(portA2.isConnected).toBe(false);
+
+    // While server is offline, user tries to connect standby Room B -> immediate socket #2 fails before open
+    const portB = hub.createRoomPort(roomB);
+    const pendingConnectB = portB.connect();
+    expect(createdSockets.length).toBe(3);
+    createdSockets[2]!.triggerClose(1006);
+    await expect(pendingConnectB).rejects.toThrow(/closed before open/);
+    portB.disconnect(); // Room B detaches, Room A remains attached!
+
+    // Background reconnect for Room A must still fire and restore connectivity automatically!
+    const deadline = Date.now() + 1_000;
+    while (createdSockets.length < 4 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    expect(createdSockets.length).toBeGreaterThanOrEqual(4);
+    createdSockets[createdSockets.length - 1]!.triggerOpen();
+    expect(portA2.isConnected).toBe(true);
+
+    hub.closeAll();
   });
 });

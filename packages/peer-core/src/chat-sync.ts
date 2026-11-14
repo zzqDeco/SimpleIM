@@ -40,7 +40,7 @@ export function compareChatMessages(
 
 export class ChatSyncManager {
   private readonly roomId: string;
-  private readonly localCert: PeerIdentityCert;
+  private localCert: PeerIdentityCert;
   private readonly localSignKeyPair: Ed25519KeyPair;
   private readonly serverSignPubKey: string;
   private readonly now: () => number;
@@ -63,6 +63,10 @@ export class ChatSyncManager {
         this.seedInitialMessage(msg);
       }
     }
+  }
+
+  updateLocalCert(nextCert: PeerIdentityCert): void {
+    this.localCert = nextCert;
   }
 
   private seedInitialMessage(message: ChatMessageEnvelope): void {

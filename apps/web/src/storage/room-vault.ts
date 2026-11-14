@@ -299,6 +299,9 @@ export class IndexedDbVaultBackend implements VaultStorageBackend {
         req.onsuccess = () => resolve(req.result);
         req.onerror = () =>
           reject(req.error ?? new Error("Failed to open IndexedDB vault"));
+      }).catch((err) => {
+        this.dbPromise = null;
+        throw err;
       });
     }
     return this.dbPromise;
@@ -472,6 +475,19 @@ function toArrayBufferSlice(bytes: Uint8Array): ArrayBuffer {
   ) as ArrayBuffer;
 }
 
+function isNonZero32ByteKey(bytes: Uint8Array): boolean {
+  return bytes.byteLength === 32 && bytes.some((b) => b !== 0);
+}
+
+function hasValidNonZeroRoomKeys(roomKeys: DerivedRoomKeys): boolean {
+  return (
+    isValidRoomIdHex(roomKeys.roomId) &&
+    isNonZero32ByteKey(roomKeys.signalingKey) &&
+    isNonZero32ByteKey(roomKeys.roomAuthKey) &&
+    isNonZero32ByteKey(roomKeys.roomAppKey)
+  );
+}
+
 export class RoomVault {
   private readonly backend: VaultStorageBackend;
   private readonly keyCache = new Map<string, Promise<CryptoKey>>();
@@ -490,7 +506,7 @@ export class RoomVault {
   private getOrCreateDeviceKey(userId: string): Promise<CryptoKey> {
     let pending = this.keyCache.get(userId);
     if (!pending) {
-      pending = (async () => {
+      const createdPromise = (async () => {
         const existing = await this.backend.getDeviceKey(userId);
         if (existing) return existing;
         const created = await globalThis.crypto.subtle.generateKey(
@@ -500,7 +516,13 @@ export class RoomVault {
         );
         await this.backend.putDeviceKey(userId, created);
         return created;
-      })();
+      })().catch((err) => {
+        if (this.keyCache.get(userId) === createdPromise) {
+          this.keyCache.delete(userId);
+        }
+        throw err;
+      });
+      pending = createdPromise;
       this.keyCache.set(userId, pending);
     }
     return pending;
@@ -593,9 +615,9 @@ export class RoomVault {
         const roomAuthKey = base64UrlToBytes(rawRoom.roomAuthKeyB64);
         const roomAppKey = base64UrlToBytes(rawRoom.roomAppKeyB64);
         if (
-          signalingKey.byteLength !== 32 ||
-          roomAuthKey.byteLength !== 32 ||
-          roomAppKey.byteLength !== 32
+          !isNonZero32ByteKey(signalingKey) ||
+          !isNonZero32ByteKey(roomAuthKey) ||
+          !isNonZero32ByteKey(roomAppKey)
         ) {
           continue;
         }
@@ -693,6 +715,14 @@ export class RoomVault {
     metadata: VaultRoomMetadata,
     roomKeys: DerivedRoomKeys,
   ): Promise<void> {
+    if (
+      !hasValidNonZeroRoomKeys(roomKeys) ||
+      roomKeys.roomId !== metadata.roomId
+    ) {
+      return Promise.reject(
+        new Error("Refusing to persist wiped or invalid room keys"),
+      );
+    }
     const payload: SerializedVaultRoomPayload = {
       v: 1,
       roomId: metadata.roomId,
