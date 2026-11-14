@@ -300,7 +300,11 @@ export async function runJoinCommand(
     peerId,
     maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
   });
-  const transportFactory = new WeriftTransportFactory();
+  const transportFactory = new WeriftTransportFactory({
+    onNetworkDiagnostic: (diag) => {
+      stderr.write(`[network] ${diag.message}\n`);
+    },
+  });
   const chunkStorage = new FsChunkStorageAdapter({
     downloadDir: cmd.downloadDir,
   });
