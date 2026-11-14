@@ -50,6 +50,9 @@ export interface TranslationSchema {
   "lobby.subtitle": string;
   "lobby.field.passphrase": string;
   "lobby.field.passphrasePlaceholder": string;
+  "lobby.field.alias": string;
+  "lobby.field.aliasHint": string;
+  "lobby.field.aliasPlaceholder": string;
   "lobby.passphrase.show": string;
   "lobby.passphrase.hide": string;
   "lobby.passphrase.showAria": string;
@@ -58,15 +61,30 @@ export interface TranslationSchema {
   "lobby.phase.connecting": string;
   "lobby.submit.idle": string;
   "lobby.signOut": string;
+  "lobby.wipeSignOut": string;
 
-  // Room Workspace
+  // Room Workspace & Persistent Room List Rail
   "room.status.online": string;
   "room.status.detached": string;
+  "room.status.standby": string;
   "room.status.onlineHint": string;
   "room.status.detachedHint": string;
+  "room.status.standbyHint": string;
+  "room.roomsToggle": string;
   "room.drawerToggle": string;
   "room.leave": string;
   "room.signOut": string;
+  "room.wipeSignOut": string;
+  "room.railAria": string;
+  "room.rail.heading": string;
+  "room.rail.addButton": string;
+  "room.rail.cancelAdd": string;
+  "room.rail.pin": string;
+  "room.rail.unpin": string;
+  "room.rail.rename": string;
+  "room.rail.renameSave": string;
+  "room.rail.renamePlaceholder": string;
+  "room.rail.emptyPreview": string;
   "room.dismiss": string;
   "room.dropFiles": string;
   "room.streamAria": string;

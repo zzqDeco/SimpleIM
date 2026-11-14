@@ -31,6 +31,7 @@ SimpleIM combines a **tiny, zero-knowledge Bun rendezvous center** with a **100%
 | :--- | :--- |
 | **Web ↔ CLI Native Interop** | Browser `RTCPeerConnection` (`apps/web`) and pure-TypeScript `werift` (`apps/cli`, zero `node-gyp` C++ addons, single-binary `bun build --compile`) speak the exact same wire protocol |
 | **Zero-Knowledge Passphrase Rooms** | Client-only `Argon2id` (`64 MiB`) + `HKDF-SHA256` key separation; encrypted SDP/ICE signaling; post-DTLS `HELLO_AUTH` mutual channel binding blocking server MITM |
+| **Persistent Encrypted Local Vault** | Multi-room workspace (`MultiplexedSignalingHub`) + IndexedDB `AES-GCM-256` (`extractable: false`) local room & history vault across reloads/sign-ins with zero server room tables |
 | **Swarm Distributed File Transfer** | `64 KiB` binary chunks on a dedicated unordered `"file-swarm"` channel, `SHA-256` per-chunk verification, Rarest-First + Endgame multi-peer pulling, and SCTP backpressure guards |
 | **Constant-Memory Large Files** | Web Worker **OPFS (`FileSystemSyncAccessHandle`)** random-offset chunk I/O in browsers and sparse `.part` files on CLI—no multi-GB RAM buffering |
 | **Optional Headless Seed Peer** | Run `simpleim seed` on any VPS or NAS as an ordinary encrypted room peer to provide 24/7 online history catch-up and file seeding with zero server changes |

@@ -50,6 +50,7 @@ export function createRoomPeerEngine(
     localSignKeyPair,
     serverSignPubKey,
     now,
+    initialMessages: options.initialMessages,
     events,
   });
 
@@ -63,6 +64,7 @@ export function createRoomPeerEngine(
     localSignKeyPair,
     serverSignPubKey,
     chunkStorage,
+    initialFiles: options.initialFiles,
     maxInFlightPerPeer: options.maxInFlightPerPeer,
     requestTimeoutMs: options.requestTimeoutMs,
     now,

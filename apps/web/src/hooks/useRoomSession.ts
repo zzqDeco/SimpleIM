@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ChatMessageEnvelope,
   FileManifest,
+  MetaResponse,
+  PeerIdentityCert,
   UserProfile,
 } from "@simpleim/contracts";
 import {
@@ -21,13 +23,26 @@ import { HttpApiError, type HttpAuthClient } from "../api/http-client.ts";
 import { deriveRoomKeysOffThread } from "../crypto/kdf-client.ts";
 import { toAppFailure, type AppFailure } from "../i18n/error-catalog.ts";
 import { mergeOrderedFiles, mergeOrderedMessages } from "../state/collections.ts";
-import { RoomRuntimeSlot } from "../state/runtime-slot.ts";
+import {
+  buildSortedRoomSummaries,
+  compareRoomOrder,
+  MAX_ACTIVE_MESH_ROOMS,
+  selectActiveMeshRoomIds,
+  type RoomMeshConnectionStatus,
+  type RoomSummaryInput,
+  type RoomSummaryItem,
+} from "../state/room-list-vm.ts";
+import { sanitizeRoomAlias } from "../state/validation.ts";
 import {
   createBrowserFileChunkReader,
   OpfsChunkStorageAdapter,
 } from "../storage/opfs-chunk-storage.ts";
-import { BrowserSignalingClient } from "../transport/browser-signaling.ts";
+import {
+  RoomVault,
+  type VaultRoomMetadata,
+} from "../storage/room-vault.ts";
 import { BrowserWebRtcTransportFactory } from "../transport/browser-webrtc.ts";
+import { MultiplexedSignalingHub } from "../transport/multiplexed-signaling.ts";
 
 export type JoinPhase = "idle" | "deriving" | "connecting";
 
@@ -35,26 +50,46 @@ export type SecurityEvent =
   | { readonly kind: "peer_rejected"; readonly reason: string }
   | { readonly kind: "engine_error"; readonly failure: AppFailure };
 
-interface ActiveRoomRuntime {
-  engine: RoomPeerEngine;
-  roomKeys: DerivedRoomKeys;
-  localSignKeyPair: Ed25519KeyPair;
-  chunkStorage: OpfsChunkStorageAdapter;
-  localPeerId: string;
-  roomIdPrefix: string;
+interface ActiveRoomEngineInstance {
+  readonly engine: RoomPeerEngine;
+  readonly chunkStorage: OpfsChunkStorageAdapter;
+  readonly localPeerId: string;
 }
 
-async function cleanupRuntimeInstance(rt: ActiveRoomRuntime): Promise<void> {
+interface ManagedRoomRecord {
+  metadata: VaultRoomMetadata;
+  readonly roomKeys: DerivedRoomKeys;
+  messages: ChatMessageEnvelope[];
+  files: FileManifest[];
+  transfers: Map<string, SwarmTransferProgress>;
+  peers: VerifiedPeerInfo[];
+  centerConnected: boolean;
+  activeRuntime: ActiveRoomEngineInstance | null;
+  startingPromise: Promise<void> | null;
+}
+
+interface WorkspaceIdentityBundle {
+  readonly userId: string;
+  readonly peerId: string;
+  readonly signKeyPair: Ed25519KeyPair;
+  cert: PeerIdentityCert;
+  readonly meta: MetaResponse;
+  readonly signalingHub: MultiplexedSignalingHub;
+  renewalTimer: ReturnType<typeof setTimeout> | null;
+}
+
+async function stopRoomEngineOnly(entry: ManagedRoomRecord): Promise<void> {
+  const rt = entry.activeRuntime;
+  entry.activeRuntime = null;
+  entry.startingPromise = null;
+  entry.centerConnected = false;
+  entry.peers = [];
+  if (!rt) return;
+
   try {
     await rt.engine.stop();
   } catch {
-    // Ignore shutdown errors
-  }
-  try {
-    wipeRoomKeys(rt.roomKeys);
-    rt.localSignKeyPair.privateKeyBytes.fill(0);
-  } catch {
-    // Ignore wipe errors
+    // Ignore engine shutdown errors
   }
   try {
     await rt.chunkStorage.closeAll();
@@ -63,17 +98,59 @@ async function cleanupRuntimeInstance(rt: ActiveRoomRuntime): Promise<void> {
   }
 }
 
+async function destroyEntryKeysAndEngine(entry: ManagedRoomRecord): Promise<void> {
+  await stopRoomEngineOnly(entry);
+  try {
+    wipeRoomKeys(entry.roomKeys);
+  } catch {
+    // Ignore wipe errors
+  }
+}
+
+function disposeIdentityBundle(bundle: WorkspaceIdentityBundle | null): void {
+  if (!bundle) return;
+  if (bundle.renewalTimer !== null) {
+    clearTimeout(bundle.renewalTimer);
+    bundle.renewalTimer = null;
+  }
+  try {
+    bundle.signalingHub.closeAll();
+  } catch {
+    // Ignore hub shutdown errors
+  }
+  try {
+    bundle.signKeyPair.privateKeyBytes.fill(0);
+  } catch {
+    // Ignore key zeroization errors
+  }
+}
+
+function computeEntryConnectionStatus(
+  entry: ManagedRoomRecord,
+): RoomMeshConnectionStatus {
+  if (!entry.activeRuntime) {
+    return "standby";
+  }
+  return entry.centerConnected ? "connected" : "detached";
+}
+
 export interface UseRoomSessionParams {
   readonly user: UserProfile | null;
   readonly authClient: HttpAuthClient;
   readonly onSessionExpired: () => void;
+  readonly vault?: RoomVault;
 }
 
 export interface RoomSessionController {
+  readonly hydrating: boolean;
   readonly inRoom: boolean;
   readonly joinPhase: JoinPhase;
   readonly joinFailure: AppFailure | null;
   readonly clearJoinFailure: () => void;
+  readonly rooms: readonly RoomSummaryItem[];
+  readonly selectedRoomId: string | null;
+  readonly selectedRoomAlias: string | null;
+  readonly selectedRoomStatus: RoomMeshConnectionStatus;
   readonly roomIdPrefix: string;
   readonly localPeerId: string;
   readonly centerConnected: boolean;
@@ -83,8 +160,16 @@ export interface RoomSessionController {
   readonly transfers: ReadonlyMap<string, SwarmTransferProgress>;
   readonly securityEvent: SecurityEvent | null;
   readonly dismissSecurityEvent: () => void;
-  readonly joinRoom: (passphrase: string) => Promise<void>;
-  readonly leaveRoom: () => Promise<void>;
+  readonly joinRoom: (passphrase: string, alias?: string) => Promise<boolean>;
+  readonly selectRoom: (roomId: string) => Promise<void>;
+  readonly renameRoomAlias: (
+    roomId: string,
+    alias: string | null,
+  ) => Promise<void>;
+  readonly togglePinRoom: (roomId: string) => Promise<void>;
+  readonly leaveRoom: (roomId?: string) => Promise<void>;
+  readonly disconnectAllPreservingVault: () => Promise<void>;
+  readonly wipeLocalVault: () => Promise<void>;
   readonly sendMessage: (
     body: string,
     replyToMsgId: string | null,
@@ -96,172 +181,384 @@ export interface RoomSessionController {
   readonly canSaveFile: (fileId: string) => boolean;
 }
 
+interface UiWorkspaceSnapshot {
+  readonly rooms: readonly RoomSummaryItem[];
+  readonly selectedRoomId: string | null;
+  readonly selectedRoomAlias: string | null;
+  readonly selectedRoomStatus: RoomMeshConnectionStatus;
+  readonly roomIdPrefix: string;
+  readonly localPeerId: string;
+  readonly centerConnected: boolean;
+  readonly peers: readonly VerifiedPeerInfo[];
+  readonly messages: readonly ChatMessageEnvelope[];
+  readonly files: readonly FileManifest[];
+  readonly transfers: ReadonlyMap<string, SwarmTransferProgress>;
+}
+
+const EMPTY_UI_SNAPSHOT: UiWorkspaceSnapshot = {
+  rooms: [],
+  selectedRoomId: null,
+  selectedRoomAlias: null,
+  selectedRoomStatus: "standby",
+  roomIdPrefix: "",
+  localPeerId: "",
+  centerConnected: false,
+  peers: [],
+  messages: [],
+  files: [],
+  transfers: new Map(),
+};
+
 export function useRoomSession({
   user,
   authClient,
   onSessionExpired,
+  vault: injectedVault,
 }: UseRoomSessionParams): RoomSessionController {
-  const runtimeSlotRef = useRef<RoomRuntimeSlot<ActiveRoomRuntime> | null>(null);
-  if (!runtimeSlotRef.current) {
-    runtimeSlotRef.current = new RoomRuntimeSlot<ActiveRoomRuntime>();
+  const vaultRef = useRef<RoomVault | null>(null);
+  if (!vaultRef.current) {
+    vaultRef.current = injectedVault ?? new RoomVault();
   }
-  const runtimeSlot = runtimeSlotRef.current;
+  const vault = vaultRef.current;
 
+  const workspaceGenRef = useRef(0);
+  const roomsRef = useRef<Map<string, ManagedRoomRecord>>(new Map());
+  const selectedRoomIdRef = useRef<string | null>(null);
+  const identityRef = useRef<WorkspaceIdentityBundle | null>(null);
+  const identityPromiseRef = useRef<{
+    gen: number;
+    promise: Promise<WorkspaceIdentityBundle>;
+  } | null>(null);
+  const activeUserIdRef = useRef<string | null>(null);
+
+  const [hydratedUserId, setHydratedUserId] = useState<string | null>(null);
   const [joinPhase, setJoinPhase] = useState<JoinPhase>("idle");
   const [joinFailure, setJoinFailure] = useState<AppFailure | null>(null);
-  const [inRoom, setInRoom] = useState(false);
-  const [roomIdPrefix, setRoomIdPrefix] = useState("");
-  const [localPeerId, setLocalPeerId] = useState("");
-  const [centerConnected, setCenterConnected] = useState(false);
-  const [peers, setPeers] = useState<VerifiedPeerInfo[]>([]);
-  const [messages, setMessages] = useState<ChatMessageEnvelope[]>([]);
-  const [files, setFiles] = useState<FileManifest[]>([]);
-  const [transfers, setTransfers] = useState<Map<string, SwarmTransferProgress>>(
-    () => new Map(),
-  );
   const [securityEvent, setSecurityEvent] = useState<SecurityEvent | null>(null);
+  const [snapshot, setSnapshot] = useState<UiWorkspaceSnapshot>(EMPTY_UI_SNAPSHOT);
 
-  const leaveRoom = useCallback(async (): Promise<void> => {
-    const rt = runtimeSlot.takeActiveForTeardown();
-
-    setInRoom(false);
-    setJoinPhase("idle");
-    setJoinFailure(null);
-    setRoomIdPrefix("");
-    setLocalPeerId("");
-    setCenterConnected(false);
-    setPeers([]);
-    setMessages([]);
-    setFiles([]);
-    setTransfers(new Map());
-    setSecurityEvent(null);
-
-    if (!rt) {
+  const publishSnapshot = useCallback((currentUserId: string | null): void => {
+    if (!currentUserId || roomsRef.current.size === 0) {
+      selectedRoomIdRef.current = null;
+      setSnapshot(EMPTY_UI_SNAPSHOT);
       return;
     }
-    await cleanupRuntimeInstance(rt);
-  }, [runtimeSlot]);
 
-  useEffect(() => {
-    const handlePageHide = (): void => {
-      void leaveRoom();
-    };
-    window.addEventListener("pagehide", handlePageHide);
-    return () => {
-      window.removeEventListener("pagehide", handlePageHide);
-      void leaveRoom();
-    };
-  }, [leaveRoom]);
+    const entries = Array.from(roomsRef.current.values());
+    const summaryInputs: RoomSummaryInput[] = entries.map((entry) => ({
+      roomId: entry.metadata.roomId,
+      roomIdPrefix: entry.metadata.roomIdPrefix,
+      alias: entry.metadata.alias,
+      pinned: entry.metadata.pinned,
+      joinedAt: entry.metadata.joinedAt,
+      lastActiveAt: entry.metadata.lastActiveAt,
+      lastReadAt: entry.metadata.lastReadAt,
+      messages: entry.messages,
+      peerCount: entry.peers.length,
+      fileCount: entry.files.length,
+      connectionStatus: computeEntryConnectionStatus(entry),
+    }));
+    const sortedSummaries = buildSortedRoomSummaries(
+      summaryInputs,
+      currentUserId,
+    );
 
-  const joinRoom = useCallback(
-    async (passphrase: string): Promise<void> => {
-      if (!user) return;
-      await leaveRoom();
+    let selId = selectedRoomIdRef.current;
+    if (!selId || !roomsRef.current.has(selId)) {
+      selId = sortedSummaries[0]?.roomId ?? null;
+      selectedRoomIdRef.current = selId;
+    }
 
-      const myGen = runtimeSlot.beginAttempt();
-      setJoinFailure(null);
-      setJoinPhase("deriving");
+    const selectedEntry = selId ? roomsRef.current.get(selId) : undefined;
+    if (!selectedEntry) {
+      setSnapshot(EMPTY_UI_SNAPSHOT);
+      return;
+    }
 
-      let derivedKeys: DerivedRoomKeys | null = null;
-      let signKeyPair: Ed25519KeyPair | null = null;
-      let chunkStorage: OpfsChunkStorageAdapter | null = null;
-      let engine: RoomPeerEngine | null = null;
-      let createdRuntime: ActiveRoomRuntime | null = null;
+    setSnapshot({
+      rooms: sortedSummaries,
+      selectedRoomId: selectedEntry.metadata.roomId,
+      selectedRoomAlias: selectedEntry.metadata.alias,
+      selectedRoomStatus: computeEntryConnectionStatus(selectedEntry),
+      roomIdPrefix: selectedEntry.metadata.roomIdPrefix,
+      localPeerId:
+        selectedEntry.activeRuntime?.localPeerId ??
+        identityRef.current?.peerId ??
+        "",
+      centerConnected: selectedEntry.centerConnected,
+      peers: [...selectedEntry.peers],
+      messages: [...selectedEntry.messages],
+      files: [...selectedEntry.files],
+      transfers: new Map(selectedEntry.transfers),
+    });
+  }, []);
 
-      try {
-        derivedKeys = await deriveRoomKeysOffThread(passphrase);
-        if (!runtimeSlot.isCurrentAttempt(myGen)) {
-          wipeRoomKeys(derivedKeys);
-          return;
-        }
+  const ensureIdentityBundle = useCallback(
+    async (
+      expectedGen: number,
+      currentUser: UserProfile,
+    ): Promise<WorkspaceIdentityBundle> => {
+      const existing = identityRef.current;
+      if (
+        existing &&
+        existing.userId === currentUser.id &&
+        existing.cert.payload.exp - Date.now() > 5 * 60_000
+      ) {
+        return existing;
+      }
 
-        setJoinPhase("connecting");
+      if (
+        identityPromiseRef.current &&
+        identityPromiseRef.current.gen === expectedGen
+      ) {
+        return identityPromiseRef.current.promise;
+      }
+
+      const promise = (async (): Promise<WorkspaceIdentityBundle> => {
         const peerId = generatePrefixedId("peer");
-        signKeyPair = generateEd25519KeyPair();
+        const signKeyPair = generateEd25519KeyPair();
 
-        const [meta, cert] = await Promise.all([
-          authClient.getMeta(),
-          authClient.issuePeerCert({
-            userId: user.id,
+        try {
+          const [meta, cert] = await Promise.all([
+            authClient.getMeta(),
+            authClient.issuePeerCert({
+              userId: currentUser.id,
+              peerId,
+              peerSignKeyPair: signKeyPair,
+            }),
+          ]);
+
+          if (workspaceGenRef.current !== expectedGen) {
+            signKeyPair.privateKeyBytes.fill(0);
+            throw new Error("Workspace session superseded");
+          }
+
+          if (identityRef.current) {
+            disposeIdentityBundle(identityRef.current);
+          }
+
+          const signalingHub = new MultiplexedSignalingHub({
             peerId,
-            peerSignKeyPair: signKeyPair,
-          }),
-        ]);
+            maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
+          });
 
-        if (!runtimeSlot.isCurrentAttempt(myGen)) {
-          wipeRoomKeys(derivedKeys);
+          const bundle: WorkspaceIdentityBundle = {
+            userId: currentUser.id,
+            peerId,
+            signKeyPair,
+            cert,
+            meta,
+            signalingHub,
+            renewalTimer: null,
+          };
+
+          const scheduleRenewal = (targetBundle: WorkspaceIdentityBundle) => {
+            const msUntilRenew = Math.max(
+              60_000,
+              targetBundle.cert.payload.exp - Date.now() - 10 * 60_000,
+            );
+            targetBundle.renewalTimer = setTimeout(() => {
+              if (
+                workspaceGenRef.current !== expectedGen ||
+                identityRef.current !== targetBundle
+              ) {
+                return;
+              }
+              void authClient
+                .issuePeerCert({
+                  userId: currentUser.id,
+                  peerId: targetBundle.peerId,
+                  peerSignKeyPair: targetBundle.signKeyPair,
+                })
+                .then((freshCert) => {
+                  if (
+                    workspaceGenRef.current !== expectedGen ||
+                    identityRef.current !== targetBundle
+                  ) {
+                    return;
+                  }
+                  targetBundle.cert = freshCert;
+                  scheduleRenewal(targetBundle);
+                })
+                .catch(() => {
+                  // Retry before actual expiration if transient network error occurs
+                  if (
+                    workspaceGenRef.current === expectedGen &&
+                    identityRef.current === targetBundle
+                  ) {
+                    targetBundle.renewalTimer = setTimeout(
+                      () => scheduleRenewal(targetBundle),
+                      60_000,
+                    );
+                  }
+                });
+            }, msUntilRenew);
+          };
+
+          scheduleRenewal(bundle);
+          identityRef.current = bundle;
+          return bundle;
+        } catch (err) {
           signKeyPair.privateKeyBytes.fill(0);
-          return;
+          throw err;
+        } finally {
+          if (identityPromiseRef.current?.gen === expectedGen) {
+            identityPromiseRef.current = null;
+          }
         }
+      })();
 
-        const signaling = new BrowserSignalingClient({
-          peerId,
-          maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
-        });
+      identityPromiseRef.current = { gen: expectedGen, promise };
+      return promise;
+    },
+    [authClient],
+  );
+
+  const startEngineForEntry = useCallback(
+    async (
+      expectedGen: number,
+      currentUser: UserProfile,
+      entry: ManagedRoomRecord,
+      identity: WorkspaceIdentityBundle,
+    ): Promise<void> => {
+      if (entry.activeRuntime) return;
+      if (entry.startingPromise) {
+        await entry.startingPromise;
+        return;
+      }
+
+      const startTask = (async (): Promise<void> => {
+        const roomId = entry.metadata.roomId;
+        const signalingPort = identity.signalingHub.createRoomPort(roomId);
         const transportFactory = new BrowserWebRtcTransportFactory();
-        chunkStorage = new OpfsChunkStorageAdapter();
+        const chunkStorage = new OpfsChunkStorageAdapter();
 
-        const activeEngine = createRoomPeerEngine({
-          localPeerId: peerId,
-          localCert: cert,
-          localSignKeyPair: signKeyPair,
-          serverSignPubKey: meta.serverSignPubKey,
-          roomKeys: derivedKeys,
-          iceServers: meta.iceServers,
-          maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
-          signaling,
-          transportFactory,
-          chunkStorage,
-          events: {
-            onCenterConnectionChange: (connected) => {
-              if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-              setCenterConnected(connected);
-            },
-            onPeersChange: (nextPeers) => {
-              if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-              setPeers([...nextPeers]);
-            },
-            onPeerAuthRejected: (_remotePeerId, reason) => {
-              if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-              setSecurityEvent({ kind: "peer_rejected", reason });
-            },
-            onChatMessage: (msg) => {
-              if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-              setMessages((prev) =>
-                mergeOrderedMessages(prev, [
+        let activeEngine: RoomPeerEngine | null = null;
+        try {
+          activeEngine = createRoomPeerEngine({
+            localPeerId: identity.peerId,
+            localCert: identity.cert,
+            localSignKeyPair: identity.signKeyPair,
+            serverSignPubKey: identity.meta.serverSignPubKey,
+            roomKeys: entry.roomKeys,
+            iceServers: identity.meta.iceServers,
+            maxSignalPayloadBytes: identity.meta.limits.maxSignalPayloadBytes,
+            initialMessages: entry.messages,
+            initialFiles: entry.files,
+            signaling: signalingPort,
+            transportFactory,
+            chunkStorage,
+            events: {
+              onCenterConnectionChange: (connected) => {
+                if (
+                  workspaceGenRef.current !== expectedGen ||
+                  roomsRef.current.get(roomId) !== entry
+                ) {
+                  return;
+                }
+                entry.centerConnected = connected;
+                publishSnapshot(currentUser.id);
+              },
+              onPeersChange: (nextPeers) => {
+                if (
+                  workspaceGenRef.current !== expectedGen ||
+                  roomsRef.current.get(roomId) !== entry
+                ) {
+                  return;
+                }
+                entry.peers = [...nextPeers];
+                publishSnapshot(currentUser.id);
+              },
+              onPeerAuthRejected: (_remotePeerId, reason) => {
+                if (
+                  workspaceGenRef.current !== expectedGen ||
+                  roomsRef.current.get(roomId) !== entry
+                ) {
+                  return;
+                }
+                if (selectedRoomIdRef.current === roomId) {
+                  setSecurityEvent({ kind: "peer_rejected", reason });
+                }
+              },
+              onChatMessage: (msg) => {
+                if (
+                  workspaceGenRef.current !== expectedGen ||
+                  roomsRef.current.get(roomId) !== entry ||
+                  !activeEngine
+                ) {
+                  return;
+                }
+                entry.messages = mergeOrderedMessages(entry.messages, [
                   ...activeEngine.getMessages(),
                   msg,
-                ]),
-              );
-            },
-            onFileAnnounced: (manifest) => {
-              if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-              setFiles((prev) =>
-                mergeOrderedFiles(prev, [...activeEngine.getFiles(), manifest]),
-              );
-              const prog = activeEngine.getTransferProgress(manifest.fileId);
-              if (prog) {
-                setTransfers((prev) => {
-                  const next = new Map(prev);
-                  next.set(manifest.fileId, { ...prog });
-                  return next;
-                });
-              }
-            },
-            onTransferProgress: (progress) => {
-              if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-              setTransfers((prev) => {
-                const next = new Map(prev);
-                next.set(progress.fileId, { ...progress });
-                return next;
-              });
-            },
-            onTransferCompleted: (manifest) => {
-              if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-              const prog = activeEngine.getTransferProgress(manifest.fileId);
-              setTransfers((prev) => {
-                const next = new Map(prev);
-                next.set(
+                ]);
+                const nextActiveAt = Math.max(
+                  entry.metadata.lastActiveAt,
+                  msg.createdAt,
+                );
+                const isSelected = selectedRoomIdRef.current === roomId;
+                entry.metadata = {
+                  ...entry.metadata,
+                  lastActiveAt: nextActiveAt,
+                  lastReadAt: isSelected
+                    ? Math.max(
+                        entry.metadata.lastReadAt,
+                        msg.createdAt,
+                        Date.now(),
+                      )
+                    : entry.metadata.lastReadAt,
+                };
+                void vault.saveRoomMessages(
+                  currentUser.id,
+                  roomId,
+                  entry.messages,
+                );
+                void vault.saveRoom(
+                  currentUser.id,
+                  entry.metadata,
+                  entry.roomKeys,
+                );
+                publishSnapshot(currentUser.id);
+              },
+              onFileAnnounced: (manifest) => {
+                if (
+                  workspaceGenRef.current !== expectedGen ||
+                  roomsRef.current.get(roomId) !== entry ||
+                  !activeEngine
+                ) {
+                  return;
+                }
+                entry.files = mergeOrderedFiles(entry.files, [
+                  ...activeEngine.getFiles(),
+                  manifest,
+                ]);
+                const prog = activeEngine.getTransferProgress(manifest.fileId);
+                if (prog) {
+                  entry.transfers.set(manifest.fileId, { ...prog });
+                }
+                void vault.saveRoomFiles(currentUser.id, roomId, entry.files);
+                publishSnapshot(currentUser.id);
+              },
+              onTransferProgress: (progress) => {
+                if (
+                  workspaceGenRef.current !== expectedGen ||
+                  roomsRef.current.get(roomId) !== entry
+                ) {
+                  return;
+                }
+                entry.transfers.set(progress.fileId, { ...progress });
+                publishSnapshot(currentUser.id);
+              },
+              onTransferCompleted: (manifest) => {
+                if (
+                  workspaceGenRef.current !== expectedGen ||
+                  roomsRef.current.get(roomId) !== entry ||
+                  !activeEngine
+                ) {
+                  return;
+                }
+                const prog = activeEngine.getTransferProgress(manifest.fileId);
+                entry.transfers.set(
                   manifest.fileId,
                   prog
                     ? { ...prog, status: "seeding" }
@@ -278,77 +575,410 @@ export function useRoomSession({
                         status: "seeding",
                       },
                 );
-                return next;
-              });
+                publishSnapshot(currentUser.id);
+              },
+              onError: (err) => {
+                if (
+                  workspaceGenRef.current !== expectedGen ||
+                  roomsRef.current.get(roomId) !== entry
+                ) {
+                  return;
+                }
+                if (selectedRoomIdRef.current === roomId) {
+                  setSecurityEvent({
+                    kind: "engine_error",
+                    failure: toAppFailure(err),
+                  });
+                }
+              },
             },
-            onError: (err) => {
-              if (!runtimeSlot.isCurrentAttempt(myGen)) return;
-              setSecurityEvent({
-                kind: "engine_error",
-                failure: toAppFailure(err),
-              });
-            },
-          },
-        });
-        engine = activeEngine;
+          });
 
-        createdRuntime = {
-          engine: activeEngine,
-          roomKeys: derivedKeys,
-          localSignKeyPair: signKeyPair,
-          chunkStorage,
-          localPeerId: peerId,
-          roomIdPrefix: derivedKeys.roomIdPrefix,
-        };
-        if (!runtimeSlot.installIfCurrent(myGen, createdRuntime)) {
-          await cleanupRuntimeInstance(createdRuntime);
-          return;
+          const runtimeInstance: ActiveRoomEngineInstance = {
+            engine: activeEngine,
+            chunkStorage,
+            localPeerId: identity.peerId,
+          };
+          entry.activeRuntime = runtimeInstance;
+
+          await activeEngine.start();
+
+          if (
+            workspaceGenRef.current !== expectedGen ||
+            entry.activeRuntime !== runtimeInstance
+          ) {
+            if (entry.activeRuntime === runtimeInstance) {
+              entry.activeRuntime = null;
+            }
+            await activeEngine.stop().catch(() => {});
+            await chunkStorage.closeAll().catch(() => {});
+            return;
+          }
+
+          entry.centerConnected = activeEngine.isCenterConnected();
+          entry.peers = activeEngine.getVerifiedPeers();
+          entry.messages = mergeOrderedMessages(
+            entry.messages,
+            activeEngine.getMessages(),
+          );
+          entry.files = mergeOrderedFiles(entry.files, activeEngine.getFiles());
+          publishSnapshot(currentUser.id);
+        } catch (err) {
+          if (entry.activeRuntime?.engine === activeEngine) {
+            entry.activeRuntime = null;
+          }
+          entry.centerConnected = false;
+          entry.peers = [];
+          if (activeEngine) {
+            await activeEngine.stop().catch(() => {});
+          } else {
+            signalingPort.disconnect();
+            await chunkStorage.closeAll().catch(() => {});
+          }
+          throw err;
         }
+      })();
 
-        await activeEngine.start();
+      entry.startingPromise = startTask.finally(() => {
+        if (entry.startingPromise === startTask) {
+          entry.startingPromise = null;
+        }
+      });
 
+      await entry.startingPromise;
+    },
+    [publishSnapshot, vault],
+  );
+
+  const rebalanceActiveMeshes = useCallback(
+    async (expectedGen: number, currentUser: UserProfile): Promise<void> => {
+      if (
+        workspaceGenRef.current !== expectedGen ||
+        roomsRef.current.size === 0
+      ) {
+        return;
+      }
+
+      const identity = await ensureIdentityBundle(expectedGen, currentUser);
+      if (workspaceGenRef.current !== expectedGen) return;
+
+      const sortedEntries = Array.from(roomsRef.current.values()).sort((a, b) =>
+        compareRoomOrder(a.metadata, b.metadata),
+      );
+      const maxActive = Math.min(
+        MAX_ACTIVE_MESH_ROOMS,
+        identity.meta.limits.maxRoomsPerConnection,
+      );
+      const desiredActiveIds = selectActiveMeshRoomIds(
+        sortedEntries.map((e) => e.metadata.roomId),
+        selectedRoomIdRef.current,
+        maxActive,
+      );
+
+      // 1. Demote standby rooms first so server per-WS room cap is never exceeded
+      for (const entry of sortedEntries) {
         if (
-          !runtimeSlot.isCurrentAttempt(myGen) ||
-          runtimeSlot.current !== createdRuntime
+          !desiredActiveIds.has(entry.metadata.roomId) &&
+          (entry.activeRuntime !== null || entry.startingPromise !== null)
         ) {
-          runtimeSlot.clearIfOwned(createdRuntime);
-          await cleanupRuntimeInstance(createdRuntime);
+          await stopRoomEngineOnly(entry);
+        }
+      }
+      if (workspaceGenRef.current !== expectedGen) return;
+
+      // 2. Promote active rooms concurrently (selected room first)
+      const entriesToStart = sortedEntries.filter(
+        (e) =>
+          desiredActiveIds.has(e.metadata.roomId) &&
+          e.activeRuntime === null &&
+          e.startingPromise === null,
+      );
+      entriesToStart.sort((a, b) => {
+        if (a.metadata.roomId === selectedRoomIdRef.current) return -1;
+        if (b.metadata.roomId === selectedRoomIdRef.current) return 1;
+        return 0;
+      });
+
+      await Promise.allSettled(
+        entriesToStart.map((entry) =>
+          startEngineForEntry(expectedGen, currentUser, entry, identity),
+        ),
+      );
+      if (workspaceGenRef.current === expectedGen) {
+        publishSnapshot(currentUser.id);
+      }
+    },
+    [ensureIdentityBundle, publishSnapshot, startEngineForEntry],
+  );
+
+  const disconnectAllPreservingVault = useCallback(async (): Promise<void> => {
+    workspaceGenRef.current += 1;
+    identityPromiseRef.current = null;
+
+    const entries = Array.from(roomsRef.current.values());
+    roomsRef.current.clear();
+    selectedRoomIdRef.current = null;
+
+    const identity = identityRef.current;
+    identityRef.current = null;
+
+    setJoinPhase("idle");
+    setJoinFailure(null);
+    setSecurityEvent(null);
+    setSnapshot(EMPTY_UI_SNAPSHOT);
+
+    await Promise.allSettled(
+      entries.map((entry) => destroyEntryKeysAndEngine(entry)),
+    );
+    disposeIdentityBundle(identity);
+    await vault.flush().catch(() => {});
+  }, [vault]);
+
+  const wipeLocalVault = useCallback(async (): Promise<void> => {
+    const targetUserId = user?.id ?? activeUserIdRef.current;
+    await disconnectAllPreservingVault();
+    if (targetUserId) {
+      await vault.wipeUserVault(targetUserId);
+    }
+  }, [disconnectAllPreservingVault, user?.id, vault]);
+
+  // Hydrate persistent encrypted rooms from IndexedDB when user authenticates
+  useEffect(() => {
+    if (!user) {
+      activeUserIdRef.current = null;
+      setHydratedUserId(null);
+      void disconnectAllPreservingVault();
+      return;
+    }
+
+    activeUserIdRef.current = user.id;
+    const myGen = workspaceGenRef.current + 1;
+    workspaceGenRef.current = myGen;
+
+    void (async () => {
+      try {
+        const hydratedRooms = await vault.loadWorkspace(user.id);
+        if (workspaceGenRef.current !== myGen) {
+          for (const h of hydratedRooms) {
+            wipeRoomKeys(h.roomKeys);
+          }
           return;
         }
 
-        setLocalPeerId(peerId);
-        setRoomIdPrefix(derivedKeys.roomIdPrefix);
-        setCenterConnected(activeEngine.isCenterConnected());
-        setPeers(activeEngine.getVerifiedPeers());
-        setMessages(activeEngine.getMessages());
-        setFiles(activeEngine.getFiles());
-        setJoinPhase("idle");
-        setInRoom(true);
-      } catch (err) {
-        runtimeSlot.clearIfOwned(createdRuntime);
-        if (engine) {
-          try {
-            await engine.stop();
-          } catch {
-            // Ignore
+        roomsRef.current.clear();
+        for (const h of hydratedRooms) {
+          roomsRef.current.set(h.metadata.roomId, {
+            metadata: h.metadata,
+            roomKeys: h.roomKeys,
+            messages: h.messages,
+            files: h.files,
+            transfers: new Map(),
+            peers: [],
+            centerConnected: false,
+            activeRuntime: null,
+            startingPromise: null,
+          });
+        }
+
+        if (hydratedRooms.length > 0) {
+          const sorted = [...hydratedRooms].sort((a, b) =>
+            compareRoomOrder(a.metadata, b.metadata),
+          );
+          const topRoomId = sorted[0]!.metadata.roomId;
+          selectedRoomIdRef.current = topRoomId;
+          const topEntry = roomsRef.current.get(topRoomId);
+          if (topEntry) {
+            const readNow = Date.now();
+            topEntry.metadata = {
+              ...topEntry.metadata,
+              lastReadAt: Math.max(topEntry.metadata.lastReadAt, readNow),
+            };
+            void vault.saveRoom(user.id, topEntry.metadata, topEntry.roomKeys);
+          }
+        } else {
+          selectedRoomIdRef.current = null;
+        }
+
+        publishSnapshot(user.id);
+        setHydratedUserId(user.id);
+
+        if (hydratedRooms.length > 0) {
+          await rebalanceActiveMeshes(myGen, user).catch((err) => {
+            if (workspaceGenRef.current !== myGen) return;
+            if (
+              err instanceof HttpApiError &&
+              (err.status === 401 || err.code === "csrf_invalid")
+            ) {
+              onSessionExpired();
+            }
+          });
+        }
+      } catch {
+        if (workspaceGenRef.current === myGen) {
+          setHydratedUserId(user.id);
+        }
+      }
+    })();
+
+    return () => {
+      if (workspaceGenRef.current === myGen) {
+        void disconnectAllPreservingVault();
+      }
+    };
+  }, [
+    disconnectAllPreservingVault,
+    onSessionExpired,
+    publishSnapshot,
+    rebalanceActiveMeshes,
+    user,
+    vault,
+  ]);
+
+  // On tab close / page reload, close live WebRTC & WebSocket and zeroize RAM keys WITHOUT deleting RoomVault
+  useEffect(() => {
+    const handlePageHide = (): void => {
+      void disconnectAllPreservingVault();
+    };
+    window.addEventListener("pagehide", handlePageHide);
+    return () => {
+      window.removeEventListener("pagehide", handlePageHide);
+    };
+  }, [disconnectAllPreservingVault]);
+
+  const joinRoom = useCallback(
+    async (passphrase: string, alias?: string): Promise<boolean> => {
+      if (!user) return false;
+      const myGen = workspaceGenRef.current;
+
+      setJoinFailure(null);
+      setJoinPhase("deriving");
+
+      let derivedKeys: DerivedRoomKeys | null = null;
+      let createdEntry: ManagedRoomRecord | null = null;
+
+      try {
+        derivedKeys = await deriveRoomKeysOffThread(passphrase);
+        if (workspaceGenRef.current !== myGen) {
+          wipeRoomKeys(derivedKeys);
+          return false;
+        }
+
+        const existing = roomsRef.current.get(derivedKeys.roomId);
+        if (existing) {
+          wipeRoomKeys(derivedKeys);
+          derivedKeys = null;
+
+          const nowMs = Date.now();
+          const nextAlias =
+            alias !== undefined && sanitizeRoomAlias(alias) !== null
+              ? sanitizeRoomAlias(alias)
+              : existing.metadata.alias;
+          existing.metadata = {
+            ...existing.metadata,
+            alias: nextAlias,
+            lastActiveAt: nowMs,
+            lastReadAt: nowMs,
+          };
+          selectedRoomIdRef.current = existing.metadata.roomId;
+          setSecurityEvent(null);
+
+          await vault.saveRoom(user.id, existing.metadata, existing.roomKeys);
+          if (workspaceGenRef.current !== myGen) return false;
+
+          setJoinPhase("connecting");
+          await rebalanceActiveMeshes(myGen, user);
+          if (workspaceGenRef.current !== myGen) return false;
+
+          setJoinPhase("idle");
+          publishSnapshot(user.id);
+          return true;
+        }
+
+        setJoinPhase("connecting");
+        const identity = await ensureIdentityBundle(myGen, user);
+        if (workspaceGenRef.current !== myGen) {
+          wipeRoomKeys(derivedKeys);
+          return false;
+        }
+
+        // If we are already at the per-connection cap, demote 1 standby candidate before joining the new room
+        const maxActive = Math.min(
+          MAX_ACTIVE_MESH_ROOMS,
+          identity.meta.limits.maxRoomsPerConnection,
+        );
+        const currentlyActive = Array.from(roomsRef.current.values())
+          .filter((e) => e.activeRuntime !== null || e.startingPromise !== null)
+          .sort((a, b) => compareRoomOrder(a.metadata, b.metadata));
+        while (currentlyActive.length >= maxActive && maxActive > 0) {
+          const victim = currentlyActive.pop();
+          if (victim) {
+            await stopRoomEngineOnly(victim);
           }
         }
-        if (derivedKeys) {
+        if (workspaceGenRef.current !== myGen) {
+          wipeRoomKeys(derivedKeys);
+          return false;
+        }
+
+        const nowMs = Date.now();
+        const metadata: VaultRoomMetadata = {
+          roomId: derivedKeys.roomId,
+          roomIdPrefix: derivedKeys.roomIdPrefix,
+          alias: sanitizeRoomAlias(alias),
+          pinned: false,
+          joinedAt: nowMs,
+          lastActiveAt: nowMs,
+          lastReadAt: nowMs,
+        };
+
+        createdEntry = {
+          metadata,
+          roomKeys: derivedKeys,
+          messages: [],
+          files: [],
+          transfers: new Map(),
+          peers: [],
+          centerConnected: false,
+          activeRuntime: null,
+          startingPromise: null,
+        };
+
+        roomsRef.current.set(metadata.roomId, createdEntry);
+        const prevSelectedId = selectedRoomIdRef.current;
+        selectedRoomIdRef.current = metadata.roomId;
+
+        try {
+          await startEngineForEntry(myGen, user, createdEntry, identity);
+        } catch (startErr) {
+          roomsRef.current.delete(metadata.roomId);
+          selectedRoomIdRef.current = prevSelectedId;
+          throw startErr;
+        }
+
+        if (workspaceGenRef.current !== myGen) {
+          roomsRef.current.delete(metadata.roomId);
+          await destroyEntryKeysAndEngine(createdEntry);
+          return false;
+        }
+
+        await vault.saveRoom(user.id, createdEntry.metadata, createdEntry.roomKeys);
+        if (workspaceGenRef.current !== myGen) return false;
+
+        setSecurityEvent(null);
+        setJoinPhase("idle");
+        publishSnapshot(user.id);
+        return true;
+      } catch (err) {
+        if (createdEntry) {
+          roomsRef.current.delete(createdEntry.metadata.roomId);
+          await destroyEntryKeysAndEngine(createdEntry);
+        } else if (derivedKeys) {
           wipeRoomKeys(derivedKeys);
         }
-        if (signKeyPair) {
-          signKeyPair.privateKeyBytes.fill(0);
-        }
-        if (chunkStorage) {
-          try {
-            await chunkStorage.closeAll();
-          } catch {
-            // Ignore
-          }
-        }
 
-        if (runtimeSlot.isCurrentAttempt(myGen)) {
+        if (workspaceGenRef.current === myGen) {
           setJoinPhase("idle");
+          publishSnapshot(user.id);
           if (
             err instanceof HttpApiError &&
             (err.status === 401 || err.code === "csrf_invalid")
@@ -358,31 +988,174 @@ export function useRoomSession({
             setJoinFailure(toAppFailure(err));
           }
         }
+        return false;
       }
     },
-    [authClient, leaveRoom, onSessionExpired, runtimeSlot, user],
+    [
+      ensureIdentityBundle,
+      onSessionExpired,
+      publishSnapshot,
+      rebalanceActiveMeshes,
+      startEngineForEntry,
+      user,
+      vault,
+    ],
+  );
+
+  const selectRoom = useCallback(
+    async (roomId: string): Promise<void> => {
+      if (!user) return;
+      const myGen = workspaceGenRef.current;
+      const entry = roomsRef.current.get(roomId);
+      if (!entry) return;
+
+      selectedRoomIdRef.current = roomId;
+      setSecurityEvent(null);
+
+      const latestMsgTime =
+        entry.messages.length > 0
+          ? entry.messages[entry.messages.length - 1]!.createdAt
+          : 0;
+      const nextReadAt = Math.max(
+        entry.metadata.lastReadAt,
+        latestMsgTime,
+        Date.now(),
+      );
+      if (nextReadAt !== entry.metadata.lastReadAt) {
+        entry.metadata = {
+          ...entry.metadata,
+          lastReadAt: nextReadAt,
+        };
+        void vault.saveRoom(user.id, entry.metadata, entry.roomKeys);
+      }
+
+      publishSnapshot(user.id);
+
+      if (!entry.activeRuntime && !entry.startingPromise) {
+        await rebalanceActiveMeshes(myGen, user).catch((err) => {
+          if (workspaceGenRef.current !== myGen) return;
+          if (
+            err instanceof HttpApiError &&
+            (err.status === 401 || err.code === "csrf_invalid")
+          ) {
+            onSessionExpired();
+          } else {
+            setSecurityEvent({
+              kind: "engine_error",
+              failure: toAppFailure(err),
+            });
+          }
+        });
+      }
+    },
+    [onSessionExpired, publishSnapshot, rebalanceActiveMeshes, user, vault],
+  );
+
+  const renameRoomAlias = useCallback(
+    async (roomId: string, alias: string | null): Promise<void> => {
+      if (!user) return;
+      const entry = roomsRef.current.get(roomId);
+      if (!entry) return;
+
+      entry.metadata = {
+        ...entry.metadata,
+        alias: sanitizeRoomAlias(alias),
+      };
+      publishSnapshot(user.id);
+      await vault.saveRoom(user.id, entry.metadata, entry.roomKeys);
+    },
+    [publishSnapshot, user, vault],
+  );
+
+  const togglePinRoom = useCallback(
+    async (roomId: string): Promise<void> => {
+      if (!user) return;
+      const myGen = workspaceGenRef.current;
+      const entry = roomsRef.current.get(roomId);
+      if (!entry) return;
+
+      entry.metadata = {
+        ...entry.metadata,
+        pinned: !entry.metadata.pinned,
+      };
+      publishSnapshot(user.id);
+      await vault.saveRoom(user.id, entry.metadata, entry.roomKeys);
+      await rebalanceActiveMeshes(myGen, user).catch(() => {});
+    },
+    [publishSnapshot, rebalanceActiveMeshes, user, vault],
+  );
+
+  const leaveRoom = useCallback(
+    async (explicitRoomId?: string): Promise<void> => {
+      const targetRoomId = explicitRoomId ?? selectedRoomIdRef.current;
+      if (!targetRoomId) return;
+
+      const myGen = workspaceGenRef.current;
+      const entry = roomsRef.current.get(targetRoomId);
+      roomsRef.current.delete(targetRoomId);
+
+      if (selectedRoomIdRef.current === targetRoomId) {
+        const remaining = Array.from(roomsRef.current.values()).sort((a, b) =>
+          compareRoomOrder(a.metadata, b.metadata),
+        );
+        selectedRoomIdRef.current = remaining[0]?.metadata.roomId ?? null;
+        setSecurityEvent(null);
+      }
+
+      publishSnapshot(user?.id ?? null);
+
+      if (entry) {
+        await destroyEntryKeysAndEngine(entry);
+      }
+      if (user) {
+        await vault.destroyRoom(user.id, targetRoomId);
+        if (workspaceGenRef.current === myGen && roomsRef.current.size > 0) {
+          await rebalanceActiveMeshes(myGen, user).catch(() => {});
+        }
+      }
+    },
+    [publishSnapshot, rebalanceActiveMeshes, user, vault],
   );
 
   const sendMessage = useCallback(
     async (body: string, replyToMsgId: string | null): Promise<void> => {
-      const rt = runtimeSlot.current;
-      if (!rt) {
+      const selId = selectedRoomIdRef.current;
+      const entry = selId ? roomsRef.current.get(selId) : undefined;
+      const rt = entry?.activeRuntime;
+      if (!user || !entry || !rt) {
         throw new Error("Room session is not active");
       }
+
       const sent = await rt.engine.sendChatMessage(body, replyToMsgId);
-      setMessages((prev) =>
-        mergeOrderedMessages(prev, [...rt.engine.getMessages(), sent]),
-      );
+      entry.messages = mergeOrderedMessages(entry.messages, [
+        ...rt.engine.getMessages(),
+        sent,
+      ]);
+      const nowMs = Math.max(Date.now(), sent.createdAt);
+      entry.metadata = {
+        ...entry.metadata,
+        lastActiveAt: nowMs,
+        lastReadAt: nowMs,
+      };
+      publishSnapshot(user.id);
+
+      await Promise.all([
+        vault.saveRoomMessages(user.id, entry.metadata.roomId, entry.messages),
+        vault.saveRoom(user.id, entry.metadata, entry.roomKeys),
+      ]);
     },
-    [runtimeSlot],
+    [publishSnapshot, user, vault],
   );
 
   const shareFiles = useCallback(
     async (selectedFiles: File[]): Promise<void> => {
-      const rt = runtimeSlot.current;
-      if (!rt) {
+      const selId = selectedRoomIdRef.current;
+      const entry = selId ? roomsRef.current.get(selId) : undefined;
+      const rt = entry?.activeRuntime;
+      if (!user || !entry || !rt) {
         throw new Error("Room session is not active");
       }
+
       for (const file of selectedFiles) {
         const manifest = await rt.engine.shareFile({
           fileName: file.name,
@@ -391,90 +1164,96 @@ export function useRoomSession({
           readChunk: createBrowserFileChunkReader(file),
         });
         rt.chunkStorage.attachLocalSourceBlob(manifest.fileId, file);
-        setFiles((prev) =>
-          mergeOrderedFiles(prev, [...rt.engine.getFiles(), manifest]),
-        );
+        entry.files = mergeOrderedFiles(entry.files, [
+          ...rt.engine.getFiles(),
+          manifest,
+        ]);
         const prog = rt.engine.getTransferProgress(manifest.fileId);
-        setTransfers((prev) => {
-          const next = new Map(prev);
-          next.set(
-            manifest.fileId,
-            prog
-              ? { ...prog }
-              : {
-                  fileId: manifest.fileId,
-                  fileName: manifest.fileName,
-                  fileSize: manifest.fileSize,
-                  totalChunks: manifest.totalChunks,
-                  completedChunks: manifest.totalChunks,
-                  bytesCompleted: manifest.fileSize,
-                  downloadSpeedBytesPerSec: 0,
-                  availableSeeders: 1,
-                  availablePeersWithChunks: 1,
-                  status: "seeding",
-                },
-          );
-          return next;
-        });
+        entry.transfers.set(
+          manifest.fileId,
+          prog
+            ? { ...prog }
+            : {
+                fileId: manifest.fileId,
+                fileName: manifest.fileName,
+                fileSize: manifest.fileSize,
+                totalChunks: manifest.totalChunks,
+                completedChunks: manifest.totalChunks,
+                bytesCompleted: manifest.fileSize,
+                downloadSpeedBytesPerSec: 0,
+                availableSeeders: 1,
+                availablePeersWithChunks: 1,
+                status: "seeding",
+              },
+        );
+        entry.metadata = {
+          ...entry.metadata,
+          lastActiveAt: Date.now(),
+        };
+        publishSnapshot(user.id);
+
+        await Promise.all([
+          vault.saveRoomFiles(user.id, entry.metadata.roomId, entry.files),
+          vault.saveRoom(user.id, entry.metadata, entry.roomKeys),
+        ]);
       }
     },
-    [runtimeSlot],
+    [publishSnapshot, user, vault],
   );
 
   const downloadFile = useCallback(
     async (fileId: string): Promise<void> => {
-      const rt = runtimeSlot.current;
-      if (!rt) return;
+      const selId = selectedRoomIdRef.current;
+      const entry = selId ? roomsRef.current.get(selId) : undefined;
+      const rt = entry?.activeRuntime;
+      if (!user || !entry || !rt) return;
+
       await rt.engine.downloadFile(fileId);
       const prog = rt.engine.getTransferProgress(fileId);
       if (prog) {
-        setTransfers((prev) => {
-          const next = new Map(prev);
-          next.set(fileId, { ...prog });
-          return next;
-        });
+        entry.transfers.set(fileId, { ...prog });
+        publishSnapshot(user.id);
       }
     },
-    [runtimeSlot],
+    [publishSnapshot, user],
   );
 
   const cancelDownload = useCallback(
     async (fileId: string): Promise<void> => {
-      const rt = runtimeSlot.current;
-      if (!rt) return;
+      const selId = selectedRoomIdRef.current;
+      const entry = selId ? roomsRef.current.get(selId) : undefined;
+      const rt = entry?.activeRuntime;
+      if (!user || !entry || !rt) return;
+
       await rt.engine.cancelDownload(fileId);
       const prog = rt.engine.getTransferProgress(fileId);
-      setTransfers((prev) => {
-        const next = new Map(prev);
-        if (prog) {
-          next.set(fileId, { ...prog });
-        }
-        return next;
-      });
+      if (prog) {
+        entry.transfers.set(fileId, { ...prog });
+        publishSnapshot(user.id);
+      }
     },
-    [runtimeSlot],
+    [publishSnapshot, user],
   );
 
-  const saveFile = useCallback(
-    async (manifest: FileManifest): Promise<void> => {
-      const rt = runtimeSlot.current;
-      if (!rt) return;
-      await rt.chunkStorage.triggerBrowserDownload(
-        manifest.fileId,
-        manifest.fileName,
-        manifest.mimeType,
-      );
-    },
-    [runtimeSlot],
-  );
+  const saveFile = useCallback(async (manifest: FileManifest): Promise<void> => {
+    const selId = selectedRoomIdRef.current;
+    const entry = selId ? roomsRef.current.get(selId) : undefined;
+    const rt = entry?.activeRuntime;
+    if (!rt) return;
 
-  const canSaveFile = useCallback(
-    (fileId: string): boolean => {
-      const rt = runtimeSlot.current;
-      return rt ? rt.chunkStorage.isSaveAvailable(fileId) : false;
-    },
-    [runtimeSlot],
-  );
+    await rt.chunkStorage.triggerBrowserDownload(
+      manifest.fileId,
+      manifest.fileName,
+      manifest.mimeType,
+    );
+  }, []);
+
+  const canSaveFile = useCallback((fileId: string): boolean => {
+    const selId = selectedRoomIdRef.current;
+    const entry = selId ? roomsRef.current.get(selId) : undefined;
+    const rt = entry?.activeRuntime;
+    return rt ? rt.chunkStorage.isSaveAvailable(fileId) : false;
+  }, []);
 
   const clearJoinFailure = useCallback((): void => {
     setJoinFailure(null);
@@ -484,22 +1263,35 @@ export function useRoomSession({
     setSecurityEvent(null);
   }, []);
 
+  const hydrating = user !== null && hydratedUserId !== user.id;
+  const inRoom = !hydrating && snapshot.rooms.length > 0;
+
   return {
+    hydrating,
     inRoom,
     joinPhase,
     joinFailure,
     clearJoinFailure,
-    roomIdPrefix,
-    localPeerId,
-    centerConnected,
-    peers,
-    messages,
-    files,
-    transfers,
+    rooms: snapshot.rooms,
+    selectedRoomId: snapshot.selectedRoomId,
+    selectedRoomAlias: snapshot.selectedRoomAlias,
+    selectedRoomStatus: snapshot.selectedRoomStatus,
+    roomIdPrefix: snapshot.roomIdPrefix,
+    localPeerId: snapshot.localPeerId,
+    centerConnected: snapshot.centerConnected,
+    peers: snapshot.peers,
+    messages: snapshot.messages,
+    files: snapshot.files,
+    transfers: snapshot.transfers,
     securityEvent,
     dismissSecurityEvent,
     joinRoom,
+    selectRoom,
+    renameRoomAlias,
+    togglePinRoom,
     leaveRoom,
+    disconnectAllPreservingVault,
+    wipeLocalVault,
     sendMessage,
     shareFiles,
     downloadFile,

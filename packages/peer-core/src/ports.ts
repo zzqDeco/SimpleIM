@@ -175,6 +175,8 @@ export interface RoomPeerEngineOptions {
   signaling: SignalingClientPort;
   transportFactory: PeerTransportFactoryPort;
   chunkStorage: ChunkStoragePort;
+  initialMessages?: readonly ChatMessageEnvelope[];
+  initialFiles?: readonly FileManifest[];
   events?: RoomPeerEngineEvents;
   maxInFlightPerPeer?: number;
   requestTimeoutMs?: number;

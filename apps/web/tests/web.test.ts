@@ -39,12 +39,19 @@ import {
 } from "../src/i18n/registry.ts";
 import { LOCALE_CODES, type TranslationKey } from "../src/i18n/types.ts";
 import { deriveMessageViewModel } from "../src/state/message-vm.ts";
+import {
+  buildSortedRoomSummaries,
+  computeUnreadCount,
+  MAX_ACTIVE_MESH_ROOMS,
+  selectActiveMeshRoomIds,
+} from "../src/state/room-list-vm.ts";
 import { RoomRuntimeSlot } from "../src/state/runtime-slot.ts";
 import {
   countActiveDownloads,
   deriveTransferViewModel,
 } from "../src/state/transfer-vm.ts";
 import {
+  sanitizeRoomAlias,
   validateAuthInput,
   validateRoomPassphrase,
 } from "../src/state/validation.ts";
@@ -65,7 +72,13 @@ import {
   type OpfsSyncAccessHandleLike,
   type WebLocksLike,
 } from "../src/storage/opfs-protocol.ts";
+import {
+  InMemoryVaultBackend,
+  RoomVault,
+  type VaultRoomMetadata,
+} from "../src/storage/room-vault.ts";
 import { BrowserSignalingClient } from "../src/transport/browser-signaling.ts";
+import { MultiplexedSignalingHub } from "../src/transport/multiplexed-signaling.ts";
 import {
   formatBytes,
   formatMessageTime,
@@ -1276,5 +1289,258 @@ describe("Theme Engine, Pure State ViewModels & CSS Token Purity", () => {
         `${cssFile} must use CSS variables from tokens.css only`,
       ).toBeNull();
     }
+  });
+});
+
+describe("Encrypted RoomVault, MultiplexedSignalingHub & Persistent Room List VM", () => {
+  test("RoomVault encrypts keys/messages/files with non-extractable AES-GCM-256, rejects tampering & cross-user AAD, and supports destroyRoom / wipeUserVault", async () => {
+    const backend = new InMemoryVaultBackend();
+    const vault = new RoomVault(backend);
+
+    const userAlice = "usr_019a0000000070008000000000000001";
+    const userBob = "usr_019a0000000070008000000000000002";
+
+    const keys1 = deriveRoomKeys("vault-secret-alpha", {
+      memoryKiB: 64,
+      iterations: 1,
+    });
+    const keys2 = deriveRoomKeys("vault-secret-beta", {
+      memoryKiB: 64,
+      iterations: 1,
+    });
+
+    const meta1: VaultRoomMetadata = {
+      roomId: keys1.roomId,
+      roomIdPrefix: keys1.roomIdPrefix,
+      alias: sanitizeRoomAlias("  研发核心群  "),
+      pinned: true,
+      joinedAt: 1_763_000_000_000,
+      lastActiveAt: 1_763_000_050_000,
+      lastReadAt: 1_763_000_050_000,
+    };
+    const meta2: VaultRoomMetadata = {
+      roomId: keys2.roomId,
+      roomIdPrefix: keys2.roomIdPrefix,
+      alias: null,
+      pinned: false,
+      joinedAt: 1_763_000_010_000,
+      lastActiveAt: 1_763_000_020_000,
+      lastReadAt: 0,
+    };
+
+    const dummyFile = buildDummyManifest({
+      fileId: "019a0000-0000-7000-8000-000000000951",
+      fileName: "vault-doc.pdf",
+      fileSize: 4096,
+      totalChunks: 1,
+    });
+    const scopedFile: FileManifest = { ...dummyFile, roomId: keys1.roomId };
+    const scopedMsg: ChatMessageEnvelope = {
+      msgId: "019a0000-0000-7000-8000-000000000952",
+      roomId: keys1.roomId,
+      lamport: 7,
+      createdAt: 1_763_000_050_000,
+      replyToMsgId: null,
+      body: "Top-secret vaulted discussion",
+      authorCert: dummyFile.senderCert,
+      authorSig: "C".repeat(86),
+    };
+
+    await vault.saveRoom(userAlice, meta1, keys1);
+    await vault.saveRoomMessages(userAlice, keys1.roomId, [scopedMsg]);
+    await vault.saveRoomFiles(userAlice, keys1.roomId, [scopedFile]);
+    await vault.saveRoom(userAlice, meta2, keys2);
+    await vault.saveRoom(userBob, meta2, keys2);
+
+    const deviceKey = await backend.getDeviceKey(userAlice);
+    expect(deviceKey).not.toBeNull();
+    expect(deviceKey!.extractable).toBe(false);
+
+    // Verify raw ciphertext never leaks plaintext alias or message body
+    const rawCipher = backend.rawInspectRoomCiphertext(userAlice, keys1.roomId);
+    expect(rawCipher).toBeDefined();
+    const rawText = new TextDecoder().decode(rawCipher!.ciphertext);
+    expect(rawText).not.toContain("研发核心群");
+    expect(rawText).not.toContain(keys1.roomIdPrefix);
+
+    const loaded = await vault.loadWorkspace(userAlice);
+    expect(loaded.length).toBe(2);
+    const r1 = loaded.find((r) => r.metadata.roomId === keys1.roomId)!;
+    expect(r1.metadata.alias).toBe("研发核心群");
+    expect(r1.metadata.pinned).toBe(true);
+    expect(r1.roomKeys.signalingKey).toEqual(keys1.signalingKey);
+    expect(r1.roomKeys.roomAuthKey).toEqual(keys1.roomAuthKey);
+    expect(r1.roomKeys.roomAppKey).toEqual(keys1.roomAppKey);
+    expect(r1.messages.map((m) => m.body)).toEqual([
+      "Top-secret vaulted discussion",
+    ]);
+    expect(r1.files.map((f) => f.fileName)).toEqual(["vault-doc.pdf"]);
+
+    // Cross-user AAD check: copying Alice's room ciphertext under Bob's userId must fail decryption
+    await backend.putRoomEntry(userBob, keys1.roomId, rawCipher!);
+    const bobLoaded = await vault.loadWorkspace(userBob);
+    expect(bobLoaded.map((r) => r.metadata.roomId)).toEqual([keys2.roomId]);
+
+    // Tampering message ciphertext rejects corrupted history cleanly while keeping room membership
+    backend.tamperMessagesCiphertext(userAlice, keys1.roomId);
+    const afterTamper = await vault.loadWorkspace(userAlice);
+    expect(
+      afterTamper.find((r) => r.metadata.roomId === keys1.roomId)?.messages,
+    ).toEqual([]);
+
+    // Per-room leave destroys only keys1
+    await vault.destroyRoom(userAlice, keys1.roomId);
+    const afterDestroyOne = await vault.loadWorkspace(userAlice);
+    expect(afterDestroyOne.map((r) => r.metadata.roomId)).toEqual([keys2.roomId]);
+
+    // Explicit wipeUserVault wipes Alice completely without touching Bob
+    await vault.wipeUserVault(userAlice);
+    expect(await vault.loadWorkspace(userAlice)).toEqual([]);
+    expect((await vault.loadWorkspace(userBob)).length).toBe(1);
+  });
+
+  test("MultiplexedSignalingHub routes frames by roomId over one shared transport and keeps socket open on partial room leave", async () => {
+    let connectCount = 0;
+    let disconnectCount = 0;
+    let connected = false;
+    const sentFrames: unknown[] = [];
+    const serverHandlers = new Set<(frame: any) => void>();
+    const connHandlers = new Set<(c: boolean) => void>();
+
+    const mockTransport = {
+      get isConnected() {
+        return connected;
+      },
+      async connect() {
+        connectCount += 1;
+        connected = true;
+        for (const h of connHandlers) h(true);
+      },
+      send(frame: unknown) {
+        sentFrames.push(frame);
+      },
+      disconnect() {
+        disconnectCount += 1;
+        connected = false;
+        for (const h of connHandlers) h(false);
+      },
+      onServerFrame(h: (f: any) => void) {
+        serverHandlers.add(h);
+      },
+      onConnectionChange(h: (c: boolean) => void) {
+        connHandlers.add(h);
+      },
+    };
+
+    const hub = new MultiplexedSignalingHub(mockTransport);
+    const roomA = "a".repeat(64);
+    const roomB = "b".repeat(64);
+
+    const portA = hub.createRoomPort(roomA);
+    const portB = hub.createRoomPort(roomB);
+
+    const receivedA: any[] = [];
+    const receivedB: any[] = [];
+    portA.onServerFrame((f) => receivedA.push(f));
+    portB.onServerFrame((f) => receivedB.push(f));
+
+    await Promise.all([portA.connect(), portB.connect()]);
+    expect(connectCount).toBe(1);
+    expect(portA.isConnected).toBe(true);
+    expect(portB.isConnected).toBe(true);
+
+    // Deliver room-specific frames -> strictly isolated
+    for (const h of serverHandlers) {
+      h({ type: "room.joined", roomId: roomA, peers: ["peer_1"] });
+      h({ type: "room.peer_joined", roomId: roomB, peerId: "peer_2" });
+      h({ type: "error", code: "rate_limited", message: "Global", roomId: undefined });
+    }
+
+    expect(receivedA.map((f) => f.type)).toEqual(["room.joined", "error"]);
+    expect(receivedB.map((f) => f.type)).toEqual(["room.peer_joined", "error"]);
+
+    // Leaving Room A detaches portA without closing shared transport for Room B
+    portA.disconnect();
+    expect(disconnectCount).toBe(0);
+    expect(portB.isConnected).toBe(true);
+
+    // Leaving the last room (Room B) closes the shared transport cleanly
+    portB.disconnect();
+    expect(disconnectCount).toBe(1);
+    expect(hub.isConnected).toBe(false);
+  });
+
+  test("buildSortedRoomSummaries, computeUnreadCount, selectActiveMeshRoomIds, and cross-session isSelf work deterministically", () => {
+    const manifest = buildDummyManifest({
+      fileId: "019a0000-0000-7000-8000-000000000961",
+      fileName: "a.bin",
+      fileSize: 10,
+      totalChunks: 1,
+    });
+    const aliceUserId = manifest.senderCert.payload.userId;
+
+    const msgFromAliceOldTab: ChatMessageEnvelope = {
+      msgId: "019a0000-0000-7000-8000-000000000962",
+      roomId: "1".repeat(64),
+      lamport: 1,
+      createdAt: 2_000,
+      replyToMsgId: null,
+      body: "Sent from previous tab before reload",
+      authorCert: manifest.senderCert,
+      authorSig: "D".repeat(86),
+    };
+
+    // Even with a brand-new localPeerId after page reload, currentUserId recognizes own messages as isSelf
+    const vmAfterReload = deriveMessageViewModel(
+      msgFromAliceOldTab,
+      "peer_brand_new_after_reload",
+      new Map([[msgFromAliceOldTab.msgId, msgFromAliceOldTab]]),
+      aliceUserId,
+    );
+    expect(vmAfterReload.isSelf).toBe(true);
+    expect(computeUnreadCount([msgFromAliceOldTab], 1_000, aliceUserId)).toBe(0);
+    expect(computeUnreadCount([msgFromAliceOldTab], 1_000, "usr_someone_else")).toBe(1);
+
+    const summaries = buildSortedRoomSummaries(
+      [
+        {
+          roomId: "1".repeat(64),
+          roomIdPrefix: "11111111",
+          alias: "Normal Newer",
+          pinned: false,
+          joinedAt: 100,
+          lastActiveAt: 500,
+          lastReadAt: 100,
+          messages: [msgFromAliceOldTab],
+          peerCount: 2,
+          fileCount: 0,
+          connectionStatus: "connected",
+        },
+        {
+          roomId: "2".repeat(64),
+          roomIdPrefix: "22222222",
+          alias: "Pinned Older",
+          pinned: true,
+          joinedAt: 50,
+          lastActiveAt: 200,
+          lastReadAt: 200,
+          messages: [],
+          peerCount: 0,
+          fileCount: 0,
+          connectionStatus: "standby",
+        },
+      ],
+      "usr_someone_else",
+    );
+    expect(summaries.map((s) => s.alias)).toEqual(["Pinned Older", "Normal Newer"]);
+    expect(summaries[1]?.unreadCount).toBe(1);
+
+    const tenRooms = Array.from({ length: 10 }, (_, idx) =>
+      String(idx).repeat(64),
+    );
+    const activeSet = selectActiveMeshRoomIds(tenRooms, tenRooms[9]!);
+    expect(activeSet.size).toBe(MAX_ACTIVE_MESH_ROOMS);
+    expect(activeSet.has(tenRooms[9]!)).toBe(true);
+    expect(activeSet.has(tenRooms[0]!)).toBe(true);
   });
 });

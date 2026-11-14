@@ -34,6 +34,16 @@ export function validateAuthInput(
   return null;
 }
 
+export const MAX_ROOM_ALIAS_CHARS = 32;
+
+export function sanitizeRoomAlias(
+  raw: string | null | undefined,
+): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().slice(0, MAX_ROOM_ALIAS_CHARS);
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 export function validateRoomPassphrase(
   rawPassphrase: string,
 ): ValidationErrorKey | null {

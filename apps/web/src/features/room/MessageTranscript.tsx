@@ -8,12 +8,14 @@ import { SafeMarkdown } from "../../utils/markdown.tsx";
 export interface MessageTranscriptProps {
   readonly messages: readonly ChatMessageEnvelope[];
   readonly localPeerId: string;
+  readonly currentUserId: string;
   readonly onReply: (msg: ChatMessageEnvelope) => void;
 }
 
 export function MessageTranscript({
   messages,
   localPeerId,
+  currentUserId,
   onReply,
 }: MessageTranscriptProps): ReactElement {
   const { t } = useI18n();
@@ -24,8 +26,10 @@ export function MessageTranscript({
     for (const msg of messages) {
       byId.set(msg.msgId, msg);
     }
-    return messages.map((msg) => deriveMessageViewModel(msg, localPeerId, byId));
-  }, [localPeerId, messages]);
+    return messages.map((msg) =>
+      deriveMessageViewModel(msg, localPeerId, byId, currentUserId),
+    );
+  }, [currentUserId, localPeerId, messages]);
 
   useEffect(() => {
     streamEndRef.current?.scrollIntoView({ block: "end" });
