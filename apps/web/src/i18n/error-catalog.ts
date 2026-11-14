@@ -17,7 +17,8 @@ export type AppFailure =
   | { readonly kind: "api"; readonly code: ErrorCode }
   | { readonly kind: "validation"; readonly key: ValidationErrorKey }
   | { readonly kind: "network" }
-  | { readonly kind: "room_inactive" };
+  | { readonly kind: "room_inactive" }
+  | { readonly kind: "runtime"; readonly detail: string };
 
 const ERROR_CODE_TO_KEY: Readonly<Record<ErrorCode, TranslationKey>> = {
   invalid_arguments: "error.invalid_arguments",
@@ -38,6 +39,11 @@ const ERROR_CODE_TO_KEY: Readonly<Record<ErrorCode, TranslationKey>> = {
   channel_binding_mismatch: "error.channel_binding_mismatch",
   chunk_hash_mismatch: "error.chunk_hash_mismatch",
 };
+
+const SIGNALING_ERROR_PREFIX_RE = /^Signaling error \[([a-z0-9_]+)\]:/i;
+const INACTIVE_ROOM_RE = /\b(?:not active|is stopped)\b/i;
+const NETWORK_TRANSPORT_RE =
+  /(?:failed to fetch|networkerror|load failed|signaling websocket|websocket closed)/i;
 
 function isKnownErrorCode(value: unknown): value is ErrorCode {
   return (
@@ -74,13 +80,36 @@ export function toAppFailure(err: unknown): AppFailure {
       code: (err as { code: ErrorCode }).code,
     };
   }
+
   if (err instanceof TypeError) {
     return { kind: "network" };
   }
-  if (err instanceof Error && /not active/i.test(err.message)) {
-    return { kind: "room_inactive" };
+
+  if (err instanceof Error) {
+    const sigMatch = SIGNALING_ERROR_PREFIX_RE.exec(err.message);
+    if (sigMatch) {
+      const parsedCode = sigMatch[1]?.toLowerCase();
+      return {
+        kind: "api",
+        code: isKnownErrorCode(parsedCode) ? parsedCode : "internal_error",
+      };
+    }
+
+    if (INACTIVE_ROOM_RE.test(err.message)) {
+      return { kind: "room_inactive" };
+    }
+
+    if (NETWORK_TRANSPORT_RE.test(err.message)) {
+      return { kind: "network" };
+    }
+
+    const trimmed = err.message.trim();
+    if (trimmed.length > 0) {
+      return { kind: "runtime", detail: trimmed };
+    }
   }
-  return { kind: "network" };
+
+  return { kind: "api", code: "internal_error" };
 }
 
 export function formatAppFailure(failure: AppFailure, t: TranslateFn): string {
@@ -93,5 +122,7 @@ export function formatAppFailure(failure: AppFailure, t: TranslateFn): string {
       return t("error.room_inactive");
     case "network":
       return t("error.network");
+    case "runtime":
+      return failure.detail;
   }
 }

@@ -6,12 +6,13 @@ import type {
 } from "@simpleim/contracts";
 import { ChatSyncManager } from "./chat-sync.ts";
 import { MeshSessionManager } from "./mesh-session.ts";
-import type {
-  RoomPeerEngine,
-  RoomPeerEngineOptions,
-  ShareFileInput,
-  SwarmTransferProgress,
-  VerifiedPeerInfo,
+import {
+  SignalingServerError,
+  type RoomPeerEngine,
+  type RoomPeerEngineOptions,
+  type ShareFileInput,
+  type SwarmTransferProgress,
+  type VerifiedPeerInfo,
 } from "./ports.ts";
 import { SwarmScheduler } from "./swarm-scheduler.ts";
 
@@ -271,7 +272,7 @@ export function createRoomPeerEngine(
       case "error":
         if (frame.roomId === undefined || frame.roomId === roomId) {
           events?.onError?.(
-            new Error(`Signaling error [${frame.code}]: ${frame.message}`),
+            new SignalingServerError(frame.code, frame.message, frame.roomId),
           );
         }
         break;

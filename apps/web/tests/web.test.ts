@@ -16,6 +16,7 @@ import {
   issuePeerIdentityCert,
   sha256Hex,
 } from "@simpleim/crypto";
+import { SignalingServerError } from "@simpleim/peer-core";
 import { HttpApiError, HttpAuthClient } from "../src/api/http-client.ts";
 import { deriveRoomKeysOffThread } from "../src/crypto/kdf-client.ts";
 import {
@@ -1044,6 +1045,42 @@ describe("Multi-Language i18n Engine & Error Code Catalog", () => {
         expect(localized).not.toBe("raw server msg");
       }
     }
+
+    // SignalingServerError (room_full / room_limit_exceeded / rate_limited) preserves structured code
+    const fullErr = new SignalingServerError("room_full", "Room is full", "a".repeat(64));
+    expect(toAppFailure(fullErr)).toEqual({ kind: "api", code: "room_full" });
+    expect(
+      formatAppFailure(toAppFailure(fullErr), (k, p) => translate("zh-CN", k, p)),
+    ).toBe("当前房间人数已满。");
+    expect(
+      formatAppFailure(toAppFailure(fullErr), (k, p) => translate("en", k, p)),
+    ).toBe("This room has reached its peer limit.");
+
+    // Plain stringified signaling Error also preserves structured ErrorCode instead of falling back to network
+    const plainLimitErr = new Error(
+      "Signaling error [room_limit_exceeded]: Too many concurrent rooms",
+    );
+    expect(toAppFailure(plainLimitErr)).toEqual({
+      kind: "api",
+      code: "room_limit_exceeded",
+    });
+
+    // Genuine network vs inactive room vs local runtime failure classification
+    expect(toAppFailure(new TypeError("Failed to fetch"))).toEqual({
+      kind: "network",
+    });
+    expect(
+      toAppFailure(new Error("Signaling WebSocket closed before open (code 1006)")),
+    ).toEqual({ kind: "network" });
+    expect(toAppFailure(new Error("RoomPeerEngine is stopped"))).toEqual({
+      kind: "room_inactive",
+    });
+    expect(
+      toAppFailure(new Error("File size 131072 exceeds in-memory fallback cap")),
+    ).toEqual({
+      kind: "runtime",
+      detail: "File size 131072 exceeds in-memory fallback cap",
+    });
   });
 });
 

@@ -26,6 +26,7 @@ import {
 } from "@simpleim/crypto";
 import {
   createRoomPeerEngine,
+  SignalingServerError,
   type RoomPeerEngine,
   type RoomPeerEngineEvents,
 } from "../src/index.ts";
@@ -2257,6 +2258,39 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
           honestSeeder3.engine.stop(),
           receiver4.engine.stop(),
         ]);
+      }
+    }
+
+    // 8d. Signaling server error frames preserve structured ErrorCode via SignalingServerError
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+      const observedErrors: Error[] = [];
+      const rig = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_sig_err_01",
+        username: "sigerr",
+        extraEvents: {
+          onError: (err) => observedErrors.push(err),
+        },
+      });
+
+      try {
+        await rig.engine.start();
+        rig.signaling.deliverFromServer({
+          type: "error",
+          code: "room_full",
+          message: "Room capacity reached",
+          roomId: roomKeys.roomId,
+        });
+        await waitFor(() => observedErrors.length === 1);
+        expect(observedErrors[0]).toBeInstanceOf(SignalingServerError);
+        expect((observedErrors[0] as SignalingServerError).code).toBe("room_full");
+      } finally {
+        await rig.engine.stop();
       }
     }
   });
