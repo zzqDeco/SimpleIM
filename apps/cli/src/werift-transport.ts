@@ -23,10 +23,56 @@ import {
   RTCCertificate,
   RTCPeerConnection,
   SignatureAlgorithm,
+  UdpTransport,
   type PeerConfig,
   type RTCDataChannel,
   type RTCIceServer,
 } from "werift";
+
+const WERIFT_UDP_ERROR_GUARDED = Symbol.for("simpleim.werift.udpErrorGuarded");
+
+function attachSafeSocketErrorHandler(emitterCandidate: unknown): void {
+  const emitter = emitterCandidate as
+    | {
+        listenerCount?: (event: string) => number;
+        on?: (event: string, listener: (err: unknown) => void) => void;
+      }
+    | null
+    | undefined;
+  if (
+    emitter &&
+    typeof emitter.listenerCount === "function" &&
+    typeof emitter.on === "function" &&
+    emitter.listenerCount("error") === 0
+  ) {
+    emitter.on("error", () => {
+      // Absorb transient UDP/ICMP errors (e.g. Linux recvmsg ECONNREFUSED when a remote peer closes its port)
+    });
+  }
+}
+
+function ensureWeriftUdpTransportGuarded(): void {
+  const proto = (
+    UdpTransport as unknown as {
+      prototype?: {
+        init?: () => Promise<void>;
+        socket?: unknown;
+        [WERIFT_UDP_ERROR_GUARDED]?: boolean;
+      };
+    }
+  ).prototype;
+  if (!proto || typeof proto.init !== "function" || proto[WERIFT_UDP_ERROR_GUARDED]) {
+    return;
+  }
+  const origInit = proto.init;
+  proto[WERIFT_UDP_ERROR_GUARDED] = true;
+  proto.init = async function guardedUdpTransportInit(this: {
+    socket?: unknown;
+  }): Promise<void> {
+    attachSafeSocketErrorHandler(this.socket);
+    return origInit.call(this);
+  };
+}
 
 export interface NetworkInterfaceProbeSuccess {
   readonly ok: true;
@@ -456,6 +502,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
         : {}),
     };
 
+    ensureWeriftUdpTransportGuarded();
     this.pc = new RTCPeerConnection(peerConfig);
     // Replace default STUN array explicitly because werift's deepMerge preserves default array items when given []
     this.pc.config.iceServers = mapped.iceServers;
@@ -486,6 +533,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     );
 
     this.pc.onIceCandidate.subscribe((candidate) => {
+      this.guardIceSocketErrors();
       if (this.closed) return;
       if (!candidate || !candidate.candidate) {
         this.emitOrBufferLocalIce("end");
@@ -511,6 +559,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     });
 
     this.pc.iceGatheringStateChange.subscribe((gState) => {
+      this.guardIceSocketErrors();
       if (this.closed) return;
       if (gState === "complete") {
         this.emitOrBufferLocalIce("end");
@@ -518,6 +567,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     });
 
     this.pc.connectionStateChange.subscribe((rawState) => {
+      this.guardIceSocketErrors();
       if (this.closed && rawState !== "closed") return;
       const next = mapPcState(rawState);
       if (next !== this.currentState) {
@@ -538,27 +588,28 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     return mapPcState(this.pc.connectionState);
   }
 
-  private guardMdnsLookupErrors(): void {
+  private guardIceSocketErrors(): void {
+    type InternalProtocol = {
+      transport?: { socket?: unknown };
+      turn?: { transport?: { socket?: unknown } };
+    };
     for (const iceTransport of this.pc.iceTransports) {
       const conn = iceTransport.connection as unknown as {
-        lookup?: {
-          mdnsInstance?: {
-            listenerCount?: (event: string) => number;
-            on?: (event: string, listener: (err: unknown) => void) => void;
-          };
-        };
+        lookup?: { mdnsInstance?: unknown };
+        protocols?: InternalProtocol[];
+        nominated?: { protocol?: InternalProtocol };
       };
-      const mdnsInstance = conn.lookup?.mdnsInstance;
-      if (
-        mdnsInstance &&
-        typeof mdnsInstance.listenerCount === "function" &&
-        typeof mdnsInstance.on === "function" &&
-        mdnsInstance.listenerCount("error") === 0
-      ) {
-        mdnsInstance.on("error", () => {
-          // Prevent unhandled EventEmitter 'error' crash if UDP 5353 bind fails
-        });
+      attachSafeSocketErrorHandler(conn.lookup?.mdnsInstance);
+      if (Array.isArray(conn.protocols)) {
+        for (const proto of conn.protocols) {
+          attachSafeSocketErrorHandler(proto?.transport?.socket);
+          attachSafeSocketErrorHandler(proto?.turn?.transport?.socket);
+        }
       }
+      attachSafeSocketErrorHandler(conn.nominated?.protocol?.transport?.socket);
+      attachSafeSocketErrorHandler(
+        conn.nominated?.protocol?.turn?.transport?.socket,
+      );
     }
   }
 
@@ -605,6 +656,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
       this.localFingerprintCache = extractSdpSha256Fingerprint(sdp);
       return sdp;
     } finally {
+      this.guardIceSocketErrors();
       this.deferLocalIce = false;
       queueMicrotask(() => this.flushBufferedLocalIce());
     }
@@ -629,7 +681,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
         sdp: sanitizedOfferSdp,
       });
     } finally {
-      this.guardMdnsLookupErrors();
+      this.guardIceSocketErrors();
     }
     this.remoteDescriptionReady = true;
     await this.flushPendingRemoteIce();
@@ -643,6 +695,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
       this.localFingerprintCache = extractSdpSha256Fingerprint(sdp);
       return sdp;
     } finally {
+      this.guardIceSocketErrors();
       this.deferLocalIce = false;
       queueMicrotask(() => this.flushBufferedLocalIce());
     }
@@ -662,7 +715,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
         sdp: sanitizedAnswerSdp,
       });
     } finally {
-      this.guardMdnsLookupErrors();
+      this.guardIceSocketErrors();
     }
     this.remoteDescriptionReady = true;
     await this.flushPendingRemoteIce();
@@ -721,7 +774,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     } catch {
       // Safely ignore unsupported browser candidate extensions (e.g. typ prflx / mDNS)
     } finally {
-      this.guardMdnsLookupErrors();
+      this.guardIceSocketErrors();
     }
   }
 

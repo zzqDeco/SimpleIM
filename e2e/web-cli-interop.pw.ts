@@ -576,4 +576,195 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       await context.close();
     }
   });
+
+  test("persists encrypted room vault across page reload & default sign-out, tracks multi-room unread badges, and wipes cache on Wipe & Sign Out", async ({
+    browser,
+  }) => {
+    const cluster = await harness.call<{
+      webOrigin: string;
+      apiUrl: string;
+      sqlitePath: string;
+    }>("startCluster");
+
+    const alphaPassphrase = "persistent-alpha-group-2026";
+    const betaPassphrase = "persistent-beta-group-2026";
+
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    try {
+      // 1. Register & join Alpha room with a local alias, paired with a live CLI peer
+      await page.goto(cluster.webOrigin);
+      await page.getByTestId("auth-tab-register").click();
+      await page.getByTestId("auth-username").fill("persist_alice");
+      await page.getByTestId("auth-display-name").fill("Persist Alice");
+      await page.getByTestId("auth-password").fill("Password-Persist-123!");
+      await page.getByTestId("auth-submit").click();
+
+      await expect(page.getByTestId("room-passphrase")).toBeVisible();
+      await page.getByTestId("room-passphrase").fill(alphaPassphrase);
+      await page.getByTestId("room-alias").fill("研发核心群");
+      await page.getByTestId("room-join-submit").click();
+
+      await expect(page.getByTestId("connection-badge")).toHaveAttribute(
+        "data-connection-state",
+        "connected",
+        { timeout: 25_000 },
+      );
+
+      const cliBob = await harness.call<{ peerId: string; username: string }>(
+        "spawnCliPeer",
+        {
+          username: "cli_persist_bob",
+          displayName: "Persist Bob CLI",
+          password: "Password-PersistBob-123!",
+          passphrase: alphaPassphrase,
+        },
+      );
+
+      await expect(page.getByTestId("peer-list")).toContainText(
+        "@cli_persist_bob",
+        { timeout: 20_000 },
+      );
+
+      await page
+        .getByTestId("chat-input")
+        .fill("History message #1 from Alice before reload");
+      await page.getByTestId("chat-send").click();
+
+      await harness.call("cliSendChat", {
+        peerId: cliBob.peerId,
+        body: "History message #2 from CLI Bob before reload",
+      });
+      await expect(page.locator(".message-stream")).toContainText(
+        "History message #2 from CLI Bob before reload",
+      );
+
+      // 2. Reload browser page -> auto-restores room & history WITHOUT re-entering passphrase, and reconnects P2P mesh!
+      await page.reload();
+
+      await expect(page.getByTestId("room-list-rail")).toContainText(
+        "研发核心群",
+        { timeout: 15_000 },
+      );
+      await expect(page.getByTestId("room-passphrase")).toHaveCount(0);
+      await expect(page.locator(".message-stream")).toContainText(
+        "History message #1 from Alice before reload",
+      );
+      await expect(page.locator(".message-stream")).toContainText(
+        "History message #2 from CLI Bob before reload",
+      );
+
+      await expect(page.getByTestId("connection-badge")).toHaveAttribute(
+        "data-connection-state",
+        "connected",
+        { timeout: 20_000 },
+      );
+      await expect(page.getByTestId("peer-list")).toContainText(
+        "@cli_persist_bob",
+        { timeout: 20_000 },
+      );
+
+      await harness.call("cliSendChat", {
+        peerId: cliBob.peerId,
+        body: "Post-reload live message #3 from CLI Bob",
+      });
+      await expect(page.locator(".message-stream")).toContainText(
+        "Post-reload live message #3 from CLI Bob",
+      );
+
+      // 3. Join second room (Beta) from RoomListRail -> receive background message in Alpha -> unread badge increments
+      await page.getByTestId("open-join-room-drawer").click();
+      await page.getByTestId("rail-join-passphrase").fill(betaPassphrase);
+      await page.getByTestId("rail-join-alias").fill("运维告警群");
+      await page.getByTestId("rail-join-submit").click();
+
+      await expect(page.getByTestId("room-list-rail")).toContainText(
+        "运维告警群",
+      );
+      await expect(page.locator(".message-stream")).not.toContainText(
+        "History message #1 from Alice before reload",
+      );
+
+      // CLI Bob sends message in Alpha while Alice is viewing Beta
+      await harness.call("cliSendChat", {
+        peerId: cliBob.peerId,
+        body: "Background unread ping in Alpha room!",
+      });
+
+      await expect(page.getByTestId("room-unread-badge")).toHaveText("1", {
+        timeout: 15_000,
+      });
+
+      // Click Alpha room in RoomListRail -> switches back, clears unread badge, displays new message
+      await page
+        .getByTestId("room-list-rail")
+        .locator(".room-item-select", { hasText: "研发核心群" })
+        .click();
+      await expect(page.getByTestId("room-unread-badge")).toHaveCount(0);
+      await expect(page.locator(".message-stream")).toContainText(
+        "Background unread ping in Alpha room!",
+      );
+
+      // 4. Default Sign Out preserves encrypted local RoomVault -> signing back in restores both rooms + history!
+      await page.getByTestId("sign-out-button").click();
+      await expect(page.getByTestId("auth-username")).toBeVisible();
+
+      await page.getByTestId("auth-username").fill("persist_alice");
+      await page.getByTestId("auth-password").fill("Password-Persist-123!");
+      await page.getByTestId("auth-submit").click();
+
+      await expect(page.getByTestId("room-list-rail")).toContainText(
+        "研发核心群",
+        { timeout: 15_000 },
+      );
+      await expect(page.getByTestId("room-list-rail")).toContainText(
+        "运维告警群",
+      );
+      await expect(page.locator(".message-stream")).toContainText(
+        "Background unread ping in Alpha room!",
+      );
+
+      // Zero secrets in localStorage / sessionStorage while vault is populated
+      const storageAudit = await page.evaluate(() => ({
+        localStorageKeys: Object.keys(window.localStorage),
+        sessionStorageKeys: Object.keys(window.sessionStorage),
+      }));
+      expect(storageAudit.localStorageKeys).toEqual([]);
+      expect(storageAudit.sessionStorageKeys).toEqual([]);
+
+      // 5. Explicit "Wipe & Sign Out" wipes local RoomVault -> next login starts fresh on JoinRoomScreen
+      await page.getByTestId("wipe-vault-button").click();
+      await expect(page.getByTestId("auth-username")).toBeVisible();
+
+      await page.getByTestId("auth-username").fill("persist_alice");
+      await page.getByTestId("auth-password").fill("Password-Persist-123!");
+      await page.getByTestId("auth-submit").click();
+
+      await expect(page.getByTestId("room-passphrase")).toBeVisible();
+      await expect(page.getByTestId("room-list-rail")).toHaveCount(0);
+
+      // 6. Final server SQLite & log zero-knowledge audit
+      const sqliteAudit = await harness.call<{
+        tables: string[];
+        leaked: string[];
+      }>("auditSqlite", {
+        forbiddenStrings: [
+          alphaPassphrase,
+          betaPassphrase,
+          "研发核心群",
+          "运维告警群",
+          "Background unread ping in Alpha room!",
+        ],
+      });
+      expect(sqliteAudit.tables).toEqual([
+        "schema_migrations",
+        "sessions",
+        "users",
+      ]);
+      expect(sqliteAudit.leaked).toEqual([]);
+    } finally {
+      await context.close();
+    }
+  });
 });

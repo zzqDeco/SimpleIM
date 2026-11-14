@@ -44,6 +44,8 @@ export class BrowserSignalingClient implements SignalingClientPort {
   private hasConnectedOnce = false;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingConnectPromise: Promise<void> | null = null;
+  private rejectPendingConnect: ((err: Error) => void) | null = null;
 
   private readonly frameHandlers = new Set<(frame: ServerSignalingFrame) => void>();
   private readonly connectionHandlers = new Set<(connected: boolean) => void>();
@@ -65,18 +67,36 @@ export class BrowserSignalingClient implements SignalingClientPort {
     if (this.connected && this.ws?.readyState === WebSocket.OPEN) {
       return Promise.resolve();
     }
+    if (this.pendingConnectPromise) {
+      return this.pendingConnectPromise;
+    }
     this.clearReconnectTimer();
+    this.closeStaleSocket();
     this.active = true;
 
-    return new Promise<void>((resolve, reject) => {
+    const promise = new Promise<void>((resolve, reject) => {
+      this.rejectPendingConnect = reject;
       this.openSocket({
-        onInitialOpen: resolve,
+        onInitialOpen: () => {
+          this.pendingConnectPromise = null;
+          this.rejectPendingConnect = null;
+          resolve();
+        },
         onInitialError: (err) => {
-          this.active = false;
+          this.pendingConnectPromise = null;
+          this.rejectPendingConnect = null;
+          if (!this.hasConnectedOnce) {
+            this.active = false;
+          } else if (this.active) {
+            this.scheduleReconnect();
+          }
           reject(err);
         },
       });
     });
+
+    this.pendingConnectPromise = promise;
+    return promise;
   }
 
   send(frame: ClientSignalingFrame): void {
@@ -103,27 +123,38 @@ export class BrowserSignalingClient implements SignalingClientPort {
   disconnect(): void {
     this.active = false;
     this.clearReconnectTimer();
-    const socket = this.ws;
-    this.ws = null;
-    if (socket) {
-      socket.onopen = null;
-      socket.onmessage = null;
-      socket.onerror = null;
-      socket.onclose = null;
-      try {
-        if (
-          socket.readyState === WebSocket.OPEN ||
-          socket.readyState === WebSocket.CONNECTING
-        ) {
-          socket.close(1000, "client disconnect");
-        }
-      } catch {
-        // Ignore close errors
-      }
+    this.closeStaleSocket();
+
+    const rejectConnect = this.rejectPendingConnect;
+    this.pendingConnectPromise = null;
+    this.rejectPendingConnect = null;
+    if (rejectConnect) {
+      rejectConnect(new Error("Signaling client disconnected"));
     }
+
     if (this.connected) {
       this.connected = false;
       this.emitConnectionChange(false);
+    }
+  }
+
+  private closeStaleSocket(): void {
+    const socket = this.ws;
+    this.ws = null;
+    if (!socket) return;
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    try {
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        socket.close(1000, "client disconnect");
+      }
+    } catch {
+      // Ignore close errors
     }
   }
 

@@ -1,4 +1,4 @@
-import { useRef, type ReactElement } from "react";
+import { useCallback, useRef, type ReactElement } from "react";
 import { NoticeBanner } from "./design-system/index.ts";
 import { AuthScreen } from "./features/auth/AuthScreen.tsx";
 import { JoinRoomScreen } from "./features/lobby/JoinRoomScreen.tsx";
@@ -12,10 +12,12 @@ export { RoomRuntimeSlot } from "./state/runtime-slot.ts";
 
 function AppShell(): ReactElement {
   const { t } = useI18n();
-  const leaveRoomRef = useRef<() => Promise<void>>(async () => {});
+  const disconnectPreservingVaultRef = useRef<() => Promise<void>>(
+    async () => {},
+  );
 
   const auth = useAuthSession({
-    onBeforeSessionReset: () => leaveRoomRef.current(),
+    onBeforeSessionReset: () => disconnectPreservingVaultRef.current(),
   });
 
   const room = useRoomSession({
@@ -24,9 +26,14 @@ function AppShell(): ReactElement {
     onSessionExpired: auth.expireToReauth,
   });
 
-  leaveRoomRef.current = room.leaveRoom;
+  disconnectPreservingVaultRef.current = room.disconnectAllPreservingVault;
 
-  if (auth.bootstrapping) {
+  const handleWipeAndSignOut = useCallback(async (): Promise<void> => {
+    await room.wipeLocalVault();
+    await auth.signOut();
+  }, [auth, room]);
+
+  if (auth.bootstrapping || room.hydrating) {
     return (
       <div className="screen-shell">
         <main className="centered-stage">
@@ -59,6 +66,7 @@ function AppShell(): ReactElement {
         onClearJoinFailure={room.clearJoinFailure}
         onJoinRoom={room.joinRoom}
         onSignOut={auth.signOut}
+        onWipeAndSignOut={handleWipeAndSignOut}
       />
     );
   }
@@ -67,12 +75,23 @@ function AppShell(): ReactElement {
     <RoomScreen
       user={auth.user}
       localPeerId={room.localPeerId}
+      rooms={room.rooms}
+      selectedRoomId={room.selectedRoomId}
+      selectedRoomAlias={room.selectedRoomAlias}
+      selectedRoomStatus={room.selectedRoomStatus}
       roomIdPrefix={room.roomIdPrefix}
       centerConnected={room.centerConnected}
       peers={room.peers}
       messages={room.messages}
       files={room.files}
       transfers={room.transfers}
+      joinPhase={room.joinPhase}
+      joinFailure={room.joinFailure}
+      onClearJoinFailure={room.clearJoinFailure}
+      onJoinRoom={room.joinRoom}
+      onSelectRoom={room.selectRoom}
+      onRenameRoomAlias={room.renameRoomAlias}
+      onTogglePinRoom={room.togglePinRoom}
       securityEvent={room.securityEvent}
       onDismissSecurityEvent={room.dismissSecurityEvent}
       onSendMessage={room.sendMessage}
@@ -81,8 +100,9 @@ function AppShell(): ReactElement {
       onCancelDownload={room.cancelDownload}
       onSaveFile={room.saveFile}
       canSaveFile={room.canSaveFile}
-      onLeaveRoom={room.leaveRoom}
+      onLeaveRoom={() => room.leaveRoom()}
       onSignOut={auth.signOut}
+      onWipeAndSignOut={handleWipeAndSignOut}
     />
   );
 }

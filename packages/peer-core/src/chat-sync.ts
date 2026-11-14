@@ -23,6 +23,7 @@ export interface ChatSyncManagerOptions {
   localSignKeyPair: Ed25519KeyPair;
   serverSignPubKey: string;
   now: () => number;
+  initialMessages?: readonly ChatMessageEnvelope[];
   events?: RoomPeerEngineEvents;
 }
 
@@ -39,7 +40,7 @@ export function compareChatMessages(
 
 export class ChatSyncManager {
   private readonly roomId: string;
-  private readonly localCert: PeerIdentityCert;
+  private localCert: PeerIdentityCert;
   private readonly localSignKeyPair: Ed25519KeyPair;
   private readonly serverSignPubKey: string;
   private readonly now: () => number;
@@ -56,6 +57,30 @@ export class ChatSyncManager {
     this.serverSignPubKey = options.serverSignPubKey;
     this.now = options.now;
     this.events = options.events;
+
+    if (options.initialMessages) {
+      for (const msg of options.initialMessages) {
+        this.seedInitialMessage(msg);
+      }
+    }
+  }
+
+  updateLocalCert(nextCert: PeerIdentityCert): void {
+    this.localCert = nextCert;
+  }
+
+  private seedInitialMessage(message: ChatMessageEnvelope): void {
+    if (
+      message.lamport > MAX_CHAT_LAMPORT ||
+      this.messagesById.has(message.msgId) ||
+      !verifyChatMessage(message, this.serverSignPubKey, this.roomId)
+    ) {
+      return;
+    }
+    if (message.lamport > this.lamport) {
+      this.lamport = message.lamport;
+    }
+    this.insertSorted(message);
   }
 
   createLocalMessage(

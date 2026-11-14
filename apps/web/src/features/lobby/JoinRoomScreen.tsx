@@ -12,7 +12,10 @@ import {
   type AppFailure,
 } from "../../i18n/error-catalog.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
-import { validateRoomPassphrase } from "../../state/validation.ts";
+import {
+  MAX_ROOM_ALIAS_CHARS,
+  validateRoomPassphrase,
+} from "../../state/validation.ts";
 import { PreferenceControls } from "../preferences/PreferenceControls.tsx";
 
 export interface JoinRoomScreenProps {
@@ -20,8 +23,9 @@ export interface JoinRoomScreenProps {
   readonly joinPhase: JoinPhase;
   readonly joinFailure: AppFailure | null;
   readonly onClearJoinFailure: () => void;
-  readonly onJoinRoom: (passphrase: string) => Promise<void>;
+  readonly onJoinRoom: (passphrase: string, alias?: string) => Promise<boolean>;
   readonly onSignOut: () => Promise<void>;
+  readonly onWipeAndSignOut: () => Promise<void>;
 }
 
 export function JoinRoomScreen({
@@ -31,9 +35,11 @@ export function JoinRoomScreen({
   onClearJoinFailure,
   onJoinRoom,
   onSignOut,
+  onWipeAndSignOut,
 }: JoinRoomScreenProps): ReactElement {
   const { t } = useI18n();
   const [passphrase, setPassphrase] = useState("");
+  const [alias, setAlias] = useState("");
   const [showPassphrase, setShowPassphrase] = useState(false);
   const [localFailure, setLocalFailure] = useState<AppFailure | null>(null);
 
@@ -53,8 +59,12 @@ export function JoinRoomScreen({
     setLocalFailure(null);
     onClearJoinFailure();
     const secretToDerive = passphrase;
+    const aliasToSave = alias;
     setPassphrase("");
-    await onJoinRoom(secretToDerive);
+    const ok = await onJoinRoom(secretToDerive, aliasToSave);
+    if (ok) {
+      setAlias("");
+    }
   };
 
   return (
@@ -78,6 +88,15 @@ export function JoinRoomScreen({
             disabled={busy}
           >
             {t("lobby.signOut")}
+          </Button>
+          <Button
+            variant="danger"
+            size="sm"
+            testId="wipe-vault-button"
+            onClick={() => void onWipeAndSignOut()}
+            disabled={busy}
+          >
+            {t("lobby.wipeSignOut")}
           </Button>
         </div>
       </header>
@@ -154,6 +173,20 @@ export function JoinRoomScreen({
                         : t("lobby.passphrase.show")}
                     </Button>
                   }
+                />
+
+                <TextField
+                  id="room-alias-input"
+                  testId="room-alias"
+                  label={t("lobby.field.alias")}
+                  hint={t("lobby.field.aliasHint")}
+                  type="text"
+                  autoComplete="off"
+                  maxLength={MAX_ROOM_ALIAS_CHARS}
+                  placeholder={t("lobby.field.aliasPlaceholder")}
+                  value={alias}
+                  onChange={(ev) => setAlias(ev.target.value)}
+                  disabled={busy}
                 />
 
                 <Button

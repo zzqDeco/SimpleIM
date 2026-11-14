@@ -98,7 +98,7 @@ interface PeerSession {
 
 export class MeshSessionManager {
   private readonly localPeerId: string;
-  private readonly localCert: PeerIdentityCert;
+  private localCert: PeerIdentityCert;
   private readonly localSignKeyPair: Ed25519KeyPair;
   private readonly serverSignPubKey: string;
   private readonly roomKeys: DerivedRoomKeys;
@@ -128,6 +128,10 @@ export class MeshSessionManager {
     this.now = options.now;
     this.events = options.events;
     this.callbacks = options.callbacks;
+  }
+
+  updateLocalCert(nextCert: PeerIdentityCert): void {
+    this.localCert = nextCert;
   }
 
   onRoomJoined(peers: readonly string[]): void {

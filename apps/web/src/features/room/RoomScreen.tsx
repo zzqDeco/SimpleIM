@@ -11,23 +11,45 @@ import type {
 import { NoticeBanner } from "../../design-system/index.ts";
 import { useFileDropzone } from "../../hooks/useFileDropzone.ts";
 import { usePromptComposer } from "../../hooks/usePromptComposer.ts";
-import type { SecurityEvent } from "../../hooks/useRoomSession.ts";
-import { formatAppFailure } from "../../i18n/error-catalog.ts";
+import type { JoinPhase, SecurityEvent } from "../../hooks/useRoomSession.ts";
+import {
+  formatAppFailure,
+  type AppFailure,
+} from "../../i18n/error-catalog.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
+import type {
+  RoomMeshConnectionStatus,
+  RoomSummaryItem,
+} from "../../state/room-list-vm.ts";
 import { MessageTranscript } from "./MessageTranscript.tsx";
 import { PromptComposer } from "./PromptComposer.tsx";
+import { RoomListRail } from "./RoomListRail.tsx";
 import { RoomSidePane } from "./RoomSidePane.tsx";
 import { RoomTopBar } from "./RoomTopBar.tsx";
 
 export interface RoomScreenProps {
   readonly user: UserProfile;
   readonly localPeerId: string;
+  readonly rooms: readonly RoomSummaryItem[];
+  readonly selectedRoomId: string | null;
+  readonly selectedRoomAlias: string | null;
+  readonly selectedRoomStatus: RoomMeshConnectionStatus;
   readonly roomIdPrefix: string;
   readonly centerConnected: boolean;
   readonly peers: readonly VerifiedPeerInfo[];
   readonly messages: readonly ChatMessageEnvelope[];
   readonly files: readonly FileManifest[];
   readonly transfers: ReadonlyMap<string, SwarmTransferProgress>;
+  readonly joinPhase: JoinPhase;
+  readonly joinFailure: AppFailure | null;
+  readonly onClearJoinFailure: () => void;
+  readonly onJoinRoom: (passphrase: string, alias?: string) => Promise<boolean>;
+  readonly onSelectRoom: (roomId: string) => Promise<void>;
+  readonly onRenameRoomAlias: (
+    roomId: string,
+    alias: string | null,
+  ) => Promise<void>;
+  readonly onTogglePinRoom: (roomId: string) => Promise<void>;
   readonly securityEvent: SecurityEvent | null;
   readonly onDismissSecurityEvent: () => void;
   readonly onSendMessage: (
@@ -41,17 +63,29 @@ export interface RoomScreenProps {
   readonly canSaveFile: (fileId: string) => boolean;
   readonly onLeaveRoom: () => Promise<void>;
   readonly onSignOut: () => Promise<void>;
+  readonly onWipeAndSignOut: () => Promise<void>;
 }
 
 export function RoomScreen({
   user,
   localPeerId,
+  rooms,
+  selectedRoomId,
+  selectedRoomAlias,
+  selectedRoomStatus,
   roomIdPrefix,
   centerConnected,
   peers,
   messages,
   files,
   transfers,
+  joinPhase,
+  joinFailure,
+  onClearJoinFailure,
+  onJoinRoom,
+  onSelectRoom,
+  onRenameRoomAlias,
+  onTogglePinRoom,
   securityEvent,
   onDismissSecurityEvent,
   onSendMessage,
@@ -62,11 +96,16 @@ export function RoomScreen({
   canSaveFile,
   onLeaveRoom,
   onSignOut,
+  onWipeAndSignOut,
 }: RoomScreenProps): ReactElement {
   const { t } = useI18n();
+  const [railOpen, setRailOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const composer = usePromptComposer({ onSendMessage });
+  const composer = usePromptComposer({
+    roomKey: selectedRoomId,
+    onSendMessage,
+  });
 
   const shareSelectedFiles = useCallback(
     (selected: File[]): void => {
@@ -91,17 +130,43 @@ export function RoomScreen({
     <div className="room-shell">
       <RoomTopBar
         roomIdPrefix={roomIdPrefix}
+        roomAlias={selectedRoomAlias}
+        connectionStatus={selectedRoomStatus}
         centerConnected={centerConnected}
         username={user.username}
+        roomCount={rooms.length}
         peerCount={peers.length}
         fileCount={files.length}
+        railOpen={railOpen}
         sidebarOpen={sidebarOpen}
-        onToggleSidebar={() => setSidebarOpen((v) => !v)}
+        onToggleRail={() => {
+          setSidebarOpen(false);
+          setRailOpen((v) => !v);
+        }}
+        onToggleSidebar={() => {
+          setRailOpen(false);
+          setSidebarOpen((v) => !v);
+        }}
         onLeaveRoom={onLeaveRoom}
         onSignOut={onSignOut}
+        onWipeAndSignOut={onWipeAndSignOut}
       />
 
       <div className="room-grid">
+        <RoomListRail
+          open={railOpen}
+          rooms={rooms}
+          selectedRoomId={selectedRoomId}
+          joinPhase={joinPhase}
+          joinFailure={joinFailure}
+          onClearJoinFailure={onClearJoinFailure}
+          onJoinRoom={onJoinRoom}
+          onSelectRoom={onSelectRoom}
+          onRenameRoomAlias={onRenameRoomAlias}
+          onTogglePinRoom={onTogglePinRoom}
+          onCloseMobileRail={() => setRailOpen(false)}
+        />
+
         <main
           className="transcript-column"
           onDragEnter={dropzone.onDragEnter}
@@ -138,6 +203,7 @@ export function RoomScreen({
           <MessageTranscript
             messages={messages}
             localPeerId={localPeerId}
+            currentUserId={user.id}
             onReply={composer.selectReplyTarget}
           />
 

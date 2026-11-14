@@ -1,6 +1,7 @@
 import type {
   ChatMessageEnvelope,
   FileManifest,
+  PeerIdentityCert,
   PostAuthControlFrame,
   ServerSignalingFrame,
 } from "@simpleim/contracts";
@@ -50,6 +51,7 @@ export function createRoomPeerEngine(
     localSignKeyPair,
     serverSignPubKey,
     now,
+    initialMessages: options.initialMessages,
     events,
   });
 
@@ -63,6 +65,7 @@ export function createRoomPeerEngine(
     localSignKeyPair,
     serverSignPubKey,
     chunkStorage,
+    initialFiles: options.initialFiles,
     maxInFlightPerPeer: options.maxInFlightPerPeer,
     requestTimeoutMs: options.requestTimeoutMs,
     now,
@@ -384,6 +387,21 @@ export function createRoomPeerEngine(
       }
 
       await chunkStorage.closeAll();
+    },
+
+    updateLocalCert(nextCert: PeerIdentityCert): void {
+      if (stopped) return;
+      if (
+        nextCert.payload.peerId !== localPeerId ||
+        nextCert.payload.peerSignPubKey !== localSignKeyPair.publicKeyBase64Url
+      ) {
+        throw new Error(
+          "Updated PeerIdentityCert does not match engine peer identity",
+        );
+      }
+      chatSync.updateLocalCert(nextCert);
+      meshManager.updateLocalCert(nextCert);
+      swarmScheduler.updateLocalCert(nextCert);
     },
 
     isCenterConnected(): boolean {

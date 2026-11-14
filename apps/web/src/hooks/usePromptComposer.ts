@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useEffect,
   useRef,
   useState,
   type FormEvent,
@@ -10,6 +11,7 @@ import type { ChatMessageEnvelope } from "@simpleim/contracts";
 import { toAppFailure, type AppFailure } from "../i18n/error-catalog.ts";
 
 export interface UsePromptComposerParams {
+  readonly roomKey?: string | null;
   readonly onSendMessage: (
     body: string,
     replyToMsgId: string | null,
@@ -32,6 +34,7 @@ export interface PromptComposerController {
 }
 
 export function usePromptComposer({
+  roomKey,
   onSendMessage,
 }: UsePromptComposerParams): PromptComposerController {
   const [draft, setDraft] = useState("");
@@ -41,6 +44,15 @@ export function usePromptComposer({
   const [sending, setSending] = useState(false);
   const [actionFailure, setActionFailure] = useState<AppFailure | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const prevRoomKeyRef = useRef(roomKey);
+
+  useEffect(() => {
+    if (prevRoomKeyRef.current !== roomKey) {
+      prevRoomKeyRef.current = roomKey;
+      setReplyTarget(null);
+      setActionFailure(null);
+    }
+  }, [roomKey]);
 
   const submitChat = useCallback(async (): Promise<void> => {
     const trimmed = draft.trim();

@@ -32,9 +32,12 @@ export function deriveMessageViewModel(
   msg: ChatMessageEnvelope,
   localPeerId: string,
   messageById: ReadonlyMap<string, ChatMessageEnvelope>,
+  currentUserId?: string,
 ): MessageViewModel {
   const author = msg.authorCert.payload;
-  const isSelf = author.peerId === localPeerId;
+  const isSelf =
+    author.peerId === localPeerId ||
+    (currentUserId !== undefined && author.userId === currentUserId);
   const runtimeTag = author.clientKind === "cli" ? "CLI" : "WEB";
 
   let quote: MessageQuoteViewModel | null = null;

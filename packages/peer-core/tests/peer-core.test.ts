@@ -2294,4 +2294,237 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
       }
     }
   });
+
+  test("9. Warm-start initialMessages & initialFiles restores monotonic Lamport, rejects tampered history, and syncs incrementally", async () => {
+    const ca = createTestServerCA();
+    const hub = new MockSignalingHub();
+    const network = new MockPeerTransportNetwork();
+    const roomKeys = deriveRoomKeys("warm-start-vault-passphrase", FAST_KDF);
+
+    // Phase 1: Alice and Bob exchange chat + file manifest, then Alice snapshots her local history (simulating RoomVault)
+    const alice1 = createTestPeerRig({
+      ca,
+      hub,
+      network,
+      roomKeys,
+      peerId: "peer_01alice_old1",
+      username: "alice",
+    });
+    const bob = createTestPeerRig({
+      ca,
+      hub,
+      network,
+      roomKeys,
+      peerId: "peer_02bob_online",
+      username: "bob",
+    });
+
+    let savedMessages: ChatMessageEnvelope[] = [];
+    let savedFiles: FileManifest[] = [];
+
+    try {
+      await Promise.all([alice1.engine.start(), bob.engine.start()]);
+      await waitFor(
+        () =>
+          alice1.engine.getVerifiedPeers().length === 1 &&
+          bob.engine.getVerifiedPeers().length === 1,
+      );
+
+      await alice1.engine.sendChatMessage("Warm message #1 from Alice");
+      await bob.engine.sendChatMessage("Warm message #2 from Bob");
+      const sampleBytes = makeDeterministicPayload(1024);
+      await bob.engine.shareFile({
+        fileName: "persisted-spec.txt",
+        fileSize: sampleBytes.byteLength,
+        readChunk: makeSliceReader(sampleBytes),
+      });
+
+      await waitFor(
+        () =>
+          alice1.engine.getMessages().length === 2 &&
+          alice1.engine.getFiles().length === 1,
+      );
+
+      savedMessages = alice1.engine.getMessages();
+      savedFiles = alice1.engine.getFiles();
+      await alice1.engine.stop();
+
+      // While Alice is offline/reloading, Bob sends message #3
+      await bob.engine.sendChatMessage("Missed message #3 while Alice reloaded");
+
+      // Inject one tampered message into Alice's snapshot -> must be silently rejected during warm-start
+      const tamperedMsg: ChatMessageEnvelope = {
+        ...savedMessages[0]!,
+        msgId: "019a0000-0000-7000-8000-999999999999",
+        body: "Tampered vault body",
+      };
+
+      const peerKeyPair2 = generateEd25519KeyPair();
+      const cert2 = issuePeerIdentityCert({
+        serverKeyId: ca.serverKeyId,
+        serverSignPrivKey: ca.keyPair.privateKeyBytes,
+        userId: "usr_alice00000",
+        username: "alice",
+        displayName: "ALICE",
+        peerId: "peer_03alice_new2",
+        peerSignPubKey: peerKeyPair2.publicKeyBase64Url,
+        clientKind: "web",
+        nowMs: Date.now() - 5_000,
+        ttlMs: 3_600_000,
+      });
+
+      const constructorEvents: ChatMessageEnvelope[] = [];
+      const signaling2 = hub.createClient("peer_03alice_new2");
+      const { factory: factory2 } = network.createFactory();
+      const storage2 = new InMemoryChunkStorage();
+
+      const alice2Engine = createRoomPeerEngine({
+        localPeerId: "peer_03alice_new2",
+        localCert: cert2,
+        localSignKeyPair: peerKeyPair2,
+        serverSignPubKey: ca.keyPair.publicKeyBase64Url,
+        roomKeys,
+        iceServers: [{ urls: ["stun:stun.example.org:3478"] }],
+        signaling: signaling2,
+        transportFactory: factory2,
+        chunkStorage: storage2,
+        initialMessages: [...savedMessages, tamperedMsg],
+        initialFiles: savedFiles,
+        events: {
+          onChatMessage: (msg) => constructorEvents.push(msg),
+        },
+      });
+
+      try {
+        // Warm-started messages & files are immediately present with zero constructor event spam and tampered item dropped
+        expect(constructorEvents.length).toBe(0);
+        expect(alice2Engine.getMessages().map((m) => m.body)).toEqual([
+          "Warm message #1 from Alice",
+          "Warm message #2 from Bob",
+        ]);
+        expect(alice2Engine.getFiles().map((f) => f.fileName)).toEqual([
+          "persisted-spec.txt",
+        ]);
+
+        // Reconnect Alice2 -> incremental sync fetches ONLY missed message #3, and Alice2's next Lamport stays monotonic
+        await alice2Engine.start();
+        await waitFor(() => alice2Engine.getMessages().length === 3);
+        expect(constructorEvents.map((m) => m.body)).toEqual([
+          "Missed message #3 while Alice reloaded",
+        ]);
+
+        const postReloadMsg = await alice2Engine.sendChatMessage(
+          "Post-reload message #4 from Alice",
+        );
+        expect(postReloadMsg.lamport).toBeGreaterThan(3);
+        await waitFor(() => bob.engine.getMessages().length === 4);
+      } finally {
+        await alice2Engine.stop();
+      }
+    } finally {
+      await alice1.engine.stop();
+      await bob.engine.stop();
+    }
+  });
+
+  test("10. updateLocalCert propagates renewed PeerIdentityCert to ChatSyncManager and MeshSessionManager for >24h sessions", async () => {
+    const ca = createTestServerCA();
+    const hub = new MockSignalingHub();
+    const network = new MockPeerTransportNetwork();
+    const roomKeys = deriveRoomKeys("cert-renewal-room", FAST_KDF);
+
+    let currentNow = 1_763_000_000_000;
+    const aliceKeyPair = generateEd25519KeyPair();
+    const initialAliceCert = issuePeerIdentityCert({
+      serverKeyId: ca.serverKeyId,
+      serverSignPrivKey: ca.keyPair.privateKeyBytes,
+      userId: "usr_alice_renew",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_01alice_renew",
+      peerSignPubKey: aliceKeyPair.publicKeyBase64Url,
+      clientKind: "web",
+      nowMs: currentNow,
+      ttlMs: 3_600_000, // 1 hour initial TTL
+    });
+
+    const aliceEngine = createRoomPeerEngine({
+      localPeerId: "peer_01alice_renew",
+      localCert: initialAliceCert,
+      localSignKeyPair: aliceKeyPair,
+      serverSignPubKey: ca.keyPair.publicKeyBase64Url,
+      roomKeys,
+      iceServers: [],
+      signaling: hub.createClient("peer_01alice_renew"),
+      transportFactory: network.createFactory().factory,
+      chunkStorage: new InMemoryChunkStorage(),
+      now: () => currentNow,
+    });
+
+    await aliceEngine.start();
+
+    // Advance simulated clock past initial 1h TTL (2 hours later) and renew Alice's cert in-place
+    currentNow += 2 * 3_600_000;
+    const renewedAliceCert = issuePeerIdentityCert({
+      serverKeyId: ca.serverKeyId,
+      serverSignPrivKey: ca.keyPair.privateKeyBytes,
+      userId: "usr_alice_renew",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_01alice_renew",
+      peerSignPubKey: aliceKeyPair.publicKeyBase64Url,
+      clientKind: "web",
+      nowMs: currentNow - 1_000,
+      ttlMs: 86_400_000,
+    });
+    aliceEngine.updateLocalCert(renewedAliceCert);
+
+    // Late-joining Bob verifies Alice via HELLO_AUTH at T+2h (would fail with cert_expired if old cert remained!)
+    const bobKeyPair = generateEd25519KeyPair();
+    const bobCert = issuePeerIdentityCert({
+      serverKeyId: ca.serverKeyId,
+      serverSignPrivKey: ca.keyPair.privateKeyBytes,
+      userId: "usr_bob_renew",
+      username: "bob",
+      displayName: "Bob",
+      peerId: "peer_02bob_renew",
+      peerSignPubKey: bobKeyPair.publicKeyBase64Url,
+      clientKind: "cli",
+      nowMs: currentNow - 1_000,
+      ttlMs: 86_400_000,
+    });
+    const bobEngine = createRoomPeerEngine({
+      localPeerId: "peer_02bob_renew",
+      localCert: bobCert,
+      localSignKeyPair: bobKeyPair,
+      serverSignPubKey: ca.keyPair.publicKeyBase64Url,
+      roomKeys,
+      iceServers: [],
+      signaling: hub.createClient("peer_02bob_renew"),
+      transportFactory: network.createFactory().factory,
+      chunkStorage: new InMemoryChunkStorage(),
+      now: () => currentNow,
+    });
+
+    try {
+      await bobEngine.start();
+      await waitFor(
+        () =>
+          aliceEngine.getVerifiedPeers().length === 1 &&
+          bobEngine.getVerifiedPeers().length === 1,
+      );
+
+      const sentAt2h = await aliceEngine.sendChatMessage(
+        "Signed with renewed 24h cert!",
+      );
+      expect(sentAt2h.authorCert.payload.exp).toBe(renewedAliceCert.payload.exp);
+      await waitFor(() => bobEngine.getMessages().length === 1);
+      expect(bobEngine.getMessages()[0]?.body).toBe(
+        "Signed with renewed 24h cert!",
+      );
+    } finally {
+      await aliceEngine.stop();
+      await bobEngine.stop();
+    }
+  });
 });

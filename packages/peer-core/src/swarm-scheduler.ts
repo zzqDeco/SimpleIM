@@ -56,6 +56,7 @@ export interface SwarmSchedulerOptions {
   localSignKeyPair: Ed25519KeyPair;
   serverSignPubKey: string;
   chunkStorage: ChunkStoragePort;
+  initialFiles?: readonly FileManifest[];
   maxInFlightPerPeer?: number;
   requestTimeoutMs?: number;
   now: () => number;
@@ -152,7 +153,7 @@ function chunkTieHash(seed: number, chunkIndex: number): number {
 export class SwarmScheduler {
   private readonly roomId: string;
   private readonly localPeerId: string;
-  private readonly localCert: PeerIdentityCert;
+  private localCert: PeerIdentityCert;
   private readonly localSignKeyPair: Ed25519KeyPair;
   private readonly serverSignPubKey: string;
   private readonly chunkStorage: ChunkStoragePort;
@@ -189,6 +190,16 @@ export class SwarmScheduler {
     this.broadcastControlFrame = options.broadcastControlFrame;
     this.sendControlFrameToPeer = options.sendControlFrameToPeer ?? (() => {});
     this.evictPeer = options.evictPeer;
+
+    if (options.initialFiles) {
+      for (const manifest of options.initialFiles) {
+        this.insertVerifiedManifest(manifest, false);
+      }
+    }
+  }
+
+  updateLocalCert(nextCert: PeerIdentityCert): void {
+    this.localCert = nextCert;
   }
 
   async shareFile(input: ShareFileInput): Promise<FileManifest> {
@@ -276,6 +287,13 @@ export class SwarmScheduler {
   }
 
   ingestFileManifest(manifest: FileManifest, _sourcePeerId?: string): boolean {
+    return this.insertVerifiedManifest(manifest, true);
+  }
+
+  private insertVerifiedManifest(
+    manifest: FileManifest,
+    emitAnnouncement: boolean,
+  ): boolean {
     if (!verifyFileManifest(manifest, this.serverSignPubKey, this.roomId)) {
       return false;
     }
@@ -319,7 +337,9 @@ export class SwarmScheduler {
     this.fileOrder.push(manifest.fileId);
     this.applyEarlyPeerBitfieldsForFile(entry);
 
-    this.events?.onFileAnnounced?.(manifest);
+    if (emitAnnouncement) {
+      this.events?.onFileAnnounced?.(manifest);
+    }
     return true;
   }
 
