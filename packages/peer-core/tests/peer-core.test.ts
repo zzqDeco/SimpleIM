@@ -83,6 +83,7 @@ function createTestPeerRig(params: {
   maxInFlightPerPeer?: number;
   requestTimeoutMs?: number;
   helloAuthTimeoutMs?: number;
+  syncIntervalMs?: number;
   maxSignalPayloadBytes?: number;
   now?: () => number;
   signalingOptions?: ConstructorParameters<typeof MockSignalingClient>[2];
@@ -139,6 +140,7 @@ function createTestPeerRig(params: {
     maxInFlightPerPeer: params.maxInFlightPerPeer,
     requestTimeoutMs: params.requestTimeoutMs,
     helloAuthTimeoutMs: params.helloAuthTimeoutMs,
+    syncIntervalMs: params.syncIntervalMs,
     maxSignalPayloadBytes: params.maxSignalPayloadBytes,
     now: params.now,
     events: {
@@ -2618,6 +2620,193 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
     } finally {
       await alice.engine.stop();
       await bob.engine.stop();
+    }
+  });
+
+  test("12. Multi-party partial-mesh gossip, 64 KiB SCTP sync.batch byte budgeting, asymmetric responder offer replacement, and periodic anti-entropy sync", async () => {
+    const ca = createTestServerCA();
+    const roomKeys = deriveRoomKeys("partial-mesh-gossip-and-batch-budget", FAST_KDF);
+
+    // 12a. Partial-mesh chain A <-> B <-> C <-> D (direct A<->C, A<->D, B<->D blocked by NAT)
+    // + strict 64 KiB (65,536 B) SCTP maxMessageSize on every DataChannel!
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+
+      const areNeighbors = (p1: string, p2: string): boolean => {
+        const pair = [p1, p2].sort().join("|");
+        return (
+          pair === "peer_01aaaaaaaaaa|peer_02bbbbbbbbbb" ||
+          pair === "peer_02bbbbbbbbbb|peer_03cccccccccc" ||
+          pair === "peer_03cccccccccc|peer_04dddddddddd"
+        );
+      };
+
+      const makePartialMeshRig = (peerId: string, username: string) =>
+        createTestPeerRig({
+          ca,
+          hub,
+          network,
+          roomKeys,
+          peerId,
+          username,
+          syncIntervalMs: 80,
+          transportConfig: ({ localPeerId, remotePeerId }) => ({
+            maxControlTextBytes: 65_536,
+            failIceOnAcceptAnswer: !areNeighbors(localPeerId, remotePeerId),
+          }),
+        });
+
+      const peerA = makePartialMeshRig("peer_01aaaaaaaaaa", "alice");
+      const peerB = makePartialMeshRig("peer_02bbbbbbbbbb", "bob");
+      const peerC = makePartialMeshRig("peer_03cccccccccc", "carol");
+
+      try {
+        await Promise.all([
+          peerA.engine.start(),
+          peerB.engine.start(),
+          peerC.engine.start(),
+        ]);
+
+        // Wait for chain A <-> B <-> C (A has 1 peer: B; B has 2 peers: A, C; C has 1 peer: B)
+        await waitFor(
+          () =>
+            peerA.engine.getVerifiedPeers().length === 1 &&
+            peerB.engine.getVerifiedPeers().length === 2 &&
+            peerC.engine.getVerifiedPeers().length === 1,
+        );
+
+        // Live messages from A reach C via B, and live messages from C reach A via B!
+        await peerA.engine.sendChatMessage("hello-from-alice-over-hop");
+        await peerC.engine.sendChatMessage("hello-from-carol-over-hop");
+
+        await waitFor(
+          () =>
+            peerA.engine.getMessages().length === 2 &&
+            peerB.engine.getMessages().length === 2 &&
+            peerC.engine.getMessages().length === 2,
+        );
+        expect(peerC.receivedChat.find((x) => x.msg.body === "hello-from-alice-over-hop")?.isHistoricalSync).toBe(false);
+        expect(peerA.receivedChat.find((x) => x.msg.body === "hello-from-carol-over-hop")?.isHistoricalSync).toBe(false);
+
+        // File announcements also gossip across partial mesh A -> B -> C!
+        const sharedBytes = makeDeterministicPayload(2 * SWARM_CHUNK_SIZE);
+        const sharedManifest = await peerA.engine.shareFile({
+          fileName: "relayed-across-hops.bin",
+          fileSize: sharedBytes.byteLength,
+          readChunk: makeSliceReader(sharedBytes),
+        });
+        await waitFor(() => peerC.announcedFiles.length === 1);
+        expect(peerC.announcedFiles[0]?.fileId).toBe(sharedManifest.fileId);
+
+        // Bulk 20 x 12 KiB AI-essay messages (~240 KiB > 64 KiB SCTP maxMessageSize!) sent by A
+        // before late-joiner D connects ONLY to C (3 hops away from A: A <-> B <-> C <-> D)!
+        for (let i = 0; i < 20; i++) {
+          await peerA.engine.sendChatMessage(
+            `essay-${i.toString().padStart(2, "0")}-${"文".repeat(4_000)}`,
+          );
+        }
+        await waitFor(() => peerC.engine.getMessages().length === 22);
+
+        const peerD = makePartialMeshRig("peer_04dddddddddd", "dave");
+        try {
+          // Seed an offline pre-existing message on D before D connects to C, so D's sync.batch
+          // must also propagate backwards D -> C -> B -> A!
+          await peerD.engine.sendChatMessage("dave-offline-note-before-join");
+          await peerD.engine.start();
+
+          await waitFor(
+            () =>
+              peerD.engine.getVerifiedPeers().length === 1 &&
+              peerD.engine.getMessages().length === 23 &&
+              peerA.engine.getMessages().length === 23 &&
+              peerB.engine.getMessages().length === 23 &&
+              peerC.engine.getMessages().length === 23 &&
+              peerD.engine.getFiles().length === 1,
+            3_000,
+          );
+
+          const canonicalIds = peerA.engine.getMessages().map((m) => m.msgId);
+          expect(peerB.engine.getMessages().map((m) => m.msgId)).toEqual(canonicalIds);
+          expect(peerC.engine.getMessages().map((m) => m.msgId)).toEqual(canonicalIds);
+          expect(peerD.engine.getMessages().map((m) => m.msgId)).toEqual(canonicalIds);
+
+          // Simulate a transient dropped live chat.message from D -> C and verify periodic anti-entropy (80ms) heals it!
+          const dToC = peerD.connections.find(
+            (c) => c.remotePeerId === peerC.peerId && c.state === "connected",
+          )!;
+          let droppedOnce = false;
+          dToC.controlChannel.setTextOutgoingInterceptor((txt) => {
+            if (!droppedOnce) {
+              droppedOnce = true;
+              return null; // Drop live chat.message frame!
+            }
+            return txt;
+          });
+          await peerD.engine.sendChatMessage("healed-by-periodic-anti-entropy");
+          expect(droppedOnce).toBe(true);
+
+          await waitFor(
+            () =>
+              peerA.engine
+                .getMessages()
+                .some((m) => m.body === "healed-by-periodic-anti-entropy"),
+            2_000,
+          );
+        } finally {
+          await peerD.engine.stop();
+        }
+      } finally {
+        await Promise.all([
+          peerA.engine.stop(),
+          peerB.engine.stop(),
+          peerC.engine.stop(),
+        ]);
+      }
+    }
+
+    // 12b. Asymmetric ICE failure where Initiator fails while Responder stays stuck in "connecting":
+    // Responder must replace its stuck UNVERIFIED session on Initiator's fresh retry offer!
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+      let initiatorAttempts = 0;
+
+      const initiator = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01_asym_init",
+        username: "init",
+        transportConfig: () => {
+          initiatorAttempts += 1;
+          return {
+            failInitiatorOnlyOnAcceptAnswer: initiatorAttempts === 1,
+          };
+        },
+      });
+      const responder = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02_asym_resp",
+        username: "resp",
+      });
+
+      try {
+        await Promise.all([initiator.engine.start(), responder.engine.start()]);
+        await waitFor(
+          () =>
+            initiator.engine.getVerifiedPeers().length === 1 &&
+            responder.engine.getVerifiedPeers().length === 1,
+          5_500,
+        );
+        expect(initiatorAttempts).toBe(2);
+      } finally {
+        await Promise.all([initiator.engine.stop(), responder.engine.stop()]);
+      }
     }
   });
 });

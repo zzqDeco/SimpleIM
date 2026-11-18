@@ -88,6 +88,7 @@ interface PeerSession {
   closed: boolean;
   authRejected: boolean;
   offerAccepted: boolean;
+  acceptedOfferSdp: string | null;
   answerAccepted: boolean;
   remoteDescReady: boolean;
   drainingIce: boolean;
@@ -310,10 +311,32 @@ export class MeshSessionManager {
     this.safeSendText(session.pc.controlChannel, JSON.stringify(sealed));
   }
 
+  getVerifiedPeerIds(): string[] {
+    const out: string[] = [];
+    for (const session of this.sessions.values()) {
+      if (
+        session.verified &&
+        !session.closed &&
+        session.pc.controlChannel.readyState === "open"
+      ) {
+        out.push(session.remotePeerId);
+      }
+    }
+    return out;
+  }
+
   broadcastControlFrame(frame: PostAuthControlFrame): void {
+    this.broadcastControlFrameExcept(null, frame);
+  }
+
+  broadcastControlFrameExcept(
+    excludePeerId: string | null,
+    frame: PostAuthControlFrame,
+  ): void {
     if (this.stopped) return;
     for (const session of this.sessions.values()) {
       if (
+        session.remotePeerId !== excludePeerId &&
         session.verified &&
         !session.closed &&
         session.pc.controlChannel.readyState === "open"
@@ -477,6 +500,7 @@ export class MeshSessionManager {
       closed: false,
       authRejected: false,
       offerAccepted: false,
+      acceptedOfferSdp: null,
       answerAccepted: false,
       remoteDescReady: false,
       drainingIce: false,
@@ -645,10 +669,19 @@ export class MeshSessionManager {
 
     const existing = this.sessions.get(fromPeerId);
     if (existing) {
-      if (this.isSessionHealthyOrConnecting(existing)) {
-        if (existing.verified || existing.offerAccepted) {
-          return;
-        }
+      if (
+        this.isSessionHealthyOrConnecting(existing) &&
+        (existing.verified ||
+          (existing.offerAccepted && existing.acceptedOfferSdp === offerSdp))
+      ) {
+        return;
+      }
+      if (
+        this.isSessionHealthyOrConnecting(existing) &&
+        !existing.offerAccepted &&
+        !existing.verified
+      ) {
+        // Reuse pre-created unverified responder session if any
       } else {
         this.closeSession(existing);
       }
@@ -663,6 +696,7 @@ export class MeshSessionManager {
     }
 
     session.offerAccepted = true;
+    session.acceptedOfferSdp = offerSdp;
     try {
       const answerSdp = await session.pc.acceptOfferAndCreateAnswer(offerSdp);
       if (this.stopped || session.closed) return;

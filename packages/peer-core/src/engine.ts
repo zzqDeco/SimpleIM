@@ -5,6 +5,7 @@ import type {
   PostAuthControlFrame,
   ServerSignalingFrame,
 } from "@simpleim/contracts";
+import { utf8ToBytes } from "@simpleim/crypto";
 import { ChatSyncManager } from "./chat-sync.ts";
 import { MeshSessionManager } from "./mesh-session.ts";
 import {
@@ -18,7 +19,11 @@ import {
 import { SwarmScheduler } from "./swarm-scheduler.ts";
 
 const SYNC_BATCH_MSG_SLICE = 50;
-const SYNC_BATCH_FILE_SLICE = 25;
+const SYNC_BATCH_FILE_SLICE = 10;
+// Keep plaintext sync.batch JSON <= 32 KiB (~44 KiB after Base64Url AEAD sealing)
+// so every batch stays safely below all browsers' 64 KiB SCTP maxMessageSize floor.
+const MAX_SYNC_BATCH_JSON_BYTES = 32_768;
+const DEFAULT_ANTI_ENTROPY_SYNC_INTERVAL_MS = 15_000;
 
 export function createRoomPeerEngine(
   options: RoomPeerEngineOptions,
@@ -37,6 +42,8 @@ export function createRoomPeerEngine(
   } = options;
 
   const now = options.now ?? (() => Date.now());
+  const syncIntervalMs =
+    options.syncIntervalMs ?? DEFAULT_ANTI_ENTROPY_SYNC_INTERVAL_MS;
   const roomId = roomKeys.roomId;
 
   let started = false;
@@ -44,6 +51,7 @@ export function createRoomPeerEngine(
   let centerConnected = signaling.isConnected;
   let joinedOnCurrentConnection = false;
   let signalingListenersAttached = false;
+  let antiEntropyTimer: ReturnType<typeof setInterval> | null = null;
 
   const chatSync = new ChatSyncManager({
     roomId,
@@ -145,28 +153,120 @@ export function createRoomPeerEngine(
     }
   }
 
+  function buildSyncSummaryFrame(): PostAuthControlFrame {
+    return {
+      type: "sync.summary",
+      knownMsgIds: chatSync.getSyncSummaryMsgIds(),
+      knownFileIds: swarmScheduler.getSyncSummaryFileIds(),
+    };
+  }
+
+  function estimateJsonBytes(value: unknown): number {
+    return utf8ToBytes(JSON.stringify(value)).byteLength;
+  }
+
+  function partitionSyncBatches(
+    messages: readonly ChatMessageEnvelope[],
+    files: readonly FileManifest[],
+  ): Array<{ messages: ChatMessageEnvelope[]; files: FileManifest[] }> {
+    const batches: Array<{
+      messages: ChatMessageEnvelope[];
+      files: FileManifest[];
+    }> = [];
+    let msgIdx = 0;
+    let fileIdx = 0;
+
+    while (msgIdx < messages.length || fileIdx < files.length) {
+      const msgSlice: ChatMessageEnvelope[] = [];
+      const fileSlice: FileManifest[] = [];
+      let currentBytes = 64; // Frame wrapper overhead {"type":"sync.batch","messages":[],"files":[]}
+
+      while (
+        msgIdx < messages.length &&
+        msgSlice.length < SYNC_BATCH_MSG_SLICE
+      ) {
+        const candidate = messages[msgIdx]!;
+        const itemBytes = estimateJsonBytes(candidate) + 1;
+        if (
+          msgSlice.length > 0 &&
+          currentBytes + itemBytes > MAX_SYNC_BATCH_JSON_BYTES
+        ) {
+          break;
+        }
+        msgSlice.push(candidate);
+        currentBytes += itemBytes;
+        msgIdx += 1;
+        if (currentBytes >= MAX_SYNC_BATCH_JSON_BYTES) {
+          break;
+        }
+      }
+
+      while (
+        fileIdx < files.length &&
+        fileSlice.length < SYNC_BATCH_FILE_SLICE
+      ) {
+        const candidate = files[fileIdx]!;
+        const itemBytes = estimateJsonBytes(candidate) + 1;
+        if (
+          (msgSlice.length > 0 || fileSlice.length > 0) &&
+          currentBytes + itemBytes > MAX_SYNC_BATCH_JSON_BYTES
+        ) {
+          break;
+        }
+        fileSlice.push(candidate);
+        currentBytes += itemBytes;
+        fileIdx += 1;
+        if (currentBytes >= MAX_SYNC_BATCH_JSON_BYTES) {
+          break;
+        }
+      }
+
+      batches.push({ messages: msgSlice, files: fileSlice });
+    }
+
+    return batches;
+  }
+
   function sendSyncBatchesToPeer(
     remotePeerId: string,
-    messages: ChatMessageEnvelope[],
-    files: FileManifest[],
+    messages: readonly ChatMessageEnvelope[],
+    files: readonly FileManifest[],
   ): void {
     if (messages.length === 0 && files.length === 0) {
       return;
     }
-
-    let msgIdx = 0;
-    let fileIdx = 0;
-    while (msgIdx < messages.length || fileIdx < files.length) {
-      const msgSlice = messages.slice(msgIdx, msgIdx + SYNC_BATCH_MSG_SLICE);
-      const fileSlice = files.slice(fileIdx, fileIdx + SYNC_BATCH_FILE_SLICE);
-      msgIdx += msgSlice.length;
-      fileIdx += fileSlice.length;
-
+    for (const batch of partitionSyncBatches(messages, files)) {
       meshManager.sendControlFrameToPeer(remotePeerId, {
         type: "sync.batch",
-        messages: msgSlice,
-        files: fileSlice,
+        messages: batch.messages,
+        files: batch.files,
       });
+    }
+  }
+
+  function gossipSyncBatchesExcept(
+    excludePeerId: string,
+    messages: readonly ChatMessageEnvelope[],
+    files: readonly FileManifest[],
+  ): void {
+    if (messages.length === 0 && files.length === 0) {
+      return;
+    }
+    const targetPeers = meshManager
+      .getVerifiedPeerIds()
+      .filter((peerId) => peerId !== excludePeerId);
+    if (targetPeers.length === 0) {
+      return;
+    }
+    const batches = partitionSyncBatches(messages, files);
+    for (const peerId of targetPeers) {
+      for (const batch of batches) {
+        meshManager.sendControlFrameToPeer(peerId, {
+          type: "sync.batch",
+          messages: batch.messages,
+          files: batch.files,
+        });
+      }
     }
   }
 
@@ -184,10 +284,20 @@ export function createRoomPeerEngine(
         meshManager.handlePresencePong(remotePeerId, frame.sentAt);
         break;
       case "chat.message":
-        chatSync.ingestRemoteMessage(frame.message, false);
+        if (chatSync.ingestRemoteMessage(frame.message, false)) {
+          meshManager.broadcastControlFrameExcept(remotePeerId, {
+            type: "chat.message",
+            message: frame.message,
+          });
+        }
         break;
       case "file.announce":
-        swarmScheduler.ingestFileManifest(frame.manifest, remotePeerId);
+        if (swarmScheduler.ingestFileManifest(frame.manifest, remotePeerId)) {
+          meshManager.broadcastControlFrameExcept(remotePeerId, {
+            type: "file.announce",
+            manifest: frame.manifest,
+          });
+        }
         break;
       case "file.hash_page_request":
         swarmScheduler.handleHashPageRequestFrame(
@@ -241,11 +351,24 @@ export function createRoomPeerEngine(
         break;
       }
       case "sync.batch": {
+        const newlyIngestedMsgs: ChatMessageEnvelope[] = [];
+        const newlyIngestedFiles: FileManifest[] = [];
         for (const msg of frame.messages) {
-          chatSync.ingestRemoteMessage(msg, true);
+          if (chatSync.ingestRemoteMessage(msg, true)) {
+            newlyIngestedMsgs.push(msg);
+          }
         }
         for (const manifest of frame.files) {
-          swarmScheduler.ingestFileManifest(manifest, remotePeerId);
+          if (swarmScheduler.ingestFileManifest(manifest, remotePeerId)) {
+            newlyIngestedFiles.push(manifest);
+          }
+        }
+        if (newlyIngestedMsgs.length > 0 || newlyIngestedFiles.length > 0) {
+          gossipSyncBatchesExcept(
+            remotePeerId,
+            newlyIngestedMsgs,
+            newlyIngestedFiles,
+          );
         }
         break;
       }
@@ -357,6 +480,14 @@ export function createRoomPeerEngine(
           safeSendSignaling({ type: "room.join", roomId });
         }
       }
+
+      if (antiEntropyTimer === null && syncIntervalMs > 0) {
+        antiEntropyTimer = setInterval(() => {
+          if (stopped) return;
+          if (meshManager.getVerifiedPeerIds().length === 0) return;
+          meshManager.broadcastControlFrame(buildSyncSummaryFrame());
+        }, syncIntervalMs);
+      }
     },
 
     async stop(): Promise<void> {
@@ -364,6 +495,11 @@ export function createRoomPeerEngine(
       stopped = true;
       started = false;
       joinedOnCurrentConnection = false;
+
+      if (antiEntropyTimer !== null) {
+        clearInterval(antiEntropyTimer);
+        antiEntropyTimer = null;
+      }
 
       swarmScheduler.stop();
       meshManager.stop();

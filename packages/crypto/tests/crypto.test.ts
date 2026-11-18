@@ -307,6 +307,38 @@ describe("@simpleim/crypto", () => {
       ),
     ).toBe(false);
 
+    // Client clock 3 minutes behind server cert.iat still verifies; 15 minutes behind is rejected
+    const skewedOkMsg = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 2,
+      body: "Client clock 3m behind server",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: now - 3 * 60_000,
+    });
+    expect(
+      verifyChatMessage(
+        skewedOkMsg,
+        serverKeys.publicKeyBase64Url,
+        roomKeys.roomId,
+      ),
+    ).toBe(true);
+    const skewedTooFarMsg = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 3,
+      body: "Client clock 15m behind server",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: now - 15 * 60_000,
+    });
+    expect(
+      verifyChatMessage(
+        skewedTooFarMsg,
+        serverKeys.publicKeyBase64Url,
+        roomKeys.roomId,
+      ),
+    ).toBe(false);
+
     const sealed = sealPostAuthControlFrame(roomKeys.roomAppKey, roomKeys.roomId, {
       type: "chat.message",
       message: chatMsg,
