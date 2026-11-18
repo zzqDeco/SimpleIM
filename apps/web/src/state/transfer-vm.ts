@@ -1,5 +1,8 @@
 import type { FileManifest } from "@simpleim/contracts";
-import type { SwarmTransferProgress } from "@simpleim/peer-core";
+import type {
+  RelayFileCacheState,
+  SwarmTransferProgress,
+} from "@simpleim/peer-core";
 import { formatBytes, formatSpeedMBps } from "../utils/format.ts";
 
 export type TransferStatus = SwarmTransferProgress["status"];
@@ -10,6 +13,12 @@ export type TransferStatusTranslationKey =
   | "room.files.status.seeding"
   | "room.files.status.paused"
   | "room.files.status.error";
+
+export type RelayCacheBadgeTranslationKey =
+  | "room.files.relay.uploading"
+  | "room.files.relay.cached"
+  | "room.files.relay.tooLarge"
+  | "room.files.relay.error";
 
 export interface TransferViewModel {
   readonly fileId: string;
@@ -26,6 +35,9 @@ export interface TransferViewModel {
   readonly canCancel: boolean;
   readonly canSave: boolean;
   readonly errorMessage: string | null;
+  readonly relayCacheState: RelayFileCacheState;
+  readonly relayCachePercent: number;
+  readonly relayBadgeKey: RelayCacheBadgeTranslationKey | null;
 }
 
 const STATUS_KEY_MAP: Readonly<
@@ -37,6 +49,23 @@ const STATUS_KEY_MAP: Readonly<
   paused: "room.files.status.paused",
   error: "room.files.status.error",
 };
+
+function resolveRelayBadgeKey(
+  state: RelayFileCacheState,
+): RelayCacheBadgeTranslationKey | null {
+  switch (state) {
+    case "uploading":
+      return "room.files.relay.uploading";
+    case "cached":
+      return "room.files.relay.cached";
+    case "too_large":
+      return "room.files.relay.tooLarge";
+    case "error":
+      return "room.files.relay.error";
+    case "none":
+      return null;
+  }
+}
 
 export function deriveTransferViewModel(
   manifest: FileManifest,
@@ -60,6 +89,20 @@ export function deriveTransferViewModel(
   const seedCount = progress?.availableSeeders ?? (isOwnSeed ? 1 : 0);
   const peerChunkCount = progress?.availablePeersWithChunks ?? seedCount;
   const speedBytesPerSec = progress?.downloadSpeedBytesPerSec ?? 0;
+  const relayCacheState: RelayFileCacheState =
+    progress?.relayCacheState ?? "none";
+  const relayCachedChunks =
+    progress?.relayCachedChunks ??
+    (relayCacheState === "cached" ? manifest.totalChunks : 0);
+  const relayCachePercent =
+    manifest.totalChunks === 0
+      ? relayCacheState === "cached"
+        ? 100
+        : 0
+      : Math.min(
+          100,
+          Math.round((relayCachedChunks / manifest.totalChunks) * 100),
+        );
 
   return {
     fileId: manifest.fileId,
@@ -77,6 +120,9 @@ export function deriveTransferViewModel(
     canCancel: status === "downloading",
     canSave: status === "seeding" && saveAvailable,
     errorMessage: progress?.errorMessage ?? null,
+    relayCacheState,
+    relayCachePercent,
+    relayBadgeKey: resolveRelayBadgeKey(relayCacheState),
   };
 }
 

@@ -98,6 +98,11 @@ export const en = {
   "room.files.action.download": "Download",
   "room.files.action.cancel": "Cancel",
   "room.files.action.save": "Save",
+  "room.files.relay.uploading":
+    "☁️ Caching encrypted {percent}% (safe to close once done)",
+  "room.files.relay.cached": "☁️ Cached encrypted (24h offline ready)",
+  "room.files.relay.tooLarge": "> 100 MB · Online P2P only",
+  "room.files.relay.error": "Relay cache unavailable · Online P2P only",
 
   "security.peerRejected": "Rejected unverified peer connection ({reason}).",
   "security.iceFailed":

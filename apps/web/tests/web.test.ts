@@ -11,6 +11,7 @@ import {
   type FileManifest,
 } from "@simpleim/contracts";
 import {
+  bytesToBase64Url,
   deriveRoomKeys,
   generateEd25519KeyPair,
   issuePeerIdentityCert,
@@ -1652,5 +1653,210 @@ describe("Encrypted RoomVault, MultiplexedSignalingHub & Persistent Room List VM
     expect(portA2.isConnected).toBe(true);
 
     hub.closeAll();
+  });
+});
+
+describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () => {
+  test("sends CSRF header on binary PUTs, decodes Base64Url envelopes, and returns null on 404 getChunk", async () => {
+    const seenRequests: Array<{
+      method: string;
+      path: string;
+      csrf: string | null;
+      contentType: string | null;
+      bodyBytes: Uint8Array | null;
+    }> = [];
+
+    const envelopeBytes = new Uint8Array(64).fill(0x5a);
+    const chunkBytes = new Uint8Array(128).fill(0xa5);
+    const boxId = "1".repeat(64);
+    const blobId = "2".repeat(32);
+    const fileTag = "3".repeat(32);
+    const chunkBlobId = "4".repeat(32);
+
+    const client = new HttpAuthClient({
+      baseUrl: "https://im.example.test",
+      enableBroadcastChannel: false,
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        const headers = new Headers(init?.headers);
+        const bodyBytes =
+          init?.body instanceof Uint8Array
+            ? new Uint8Array(init.body)
+            : null;
+        seenRequests.push({
+          method: init?.method ?? "GET",
+          path: `${url.pathname}${url.search}`,
+          csrf: headers.get("x-csrf-token"),
+          contentType: headers.get("content-type"),
+          bodyBytes,
+        });
+
+        if (url.pathname === "/api/v1/auth/login") {
+          return Response.json({
+            ok: true,
+            csrfToken: "csrf_tok_relay_01",
+            user: {
+              id: "usr_019a0000000070008000000000000001",
+              username: "alice",
+              displayName: "Alice",
+              createdAt: 1_763_000_000_000,
+            },
+          });
+        }
+        if (
+          url.pathname === `/api/v1/relay/${boxId}/envelopes/${blobId}` &&
+          init?.method === "PUT"
+        ) {
+          return Response.json(
+            { ok: true, seq: 7, created: true, expiresAt: 1_900_000_000_000 },
+            { status: 201 },
+          );
+        }
+        if (
+          url.pathname === `/api/v1/relay/${boxId}/envelopes` &&
+          init?.method === "GET"
+        ) {
+          return Response.json({
+            ok: true,
+            items: [
+              {
+                seq: 7,
+                blobId,
+                payloadB64: bytesToBase64Url(envelopeBytes),
+                expiresAt: 1_900_000_000_000,
+              },
+            ],
+            nextCursor: 7,
+            hasMore: false,
+          });
+        }
+        if (
+          url.pathname ===
+            `/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkBlobId}` &&
+          init?.method === "PUT"
+        ) {
+          return Response.json(
+            { ok: true, created: true, expiresAt: 1_900_000_000_000 },
+            { status: 201 },
+          );
+        }
+        if (
+          url.pathname ===
+            `/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkBlobId}` &&
+          init?.method === "GET"
+        ) {
+          return new Response(chunkBytes, {
+            status: 200,
+            headers: { "Content-Type": "application/octet-stream" },
+          });
+        }
+        return Response.json(
+          { ok: false, error: { code: "not_found", message: "Missing chunk" } },
+          { status: 404 },
+        );
+      }) as typeof fetch,
+    });
+
+    await client.login({ username: "alice", password: "Password!123" });
+    const relay = client.createBlindRelayClient({
+      enabled: true,
+      ttlMs: 86_400_000,
+      maxFileBytes: 104_857_600,
+      maxTotalBytes: 2_147_483_648,
+    });
+    expect(relay.enabled).toBe(true);
+    expect(relay.maxFileBytes).toBe(104_857_600);
+
+    const putEnv = await relay.putEnvelope({
+      boxId,
+      blobId,
+      payload: envelopeBytes,
+    });
+    expect(putEnv).toEqual({ seq: 7, expiresAt: 1_900_000_000_000 });
+    expect(seenRequests[1]?.csrf).toBe("csrf_tok_relay_01");
+    expect(seenRequests[1]?.contentType).toBe("application/octet-stream");
+    expect(seenRequests[1]?.bodyBytes).toEqual(envelopeBytes);
+
+    const listed = await relay.listEnvelopes({ boxId, afterSeq: 0, limit: 50 });
+    expect(listed.nextCursor).toBe(7);
+    expect(listed.items).toHaveLength(1);
+    expect(listed.items[0]?.payload).toEqual(envelopeBytes);
+
+    const putCh = await relay.putChunk({
+      boxId,
+      fileTag,
+      chunkBlobId,
+      payload: chunkBytes,
+    });
+    expect(putCh.expiresAt).toBe(1_900_000_000_000);
+    expect(seenRequests[3]?.csrf).toBe("csrf_tok_relay_01");
+
+    const gotCh = await relay.getChunk({ boxId, fileTag, chunkBlobId });
+    expect(gotCh).toEqual(chunkBytes);
+
+    const missingCh = await relay.getChunk({
+      boxId,
+      fileTag,
+      chunkBlobId: "f".repeat(32),
+    });
+    expect(missingCh).toBeNull();
+    client.dispose();
+  });
+
+  test("deriveTransferViewModel exposes relay cache badges and keeps Download enabled with 0 online seeds", () => {
+    const manifest = buildDummyManifest({
+      fileId: "019a0000-0000-7000-8000-000000000777",
+      fileName: "offline-report.pdf",
+      fileSize: SWARM_CHUNK_SIZE * 4,
+      totalChunks: 4,
+    });
+
+    const uploadingVm = deriveTransferViewModel(
+      manifest,
+      {
+        fileId: manifest.fileId,
+        fileName: manifest.fileName,
+        fileSize: manifest.fileSize,
+        totalChunks: 4,
+        completedChunks: 4,
+        bytesCompleted: manifest.fileSize,
+        downloadSpeedBytesPerSec: 0,
+        availableSeeders: 1,
+        availablePeersWithChunks: 1,
+        status: "seeding",
+        relayCacheState: "uploading",
+        relayCachedChunks: 2,
+      },
+      manifest.senderCert.payload.peerId,
+      true,
+    );
+    expect(uploadingVm.relayCacheState).toBe("uploading");
+    expect(uploadingVm.relayCachePercent).toBe(50);
+    expect(uploadingVm.relayBadgeKey).toBe("room.files.relay.uploading");
+
+    const offlineReceiverVm = deriveTransferViewModel(
+      manifest,
+      {
+        fileId: manifest.fileId,
+        fileName: manifest.fileName,
+        fileSize: manifest.fileSize,
+        totalChunks: 4,
+        completedChunks: 0,
+        bytesCompleted: 0,
+        downloadSpeedBytesPerSec: 0,
+        availableSeeders: 0,
+        availablePeersWithChunks: 0,
+        status: "announced",
+        relayCacheState: "cached",
+        relayCachedChunks: 4,
+      },
+      "peer_019a0000000070008000000000000999",
+      false,
+    );
+    expect(offlineReceiverVm.seedCount).toBe(0);
+    expect(offlineReceiverVm.canDownload).toBe(true);
+    expect(offlineReceiverVm.relayCacheState).toBe("cached");
+    expect(offlineReceiverVm.relayCachePercent).toBe(100);
+    expect(offlineReceiverVm.relayBadgeKey).toBe("room.files.relay.cached");
   });
 });

@@ -98,6 +98,11 @@ export const es = {
   "room.files.action.download": "Descargar",
   "room.files.action.cancel": "Cancelar",
   "room.files.action.save": "Guardar",
+  "room.files.relay.uploading":
+    "☁️ Guardando copia cifrada {percent}% (puedes cerrar al terminar)",
+  "room.files.relay.cached": "☁️ Copia cifrada lista (24h sin conexión)",
+  "room.files.relay.tooLarge": "> 100 MB · Solo P2P en línea",
+  "room.files.relay.error": "Caché no disponible · Solo P2P en línea",
 
   "security.peerRejected": "Se rechazó un par no verificado ({reason}).",
   "security.iceFailed":

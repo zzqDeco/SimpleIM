@@ -403,6 +403,9 @@ async function startCluster(): Promise<{
     stunUrls: [`stun:127.0.0.1:${stunSocket.port}`],
     passwordHashMemoryCost: 4_096,
     passwordHashTimeCost: 1,
+    relay: {
+      cacheDir: join(tempRootDir, "relay-cache"),
+    },
     logSink: (line) => serverLogLines.push(line),
   });
 
@@ -449,6 +452,7 @@ async function spawnCliPeer(params: {
   });
   const transportFactory = new WeriftTransportFactory();
   const storage = new FsChunkStorageAdapter({ downloadDir });
+  const relayClient = api.createBlindRelayClient(reg.sessionToken, meta.relay);
   const completedFileIds = new Set<string>();
 
   const engine = createRoomPeerEngine({
@@ -458,9 +462,11 @@ async function spawnCliPeer(params: {
     serverSignPubKey: meta.serverSignPubKey,
     roomKeys,
     iceServers: meta.iceServers,
+    maxSignalPayloadBytes: meta.limits.maxSignalPayloadBytes,
     signaling,
     transportFactory,
     chunkStorage: storage,
+    relayClient,
     events: {
       onTransferCompleted: (manifest) => {
         completedFileIds.add(manifest.fileId);

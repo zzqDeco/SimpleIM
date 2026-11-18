@@ -4,11 +4,75 @@ import type {
   IceServerConfig,
   PeerCertRequest,
   PeerIdentityCert,
+  RelayMetaConfig,
 } from "@simpleim/contracts";
 import type { Session, User } from "./entities.ts";
 
 export interface ClockPort {
   nowMs(): number;
+}
+
+export interface RelayConfig extends RelayMetaConfig {
+  readonly enabled: boolean;
+  readonly ttlMs: number;
+  readonly maxFileBytes: number;
+  readonly maxTotalBytes: number;
+}
+
+export interface StoredRelayEnvelope {
+  readonly seq: number;
+  readonly blobId: string;
+  readonly payload: Uint8Array;
+  readonly expiresAt: number;
+}
+
+export interface PutRelayEnvelopeResult {
+  readonly seq: number;
+  readonly created: boolean;
+  readonly expiresAt: number;
+}
+
+export interface ListRelayEnvelopesResult {
+  readonly items: readonly StoredRelayEnvelope[];
+  readonly hasMore: boolean;
+}
+
+export interface PutRelayChunkResult {
+  readonly created: boolean;
+  readonly expiresAt: number;
+}
+
+export interface BlindRelayStorePort {
+  putEnvelope(params: {
+    boxId: string;
+    blobId: string;
+    payload: Uint8Array;
+    nowMs: number;
+    ttlMs: number;
+  }): PutRelayEnvelopeResult;
+  listEnvelopes(params: {
+    boxId: string;
+    afterSeq: number;
+    limit: number;
+    nowMs: number;
+  }): ListRelayEnvelopesResult;
+  putChunk(params: {
+    boxId: string;
+    fileTag: string;
+    chunkBlobId: string;
+    payload: Uint8Array;
+    nowMs: number;
+    ttlMs: number;
+    maxFileBytes: number;
+  }): PutRelayChunkResult;
+  getChunk(params: {
+    boxId: string;
+    fileTag: string;
+    chunkBlobId: string;
+    nowMs: number;
+  }): Uint8Array | null;
+  sweepExpired(nowMs: number): number;
+  close(): void;
 }
 
 export interface UserRepositoryPort {

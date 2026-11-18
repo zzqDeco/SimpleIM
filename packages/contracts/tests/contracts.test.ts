@@ -6,10 +6,14 @@ import {
   encodeSwarmFrame,
   hasChunkInBitfield,
   isValidFileManifest,
+  isValidRelayBlobId,
+  isValidRelayBoxId,
+  isValidRelayListEnvelopesResponse,
   MAX_CHAT_LAMPORT,
   parseClientSignalingFrame,
   parsePostAuthControlFrame,
   parseRegisterRequest,
+  parseRelayEnvelopeInnerPayload,
   parseServerSignalingFrame,
   parseSignalingInnerPayload,
   sanitizeFileName,
@@ -283,5 +287,38 @@ describe("@simpleim/contracts", () => {
     expect(() =>
       parseSignalingInnerPayload(mediumSdpRaw, { maxFrameBytes: 8_192 }),
     ).toThrow();
+  });
+
+  test("relay identifiers and parseRelayEnvelopeInnerPayload validate blind relay shapes", () => {
+    expect(isValidRelayBoxId("a".repeat(64))).toBe(true);
+    expect(isValidRelayBoxId("A".repeat(64))).toBe(false);
+    expect(isValidRelayBlobId("f".repeat(32))).toBe(true);
+    expect(isValidRelayBlobId("../escape".padEnd(32, "a"))).toBe(false);
+
+    const parsedPage = parseRelayEnvelopeInnerPayload(
+      JSON.stringify({
+        type: "relay.hash_page",
+        fileId: "01932c7f-8a1e-7b23-9d4c-112233445566",
+        pageIndex: 0,
+        chunkHashes: ["0".repeat(64)],
+      }),
+    );
+    expect(parsedPage.type).toBe("relay.hash_page");
+
+    expect(
+      isValidRelayListEnvelopesResponse({
+        ok: true,
+        items: [
+          {
+            seq: 1,
+            blobId: "0".repeat(32),
+            payloadB64: "A".repeat(60),
+            expiresAt: 1_800_000_000_000,
+          },
+        ],
+        nextCursor: 1,
+        hasMore: false,
+      }),
+    ).toBe(true);
   });
 });

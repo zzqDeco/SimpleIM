@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { ServerLimits } from "@simpleim/contracts";
+import type { RelayMetaConfig, ServerLimits } from "@simpleim/contracts";
 import {
   HttpHandler,
   normalizeAllowedOrigins,
@@ -8,16 +8,22 @@ import {
 } from "./adapter/index.ts";
 import {
   AuthService,
+  DEFAULT_RELAY_CONFIG,
   DEFAULT_SERVER_LIMITS,
+  RelayService,
   SignalingService,
 } from "./app/index.ts";
 import type {
+  BlindRelayStorePort,
   ClockPort,
   LoggerPort,
   RateLimitRule,
+  RelayConfig,
 } from "./domain/index.ts";
 import {
   BunPasswordHasher,
+  FsBlindRelayStore,
+  InMemoryBlindRelayStore,
   InMemoryRateLimiter,
   JsonBoundaryLogger,
   openAndMigrateSqliteDb,
@@ -26,6 +32,11 @@ import {
   SqliteUserRepository,
   SystemClock,
 } from "./infra/index.ts";
+
+export interface SimpleImRelayOptions extends Partial<RelayMetaConfig> {
+  readonly cacheDir?: string;
+  readonly sweepIntervalMs?: number;
+}
 
 export interface SimpleImServerOptions {
   readonly port?: number;
@@ -49,9 +60,12 @@ export interface SimpleImServerOptions {
   readonly peerCertTtlMs?: number;
   readonly popMaxSkewMs?: number;
   readonly limits?: Partial<ServerLimits>;
+  readonly relay?: SimpleImRelayOptions;
   readonly authRateLimit?: RateLimitRule;
   readonly peerCertRateLimit?: RateLimitRule;
   readonly wsFrameRateLimit?: RateLimitRule;
+  readonly relayEnvelopeRateLimit?: RateLimitRule;
+  readonly relayChunkRateLimit?: RateLimitRule;
   readonly logger?: LoggerPort;
   readonly logSink?: (jsonLine: string) => void;
   readonly clock?: ClockPort;
@@ -67,6 +81,7 @@ export interface SimpleImServerInstance {
   readonly serverSignPubKey: string;
   readonly sqliteDb: Database;
   readonly signalingService: SignalingService;
+  readonly relayService: RelayService;
   stop(closeActiveConnections?: boolean): Promise<void>;
 }
 
@@ -134,6 +149,50 @@ export function createSimpleImServer(
     );
   }
 
+  const relayConfig: RelayConfig = {
+    enabled: options.relay?.enabled ?? DEFAULT_RELAY_CONFIG.enabled,
+    ttlMs: options.relay?.ttlMs ?? DEFAULT_RELAY_CONFIG.ttlMs,
+    maxFileBytes:
+      options.relay?.maxFileBytes ?? DEFAULT_RELAY_CONFIG.maxFileBytes,
+    maxTotalBytes:
+      options.relay?.maxTotalBytes ?? DEFAULT_RELAY_CONFIG.maxTotalBytes,
+  };
+
+  if (!Number.isSafeInteger(relayConfig.ttlMs) || relayConfig.ttlMs <= 0) {
+    throw new Error(`Invalid relay.ttlMs (${relayConfig.ttlMs}); expected > 0`);
+  }
+  if (
+    !Number.isSafeInteger(relayConfig.maxFileBytes) ||
+    relayConfig.maxFileBytes <= 0
+  ) {
+    throw new Error(
+      `Invalid relay.maxFileBytes (${relayConfig.maxFileBytes}); expected > 0`,
+    );
+  }
+  if (
+    !Number.isSafeInteger(relayConfig.maxTotalBytes) ||
+    relayConfig.maxTotalBytes <= 0
+  ) {
+    throw new Error(
+      `Invalid relay.maxTotalBytes (${relayConfig.maxTotalBytes}); expected > 0`,
+    );
+  }
+
+  const rawRelayCacheDir = options.relay?.cacheDir?.trim();
+  const relayStore: BlindRelayStorePort =
+    rawRelayCacheDir && rawRelayCacheDir !== ":memory:"
+      ? new FsBlindRelayStore({
+          cacheDir: rawRelayCacheDir,
+          maxTotalBytes: relayConfig.maxTotalBytes,
+          clock,
+          sweepIntervalMs: options.relay?.sweepIntervalMs,
+        })
+      : new InMemoryBlindRelayStore({
+          maxTotalBytes: relayConfig.maxTotalBytes,
+          clock,
+          sweepIntervalMs: options.relay?.sweepIntervalMs,
+        });
+
   const authService = new AuthService({
     userRepo,
     sessionRepo,
@@ -143,11 +202,21 @@ export function createSimpleImServer(
     clock,
     stunUrls: options.stunUrls,
     limits,
+    relay: relayConfig,
     sessionTtlMs: options.sessionTtlMs,
     peerCertTtlMs: options.peerCertTtlMs,
     popMaxSkewMs: options.popMaxSkewMs,
     authRateLimit: options.authRateLimit,
     peerCertRateLimit: options.peerCertRateLimit,
+  });
+
+  const relayService = new RelayService({
+    store: relayStore,
+    rateLimiter,
+    clock,
+    config: relayConfig,
+    envelopeRateLimit: options.relayEnvelopeRateLimit,
+    chunkRateLimit: options.relayChunkRateLimit,
   });
 
   const signalingService = new SignalingService({
@@ -164,6 +233,7 @@ export function createSimpleImServer(
 
   const httpHandler = new HttpHandler({
     authService,
+    relayService,
     logger,
     clock,
     allowedOrigins,
@@ -182,38 +252,50 @@ export function createSimpleImServer(
     maxSignalPayloadBytes: limits.maxSignalPayloadBytes,
   });
 
-  const server = Bun.serve<WsConnectionData>({
-    port: options.port ?? 3000,
-    hostname: host,
-    maxRequestBodySize: 1_048_576,
-    fetch(req, srv) {
-      const url = new URL(req.url);
-      if (url.pathname === "/ws/v1/signaling") {
-        return wsHandler.handleUpgrade(req, url, srv);
-      }
-      const directIp = srv.requestIP(req)?.address;
-      return httpHandler.handle(req, url, directIp);
-    },
-    websocket: {
-      maxPayloadLength: Math.min(
-        524_288,
-        Math.max(limits.maxSignalPayloadBytes + 4_096, 65_536),
-      ),
-      idleTimeout: 120,
-      open(ws) {
-        wsHandler.onOpen(ws);
+  let server: Bun.Server<WsConnectionData>;
+  try {
+    server = Bun.serve<WsConnectionData>({
+      port: options.port ?? 3000,
+      hostname: host,
+      maxRequestBodySize: 1_048_576,
+      fetch(req, srv) {
+        const url = new URL(req.url);
+        if (url.pathname === "/ws/v1/signaling") {
+          return wsHandler.handleUpgrade(req, url, srv);
+        }
+        const directIp = srv.requestIP(req)?.address;
+        return httpHandler.handle(req, url, directIp);
       },
-      message(ws, message) {
-        wsHandler.onMessage(ws, message);
+      websocket: {
+        maxPayloadLength: Math.min(
+          524_288,
+          Math.max(limits.maxSignalPayloadBytes + 4_096, 65_536),
+        ),
+        idleTimeout: 120,
+        open(ws) {
+          wsHandler.onOpen(ws);
+        },
+        message(ws, message) {
+          wsHandler.onMessage(ws, message);
+        },
+        close(ws) {
+          wsHandler.onClose(ws);
+        },
       },
-      close(ws) {
-        wsHandler.onClose(ws);
-      },
-    },
-  });
+    });
+  } catch (err) {
+    relayStore.close();
+    try {
+      sqliteDb.close(false);
+    } catch {
+      // Ignore SQLite close errors during failed startup.
+    }
+    throw err;
+  }
 
   const boundPort = server.port;
   if (boundPort === undefined) {
+    relayStore.close();
     throw new Error("Expected TCP port on SimpleIM server");
   }
 
@@ -234,11 +316,13 @@ export function createSimpleImServer(
     serverSignPubKey: identitySigner.serverSignPubKey,
     sqliteDb,
     signalingService,
+    relayService,
     async stop(closeActiveConnections = true): Promise<void> {
       if (stopped) {
         return;
       }
       stopped = true;
+      relayStore.close();
       await server.stop(closeActiveConnections);
       if (sqlitePath !== ":memory:" && !sqlitePath.startsWith("file:")) {
         try {

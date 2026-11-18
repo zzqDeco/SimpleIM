@@ -2,6 +2,13 @@ import {
   CONTROL_CHANNEL_ID,
   CONTROL_CHANNEL_LABEL,
   createBitfield,
+  DEFAULT_RELAY_MAX_FILE_BYTES,
+  DEFAULT_RELAY_TTL_MS,
+  isValidRelayBlobId,
+  isValidRelayBoxId,
+  MAX_RELAY_CHUNK_CIPHERTEXT_BYTES,
+  MAX_RELAY_ENVELOPE_CIPHERTEXT_BYTES,
+  MAX_RELAY_LIST_LIMIT,
   setChunkInBitfield,
   SWARM_CHANNEL_ID,
   SWARM_CHANNEL_LABEL,
@@ -17,6 +24,8 @@ import {
   sha256Hex,
 } from "@simpleim/crypto";
 import type {
+  BlindRelayClientPort,
+  BlindRelayListedEnvelope,
   ChannelReadyState,
   ChunkStoragePort,
   DataChannelPort,
@@ -864,5 +873,322 @@ export class InMemoryChunkStorage implements ChunkStoragePort {
 
   getFinalizedBytes(fileId: string): Uint8Array | undefined {
     return this.finalizedFiles.get(fileId);
+  }
+
+  hasReceivedChunk(fileId: string, chunkIndex: number): boolean {
+    return Boolean(this.receiving.get(fileId)?.chunks.has(chunkIndex));
+  }
+}
+
+interface StoredRelayEnvelope {
+  seq: number;
+  blobId: string;
+  payload: Uint8Array;
+  expiresAt: number;
+}
+
+interface StoredRelayChunk {
+  payload: Uint8Array;
+  expiresAt: number;
+}
+
+interface StoredRelayBox {
+  nextSeq: number;
+  envelopesByBlobId: Map<string, StoredRelayEnvelope>;
+  chunksByKey: Map<string, StoredRelayChunk>;
+}
+
+export interface MockBlindRelayHubOptions {
+  ttlMs?: number;
+  maxFileBytes?: number;
+  now?: () => number;
+}
+
+export interface MockBlindRelayClientOptions {
+  enabled?: boolean;
+  maxFileBytes?: number;
+}
+
+export class MockBlindRelayClient implements BlindRelayClientPort {
+  enabled: boolean;
+  readonly maxFileBytes: number;
+  putEnvelopeCalls = 0;
+  listEnvelopeCalls = 0;
+  putChunkCalls = 0;
+  getChunkCalls = 0;
+
+  private readonly hub: MockBlindRelayHub;
+
+  constructor(hub: MockBlindRelayHub, options?: MockBlindRelayClientOptions) {
+    this.hub = hub;
+    this.enabled = options?.enabled ?? true;
+    this.maxFileBytes = options?.maxFileBytes ?? hub.maxFileBytes;
+  }
+
+  async putEnvelope(params: {
+    boxId: string;
+    blobId: string;
+    payload: Uint8Array;
+  }): Promise<{ seq: number; expiresAt: number }> {
+    this.putEnvelopeCalls += 1;
+    await Promise.resolve();
+    return this.hub.putEnvelope(params);
+  }
+
+  async listEnvelopes(params: {
+    boxId: string;
+    afterSeq: number;
+    limit?: number;
+  }): Promise<{
+    items: BlindRelayListedEnvelope[];
+    nextCursor: number;
+    hasMore: boolean;
+  }> {
+    this.listEnvelopeCalls += 1;
+    await Promise.resolve();
+    return this.hub.listEnvelopes(params);
+  }
+
+  async putChunk(params: {
+    boxId: string;
+    fileTag: string;
+    chunkBlobId: string;
+    payload: Uint8Array;
+  }): Promise<{ expiresAt: number }> {
+    this.putChunkCalls += 1;
+    await Promise.resolve();
+    return this.hub.putChunk(params);
+  }
+
+  async getChunk(params: {
+    boxId: string;
+    fileTag: string;
+    chunkBlobId: string;
+  }): Promise<Uint8Array | null> {
+    this.getChunkCalls += 1;
+    await Promise.resolve();
+    return this.hub.getChunk(params);
+  }
+}
+
+export class MockBlindRelayHub {
+  isOnline = true;
+  readonly ttlMs: number;
+  readonly maxFileBytes: number;
+  private readonly now: () => number;
+  private readonly boxes = new Map<string, StoredRelayBox>();
+
+  constructor(options?: MockBlindRelayHubOptions) {
+    this.ttlMs = options?.ttlMs ?? DEFAULT_RELAY_TTL_MS;
+    this.maxFileBytes = options?.maxFileBytes ?? DEFAULT_RELAY_MAX_FILE_BYTES;
+    this.now = options?.now ?? (() => Date.now());
+  }
+
+  createClient(options?: MockBlindRelayClientOptions): MockBlindRelayClient {
+    return new MockBlindRelayClient(this, options);
+  }
+
+  private getOrCreateBox(boxId: string): StoredRelayBox {
+    let box = this.boxes.get(boxId);
+    if (!box) {
+      box = {
+        nextSeq: 1,
+        envelopesByBlobId: new Map(),
+        chunksByKey: new Map(),
+      };
+      this.boxes.set(boxId, box);
+    }
+    return box;
+  }
+
+  private purgeExpired(box: StoredRelayBox): void {
+    const nowTs = this.now();
+    for (const [blobId, item] of box.envelopesByBlobId.entries()) {
+      if (item.expiresAt <= nowTs) {
+        box.envelopesByBlobId.delete(blobId);
+      }
+    }
+    for (const [key, chunk] of box.chunksByKey.entries()) {
+      if (chunk.expiresAt <= nowTs) {
+        box.chunksByKey.delete(key);
+      }
+    }
+  }
+
+  putEnvelope(params: {
+    boxId: string;
+    blobId: string;
+    payload: Uint8Array;
+  }): { seq: number; expiresAt: number } {
+    if (!this.isOnline) {
+      throw new Error("Blind relay server is offline");
+    }
+    if (!isValidRelayBoxId(params.boxId) || !isValidRelayBlobId(params.blobId)) {
+      throw new Error("Invalid relay boxId or blobId");
+    }
+    if (params.payload.byteLength > MAX_RELAY_ENVELOPE_CIPHERTEXT_BYTES) {
+      throw new Error("Relay envelope exceeds maximum ciphertext size");
+    }
+
+    const box = this.getOrCreateBox(params.boxId);
+    this.purgeExpired(box);
+
+    const existing = box.envelopesByBlobId.get(params.blobId);
+    if (existing) {
+      return { seq: existing.seq, expiresAt: existing.expiresAt };
+    }
+
+    const seq = box.nextSeq++;
+    const expiresAt = this.now() + this.ttlMs;
+    box.envelopesByBlobId.set(params.blobId, {
+      seq,
+      blobId: params.blobId,
+      payload: params.payload.slice(),
+      expiresAt,
+    });
+    return { seq, expiresAt };
+  }
+
+  listEnvelopes(params: {
+    boxId: string;
+    afterSeq: number;
+    limit?: number;
+  }): {
+    items: BlindRelayListedEnvelope[];
+    nextCursor: number;
+    hasMore: boolean;
+  } {
+    if (!this.isOnline) {
+      throw new Error("Blind relay server is offline");
+    }
+    if (!isValidRelayBoxId(params.boxId)) {
+      throw new Error("Invalid relay boxId");
+    }
+
+    const box = this.boxes.get(params.boxId);
+    if (!box) {
+      return { items: [], nextCursor: params.afterSeq, hasMore: false };
+    }
+    this.purgeExpired(box);
+
+    const effectiveLimit = Math.min(
+      Math.max(1, params.limit ?? MAX_RELAY_LIST_LIMIT),
+      MAX_RELAY_LIST_LIMIT,
+    );
+    const matching = Array.from(box.envelopesByBlobId.values())
+      .filter((it) => it.seq > params.afterSeq)
+      .sort((a, b) => a.seq - b.seq);
+
+    const page = matching.slice(0, effectiveLimit).map((it) => ({
+      seq: it.seq,
+      blobId: it.blobId,
+      payload: it.payload.slice(),
+      expiresAt: it.expiresAt,
+    }));
+    const hasMore = matching.length > effectiveLimit;
+    const nextCursor =
+      page.length > 0 ? page[page.length - 1]!.seq : params.afterSeq;
+
+    return { items: page, nextCursor, hasMore };
+  }
+
+  putChunk(params: {
+    boxId: string;
+    fileTag: string;
+    chunkBlobId: string;
+    payload: Uint8Array;
+  }): { expiresAt: number } {
+    if (!this.isOnline) {
+      throw new Error("Blind relay server is offline");
+    }
+    if (
+      !isValidRelayBoxId(params.boxId) ||
+      !isValidRelayBlobId(params.fileTag) ||
+      !isValidRelayBlobId(params.chunkBlobId)
+    ) {
+      throw new Error("Invalid relay chunk identifiers");
+    }
+    if (params.payload.byteLength > MAX_RELAY_CHUNK_CIPHERTEXT_BYTES) {
+      throw new Error("Relay chunk exceeds maximum ciphertext size");
+    }
+
+    const box = this.getOrCreateBox(params.boxId);
+    this.purgeExpired(box);
+
+    const key = `${params.fileTag}:${params.chunkBlobId}`;
+    const expiresAt = this.now() + this.ttlMs;
+    box.chunksByKey.set(key, {
+      payload: params.payload.slice(),
+      expiresAt,
+    });
+    return { expiresAt };
+  }
+
+  getChunk(params: {
+    boxId: string;
+    fileTag: string;
+    chunkBlobId: string;
+  }): Uint8Array | null {
+    if (!this.isOnline) {
+      throw new Error("Blind relay server is offline");
+    }
+    const box = this.boxes.get(params.boxId);
+    if (!box) return null;
+    this.purgeExpired(box);
+
+    const key = `${params.fileTag}:${params.chunkBlobId}`;
+    const rec = box.chunksByKey.get(key);
+    return rec ? rec.payload.slice() : null;
+  }
+
+  tamperChunkBytes(
+    boxId: string,
+    fileTag: string,
+    chunkBlobId: string,
+    mutator: (bytes: Uint8Array) => Uint8Array,
+  ): void {
+    const box = this.boxes.get(boxId);
+    const key = `${fileTag}:${chunkBlobId}`;
+    const rec = box?.chunksByKey.get(key);
+    if (!rec) {
+      throw new Error(`Relay chunk not found for tampering: ${key}`);
+    }
+    rec.payload = mutator(rec.payload.slice());
+  }
+
+  overwriteRawChunk(
+    boxId: string,
+    fileTag: string,
+    chunkBlobId: string,
+    rawPayload: Uint8Array,
+  ): void {
+    const box = this.getOrCreateBox(boxId);
+    box.chunksByKey.set(`${fileTag}:${chunkBlobId}`, {
+      payload: rawPayload.slice(),
+      expiresAt: this.now() + this.ttlMs,
+    });
+  }
+
+  injectCorruptedEnvelope(
+    boxId: string,
+    blobId: string,
+    rawPayload: Uint8Array,
+  ): void {
+    const box = this.getOrCreateBox(boxId);
+    const seq = box.nextSeq++;
+    box.envelopesByBlobId.set(blobId, {
+      seq,
+      blobId,
+      payload: rawPayload.slice(),
+      expiresAt: this.now() + this.ttlMs,
+    });
+  }
+
+  getStoredEnvelopeCount(boxId: string): number {
+    return this.boxes.get(boxId)?.envelopesByBlobId.size ?? 0;
+  }
+
+  getStoredChunkCount(boxId: string): number {
+    return this.boxes.get(boxId)?.chunksByKey.size ?? 0;
   }
 }

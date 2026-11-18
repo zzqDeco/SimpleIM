@@ -98,6 +98,10 @@ export const zhCN = {
   "room.files.action.download": "下载",
   "room.files.action.cancel": "取消",
   "room.files.action.save": "保存",
+  "room.files.relay.uploading": "☁️ 加密暂存中 {percent}%（完成后可关闭页面）",
+  "room.files.relay.cached": "☁️ 已加密暂存（24h 可离线下载）",
+  "room.files.relay.tooLarge": "超 100 MB · 仅在线直传",
+  "room.files.relay.error": "暂存未完成 · 需在线直传",
 
   "security.peerRejected": "已拒绝未通过身份校验的连接（{reason}）。",
   "security.iceFailed":

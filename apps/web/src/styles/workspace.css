@@ -734,6 +734,34 @@
   color: var(--text-muted);
 }
 
+.file-relay-badge {
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-canvas);
+  color: var(--text-secondary);
+}
+
+.file-relay-badge-uploading {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.file-relay-badge-cached {
+  color: var(--status-success);
+  border-color: var(--status-success-border);
+  background: var(--status-success-soft);
+}
+
+.file-relay-badge-error {
+  color: var(--status-danger);
+  border-color: var(--status-danger-border);
+  background: var(--status-danger-soft);
+}
+
 .file-row-actions {
   display: flex;
   align-items: center;
