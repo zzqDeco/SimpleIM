@@ -19,9 +19,12 @@ import type {
 } from "@simpleim/peer-core";
 import {
   createSelfSignedCertificate,
+  DtlsSocket,
   HashAlgorithm,
+  isDtls,
   NamedCurveAlgorithm,
   RTCCertificate,
+  RTCDtlsTransport,
   RTCPeerConnection,
   SignatureAlgorithm,
   TcpTransport,
@@ -33,7 +36,446 @@ import {
 
 const WERIFT_UDP_ERROR_GUARDED = Symbol.for("simpleim.werift.udpErrorGuarded");
 const WERIFT_TCP_ERROR_GUARDED = Symbol.for("simpleim.werift.tcpErrorGuarded");
+const WERIFT_DTLS_FRAGMENT_GUARDED = Symbol.for(
+  "simpleim.werift.dtlsFragmentGuarded",
+);
+const WERIFT_DTLS_REASSEMBLER = Symbol.for("simpleim.werift.dtlsReassembler");
+const WERIFT_DTLS_TRANSPORT_GUARDED = Symbol.for(
+  "simpleim.werift.dtlsTransportGuarded",
+);
+const WERIFT_EARLY_DTLS_STATE = Symbol.for("simpleim.werift.earlyDtlsState");
 const TURN_TCP_CONNECT_TIMEOUT_MS = 4_000;
+const MAX_DTLS_HANDSHAKE_BYTES = 262_144;
+const MAX_PENDING_DTLS_HANDSHAKES = 32;
+const MAX_EARLY_DTLS_PACKETS = 32;
+
+export interface DtlsHandshakeFragmentLike {
+  msg_type: number;
+  length: number;
+  message_seq: number;
+  fragment_offset: number;
+  fragment_length: number;
+  fragment: Buffer;
+}
+
+interface PendingDtlsHandshakeEntry<T extends DtlsHandshakeFragmentLike> {
+  readonly msgType: number;
+  readonly messageSeq: number;
+  readonly totalLength: number;
+  readonly combined: Buffer;
+  ranges: Array<[number, number]>;
+  readonly construct: (
+    msgType: number,
+    length: number,
+    messageSeq: number,
+    fragmentOffset: number,
+    fragmentLength: number,
+    fragment: Buffer,
+  ) => T;
+}
+
+function mergeByteRanges(
+  existing: ReadonlyArray< readonly [number, number] >,
+  start: number,
+  end: number,
+): Array<[number, number]> {
+  const next: Array<[number, number]> = [
+    ...existing.map(([s, e]): [number, number] => [s, e]),
+    [start, end],
+  ];
+  next.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<[number, number]> = [];
+  for (const [s, e] of next) {
+    const last = merged[merged.length - 1];
+    if (!last) {
+      merged.push([s, e]);
+    } else if (s <= last[1]) {
+      last[1] = Math.max(last[1], e);
+    } else {
+      merged.push([s, e]);
+    }
+  }
+  return merged;
+}
+
+function instantiateReassembledFragment<T extends DtlsHandshakeFragmentLike>(
+  sample: T,
+  msgType: number,
+  length: number,
+  messageSeq: number,
+  fragmentOffset: number,
+  fragmentLength: number,
+  fragment: Buffer,
+): T {
+  const ctor = (sample as unknown as { constructor?: unknown }).constructor;
+  if (typeof ctor === "function" && ctor !== Object) {
+    try {
+      return new (ctor as new (
+        msg_type: number,
+        length: number,
+        message_seq: number,
+        fragment_offset: number,
+        fragment_length: number,
+        fragment: Buffer,
+      ) => T)(
+        msgType,
+        length,
+        messageSeq,
+        fragmentOffset,
+        fragmentLength,
+        fragment,
+      );
+    } catch {
+      // Fall through to plain object shape if custom constructor signature differs
+    }
+  }
+  return {
+    msg_type: msgType,
+    length,
+    message_seq: messageSeq,
+    fragment_offset: fragmentOffset,
+    fragment_length: fragmentLength,
+    fragment,
+  } as T;
+}
+
+/**
+ * RFC 6347 §4.2.3 compliant DTLS handshake fragment reassembler.
+ * Fixes werift's DtlsSocket.handleFragmentHandshake bug where out-of-order,
+ * duplicate, or 3-fragment Post-Quantum (X25519MLKEM768) ClientHello flights
+ * with a delayed first fragment assembled zero-filled buffers and failed DTLS.
+ */
+export class DtlsHandshakeReassembler<
+  T extends DtlsHandshakeFragmentLike = DtlsHandshakeFragmentLike,
+> {
+  private readonly pending = new Map<string, PendingDtlsHandshakeEntry<T>>();
+
+  reset(): void {
+    this.pending.clear();
+  }
+
+  get pendingCount(): number {
+    return this.pending.size;
+  }
+
+  ingest(messages: readonly T[]): T[] {
+    const completed: T[] = [];
+    for (const msg of messages) {
+      const totalLength = msg.length;
+      const offset = msg.fragment_offset;
+      const fragLen = msg.fragment_length;
+      const buf = msg.fragment;
+
+      if (
+        !Number.isInteger(totalLength) ||
+        !Number.isInteger(offset) ||
+        !Number.isInteger(fragLen) ||
+        totalLength < 0 ||
+        totalLength > MAX_DTLS_HANDSHAKE_BYTES ||
+        offset < 0 ||
+        fragLen < 0 ||
+        !Buffer.isBuffer(buf) ||
+        buf.length < fragLen ||
+        offset + fragLen > totalLength
+      ) {
+        continue;
+      }
+
+      const key = `${msg.msg_type}:${msg.message_seq}:${totalLength}`;
+
+      // Unfragmented message (including zero-length messages like ServerHelloDone)
+      if (offset === 0 && fragLen === totalLength) {
+        this.pending.delete(key);
+        completed.push(
+          buf.length === totalLength
+            ? msg
+            : instantiateReassembledFragment(
+                msg,
+                msg.msg_type,
+                totalLength,
+                msg.message_seq,
+                0,
+                totalLength,
+                Buffer.from(buf.subarray(0, totalLength)),
+              ),
+        );
+        continue;
+      }
+
+      if (fragLen === 0) {
+        continue;
+      }
+
+      let entry = this.pending.get(key);
+      if (!entry) {
+        if (this.pending.size >= MAX_PENDING_DTLS_HANDSHAKES) {
+          const oldestKey = this.pending.keys().next().value;
+          if (oldestKey !== undefined) {
+            this.pending.delete(oldestKey);
+          }
+        }
+        entry = {
+          msgType: msg.msg_type,
+          messageSeq: msg.message_seq,
+          totalLength,
+          combined: Buffer.alloc(totalLength),
+          ranges: [],
+          construct: (
+            mType,
+            len,
+            seq,
+            fOffset,
+            fLen,
+            combinedBuf,
+          ) =>
+            instantiateReassembledFragment(
+              msg,
+              mType,
+              len,
+              seq,
+              fOffset,
+              fLen,
+              combinedBuf,
+            ),
+        };
+        this.pending.set(key, entry);
+      }
+
+      buf.copy(entry.combined, offset, 0, fragLen);
+      entry.ranges = mergeByteRanges(entry.ranges, offset, offset + fragLen);
+
+      if (
+        entry.ranges.length === 1 &&
+        entry.ranges[0]?.[0] === 0 &&
+        entry.ranges[0]?.[1] === totalLength
+      ) {
+        this.pending.delete(key);
+        completed.push(
+          entry.construct(
+            entry.msgType,
+            totalLength,
+            entry.messageSeq,
+            0,
+            totalLength,
+            entry.combined,
+          ),
+        );
+      }
+    }
+    return completed;
+  }
+}
+
+interface InternalWeriftDtlsSocket {
+  bufferFragmentedHandshakes?: DtlsHandshakeFragmentLike[];
+  [WERIFT_DTLS_REASSEMBLER]?: DtlsHandshakeReassembler;
+}
+
+function getOrCreateDtlsReassembler(
+  sock: InternalWeriftDtlsSocket,
+): DtlsHandshakeReassembler {
+  let reassembler = sock[WERIFT_DTLS_REASSEMBLER];
+  if (!reassembler) {
+    reassembler = new DtlsHandshakeReassembler();
+    sock[WERIFT_DTLS_REASSEMBLER] = reassembler;
+  }
+  return reassembler;
+}
+
+export function ensureWeriftDtlsFragmentReassemblyGuarded(): void {
+  const proto = (
+    DtlsSocket as unknown as {
+      prototype?: {
+        handleFragmentHandshake?: (
+          messages: DtlsHandshakeFragmentLike[],
+        ) => DtlsHandshakeFragmentLike[];
+        renegotiation?: () => void;
+        close?: () => void;
+        [WERIFT_DTLS_FRAGMENT_GUARDED]?: boolean;
+      };
+    }
+  ).prototype;
+  if (
+    !proto ||
+    typeof proto.handleFragmentHandshake !== "function" ||
+    proto[WERIFT_DTLS_FRAGMENT_GUARDED]
+  ) {
+    return;
+  }
+  proto[WERIFT_DTLS_FRAGMENT_GUARDED] = true;
+
+  proto.handleFragmentHandshake = function guardedHandleFragmentHandshake(
+    this: InternalWeriftDtlsSocket,
+    messages: DtlsHandshakeFragmentLike[],
+  ): DtlsHandshakeFragmentLike[] {
+    if (Array.isArray(this.bufferFragmentedHandshakes)) {
+      this.bufferFragmentedHandshakes.length = 0;
+    }
+    return getOrCreateDtlsReassembler(this).ingest(messages);
+  };
+
+  if (typeof proto.renegotiation === "function") {
+    const origRenegotiation = proto.renegotiation;
+    proto.renegotiation = function guardedRenegotiation(
+      this: InternalWeriftDtlsSocket,
+    ): void {
+      this[WERIFT_DTLS_REASSEMBLER]?.reset();
+      origRenegotiation.call(this);
+    };
+  }
+
+  if (typeof proto.close === "function") {
+    const origClose = proto.close;
+    proto.close = function guardedDtlsClose(
+      this: InternalWeriftDtlsSocket,
+    ): void {
+      this[WERIFT_DTLS_REASSEMBLER]?.reset();
+      origClose.call(this);
+    };
+  }
+}
+
+interface EarlyDtlsBufferState {
+  readonly packets: Buffer[];
+  unSubscribe: (() => void) | null;
+  flushed: boolean;
+}
+
+interface InternalWeriftDtlsTransport {
+  state: string;
+  role: string;
+  dtls?: {
+    udpOnMessage?: (data: Buffer) => void;
+  };
+  iceTransport?: {
+    connection?: {
+      onData?: {
+        subscribe?: (
+          cb: (buf: Buffer) => void,
+        ) => { unSubscribe: () => void };
+      };
+    };
+  };
+  [WERIFT_EARLY_DTLS_STATE]?: EarlyDtlsBufferState;
+}
+
+function attachEarlyDtlsPacketBuffer(
+  candidate: unknown,
+): void {
+  const dtlsTransport = candidate as InternalWeriftDtlsTransport | null | undefined;
+  if (
+    !dtlsTransport ||
+    dtlsTransport[WERIFT_EARLY_DTLS_STATE] ||
+    dtlsTransport.dtls ||
+    dtlsTransport.state !== "new"
+  ) {
+    return;
+  }
+  const onData = dtlsTransport.iceTransport?.connection?.onData;
+  if (!onData || typeof onData.subscribe !== "function") {
+    return;
+  }
+  const earlyState: EarlyDtlsBufferState = {
+    packets: [],
+    unSubscribe: null,
+    flushed: false,
+  };
+  dtlsTransport[WERIFT_EARLY_DTLS_STATE] = earlyState;
+  const sub = onData.subscribe((buf: Buffer) => {
+    if (
+      earlyState.flushed ||
+      dtlsTransport.dtls ||
+      dtlsTransport.state !== "new"
+    ) {
+      earlyState.unSubscribe?.();
+      earlyState.unSubscribe = null;
+      return;
+    }
+    if (Buffer.isBuffer(buf) && buf.length > 0 && isDtls(buf)) {
+      if (earlyState.packets.length < MAX_EARLY_DTLS_PACKETS) {
+        earlyState.packets.push(Buffer.from(buf));
+      }
+    }
+  });
+  earlyState.unSubscribe = () => sub.unSubscribe();
+}
+
+function ensureWeriftDtlsTransportGuarded(): void {
+  const proto = (
+    RTCDtlsTransport as unknown as {
+      prototype?: {
+        setRemoteParams?: (remoteParameters: unknown) => void;
+        start?: () => Promise<void>;
+        stop?: () => Promise<void>;
+        [WERIFT_DTLS_TRANSPORT_GUARDED]?: boolean;
+      };
+    }
+  ).prototype;
+  if (
+    !proto ||
+    typeof proto.start !== "function" ||
+    proto[WERIFT_DTLS_TRANSPORT_GUARDED]
+  ) {
+    return;
+  }
+  proto[WERIFT_DTLS_TRANSPORT_GUARDED] = true;
+
+  if (typeof proto.setRemoteParams === "function") {
+    const origSetRemoteParams = proto.setRemoteParams;
+    proto.setRemoteParams = function guardedSetRemoteParams(
+      this: InternalWeriftDtlsTransport,
+      remoteParameters: unknown,
+    ): void {
+      attachEarlyDtlsPacketBuffer(this);
+      origSetRemoteParams.call(this, remoteParameters);
+    };
+  }
+
+  const origStart = proto.start;
+  proto.start = function guardedDtlsTransportStart(
+    this: InternalWeriftDtlsTransport,
+  ): Promise<void> {
+    const earlyState = this[WERIFT_EARLY_DTLS_STATE];
+    if (earlyState) {
+      earlyState.flushed = true;
+      earlyState.unSubscribe?.();
+      earlyState.unSubscribe = null;
+    }
+    const startPromise = origStart.call(this);
+    if (earlyState && earlyState.packets.length > 0) {
+      const queued = earlyState.packets.splice(0);
+      queueMicrotask(() => {
+        if (
+          this.role === "server" &&
+          this.state === "connecting" &&
+          this.dtls &&
+          typeof this.dtls.udpOnMessage === "function"
+        ) {
+          for (const pkt of queued) {
+            this.dtls.udpOnMessage(pkt);
+          }
+        }
+      });
+    }
+    return startPromise;
+  };
+
+  if (typeof proto.stop === "function") {
+    const origStop = proto.stop;
+    proto.stop = function guardedDtlsTransportStop(
+      this: InternalWeriftDtlsTransport,
+    ): Promise<void> {
+      const earlyState = this[WERIFT_EARLY_DTLS_STATE];
+      if (earlyState) {
+        earlyState.flushed = true;
+        earlyState.packets.length = 0;
+        earlyState.unSubscribe?.();
+        earlyState.unSubscribe = null;
+      }
+      return origStop.call(this);
+    };
+  }
+}
 
 function attachSafeSocketErrorHandler(emitterCandidate: unknown): void {
   const emitter = emitterCandidate as
@@ -640,6 +1082,8 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
 
     ensureWeriftUdpTransportGuarded();
     ensureWeriftTcpTransportGuarded();
+    ensureWeriftDtlsFragmentReassemblyGuarded();
+    ensureWeriftDtlsTransportGuarded();
     this.pc = new RTCPeerConnection(peerConfig);
     // Replace default STUN array explicitly because werift's deepMerge preserves default array items when given []
     this.pc.config.iceServers = mapped.iceServers;
@@ -654,6 +1098,9 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
       id: SWARM_CHANNEL_ID,
       ordered: false,
     });
+    for (const dt of this.pc.dtlsTransports) {
+      attachEarlyDtlsPacketBuffer(dt);
+    }
 
     if (!mapped.hasStunServer) {
       // Prevent werift's Connection fallback to stun.l.google.com:19302 when iceServers has no STUN URL
