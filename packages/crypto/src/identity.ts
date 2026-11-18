@@ -391,6 +391,8 @@ export function signChatMessage(params: {
   };
 }
 
+const CHAT_CERT_CLOCK_SKEW_MS = 10 * 60_000;
+
 export function verifyChatMessage(
   message: ChatMessageEnvelope,
   serverSignPubKey: Uint8Array | string,
@@ -400,7 +402,8 @@ export function verifyChatMessage(
     return false;
   }
   // Relayed catch-up messages verify the server's root signature on authorCert
-  // even if the original session cert later expired, as long as createdAt fell within [iat, exp].
+  // even if the original session cert later expired, as long as createdAt fell within
+  // [iat, exp] with generous client clock-skew tolerance.
   const certValid = verifyPeerIdentityCert(message.authorCert, serverSignPubKey, {
     checkExpiry: false,
   });
@@ -408,8 +411,10 @@ export function verifyChatMessage(
     return false;
   }
   if (
-    message.createdAt < message.authorCert.payload.iat - 60_000 ||
-    message.createdAt > message.authorCert.payload.exp + 60_000
+    message.createdAt <
+      message.authorCert.payload.iat - CHAT_CERT_CLOCK_SKEW_MS ||
+    message.createdAt >
+      message.authorCert.payload.exp + CHAT_CERT_CLOCK_SKEW_MS
   ) {
     return false;
   }

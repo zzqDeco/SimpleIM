@@ -306,11 +306,19 @@ export class MockDataChannel implements DataChannelPort {
   private readonly binaryHandlers: Array<(bytes: Uint8Array) => void> = [];
   private readonly bufferedLowHandlers: Array<() => void> = [];
   private binaryInterceptor?: (bytes: Uint8Array) => Uint8Array | null;
+  private textInterceptor?: (text: string) => string | null;
+  private readonly maxTextBytes?: number;
 
-  constructor(id: number, label: string, flushDelayMs = 0) {
+  constructor(
+    id: number,
+    label: string,
+    flushDelayMs = 0,
+    maxTextBytes?: number,
+  ) {
     this.id = id;
     this.label = label;
     this.flushDelayMs = flushDelayMs;
+    this.maxTextBytes = maxTextBytes;
   }
 
   linkPeer(remote: MockDataChannel): void {
@@ -321,6 +329,12 @@ export class MockDataChannel implements DataChannelPort {
     fn: ((bytes: Uint8Array) => Uint8Array | null) | undefined,
   ): void {
     this.binaryInterceptor = fn;
+  }
+
+  setTextOutgoingInterceptor(
+    fn: ((text: string) => string | null) | undefined,
+  ): void {
+    this.textInterceptor = fn;
   }
 
   openChannel(): void {
@@ -335,7 +349,16 @@ export class MockDataChannel implements DataChannelPort {
     if (this.readyState !== "open") {
       throw new Error("DataChannel is not open");
     }
-    const byteLen = new TextEncoder().encode(text).byteLength;
+    const outgoing = this.textInterceptor ? this.textInterceptor(text) : text;
+    if (outgoing === null) {
+      return;
+    }
+    const byteLen = new TextEncoder().encode(outgoing).byteLength;
+    if (this.maxTextBytes !== undefined && byteLen > this.maxTextBytes) {
+      throw new TypeError(
+        `Message size (${byteLen}) exceeds maxMessageSize (${this.maxTextBytes})`,
+      );
+    }
     this.bufferedAmount += byteLen;
     if (this.bufferedAmount > this.stats.peakBufferedAmount) {
       this.stats.peakBufferedAmount = this.bufferedAmount;
@@ -346,7 +369,7 @@ export class MockDataChannel implements DataChannelPort {
     this.scheduleFlush(byteLen, () => {
       if (remote && remote.readyState === "open") {
         for (const h of remote.textHandlers) {
-          h(text);
+          h(outgoing);
         }
       }
     });
@@ -439,10 +462,12 @@ export class MockDataChannel implements DataChannelPort {
 
 export interface MockPeerConnectionConfig {
   swarmFlushDelayMs?: number;
+  maxControlTextBytes?: number;
   overrideLocalFingerprint?: string;
   overrideRemoteFingerprint?: string;
   autoOpenChannels?: boolean;
   failIceOnAcceptAnswer?: boolean;
+  failInitiatorOnlyOnAcceptAnswer?: boolean;
 }
 
 export class MockPeerConnection implements PeerConnectionPort {
@@ -498,6 +523,7 @@ export class MockPeerConnection implements PeerConnectionPort {
       CONTROL_CHANNEL_ID,
       CONTROL_CHANNEL_LABEL,
       0,
+      params.config?.maxControlTextBytes,
     );
     this.swarmChannel = new MockDataChannel(
       SWARM_CHANNEL_ID,
@@ -542,14 +568,19 @@ export class MockPeerConnection implements PeerConnectionPort {
     await Promise.resolve();
 
     if (this.state === "closed") return;
-    if (this.config?.failIceOnAcceptAnswer) {
+    if (
+      this.config?.failIceOnAcceptAnswer ||
+      this.config?.failInitiatorOnlyOnAcceptAnswer
+    ) {
       const remote = this.linkedRemotePc;
       this.linkedRemotePc = null;
       if (remote) {
         remote.linkedRemotePc = null;
       }
       this.setState("failed");
-      remote?.setState("failed");
+      if (this.config?.failIceOnAcceptAnswer) {
+        remote?.setState("failed");
+      }
       return;
     }
     this.activateDirectLink();

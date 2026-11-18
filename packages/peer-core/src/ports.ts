@@ -188,6 +188,7 @@ export interface RoomPeerEngineOptions {
   maxInFlightPerPeer?: number;
   requestTimeoutMs?: number;
   helloAuthTimeoutMs?: number;
+  syncIntervalMs?: number;
   maxSignalPayloadBytes?: number;
   now?: () => number;
 }
