@@ -43,6 +43,7 @@ import {
   executeJoinInputLine,
   FsChunkStorageAdapter,
   isMdnsIceCandidate,
+  mapContractIceServers,
   LocalSharedFileRegistry,
   parseCliArgs,
   probeNetworkInterfaces,
@@ -1158,6 +1159,7 @@ describe("Interactive join Slash Commands", () => {
       stop: async () => {},
       updateLocalCert: () => {},
       isCenterConnected: () => true,
+      getSignalingPeerCount: () => 1,
       getVerifiedPeers: () => [
         {
           peerId: "peer_019a0000000070008000000000000001",
@@ -1725,6 +1727,102 @@ describe("Real WeriftTransportFactory P2P Loopback", () => {
       });
       connA.controlChannel.sendText("alive-after-econnrefused");
       expect(await msgPromise).toBe("alive-after-econnrefused");
+    } finally {
+      connA.close();
+      connB.close();
+    }
+  });
+
+  test("TURN TCP ECONNREFUSED regression: mapContractIceServers prefers UDP TURN when both UDP and TCP URLs exist, and TcpTransport rejects fast instead of hanging createOffer()", async () => {
+    const mixed = mapContractIceServers([
+      { urls: ["stun:120.25.210.202:3478"] },
+      {
+        urls: [
+          "turn:120.25.210.202:3478?transport=udp",
+          "turn:120.25.210.202:3478?transport=tcp",
+        ],
+        username: "1795000000:usr_1",
+        credential: "secret",
+      },
+    ]);
+    expect(mixed.forceTurnTCP).toBe(false);
+    expect(mixed.hasStunServer).toBe(true);
+    expect(mixed.hasTurnServer).toBe(true);
+    expect(mixed.iceServers.length).toBe(2);
+
+    const tcpOnly = mapContractIceServers([
+      {
+        urls: ["turn:120.25.210.202:3478?transport=tcp"],
+        username: "1795000000:usr_1",
+        credential: "secret",
+      },
+    ]);
+    expect(tcpOnly.forceTurnTCP).toBe(true);
+
+    // Pick a guaranteed-closed ephemeral localhost TCP port to trigger immediate ECONNREFUSED
+    const netMod = await import("node:net");
+    const closedPort = await new Promise<number>((resolve, reject) => {
+      const srv = netMod.createServer();
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address();
+        const port = typeof addr === "object" && addr ? addr.port : 0;
+        srv.close((err) => (err ? reject(err) : resolve(port)));
+      });
+    });
+
+    const factoryA = new WeriftTransportFactory();
+    const factoryB = new WeriftTransportFactory();
+    const refusedTurnServers = [
+      {
+        urls: [`turn:127.0.0.1:${closedPort}?transport=tcp`],
+        username: "1795000000:usr_test",
+        credential: "cred",
+      },
+    ];
+
+    const connA = factoryA.createPeerConnection({
+      localPeerId: "peer_019a000000007000800000000000030a",
+      remotePeerId: "peer_019a000000007000800000000000030b",
+      isInitiator: true,
+      iceServers: refusedTurnServers,
+    });
+    const connB = factoryB.createPeerConnection({
+      localPeerId: "peer_019a000000007000800000000000030b",
+      remotePeerId: "peer_019a000000007000800000000000030a",
+      isInitiator: false,
+      iceServers: refusedTurnServers,
+    });
+
+    try {
+      connA.onLocalIceCandidate((cand) => {
+        void connB.addIceCandidate(cand);
+      });
+      connA.onLocalIceEnd(() => {
+        void connB.endIceCandidates();
+      });
+      connB.onLocalIceCandidate((cand) => {
+        void connA.addIceCandidate(cand);
+      });
+      connB.onLocalIceEnd(() => {
+        void connA.endIceCandidates();
+      });
+
+      const startedAt = Date.now();
+      const offer = await connA.createOffer();
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      const answer = await connB.acceptOfferAndCreateAnswer(offer);
+      await connA.acceptAnswer(answer);
+
+      await Promise.all([
+        waitForChannelOpen(connA.controlChannel),
+        waitForChannelOpen(connB.controlChannel),
+      ]);
+
+      const received = new Promise<string>((resolve) => {
+        connB.controlChannel.onTextMessage((t) => resolve(t));
+      });
+      connA.controlChannel.sendText("recovered-over-host-after-tcp-turn-refused");
+      expect(await received).toBe("recovered-over-host-after-tcp-turn-refused");
     } finally {
       connA.close();
       connB.close();

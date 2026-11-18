@@ -154,10 +154,17 @@ export interface SwarmTransferProgress {
   errorMessage?: string;
 }
 
+export type PeerTransportFailureReason = "ice_failed" | "connect_timeout";
+
 export interface RoomPeerEngineEvents {
   onCenterConnectionChange?: (connected: boolean) => void;
+  onSignalingPeersChange?: (signalingPeerCount: number) => void;
   onPeersChange?: (peers: VerifiedPeerInfo[]) => void;
   onPeerAuthRejected?: (remotePeerId: string, reason: string) => void;
+  onPeerTransportFailure?: (
+    remotePeerId: string,
+    reason: PeerTransportFailureReason,
+  ) => void;
   onChatMessage?: (message: ChatMessageEnvelope, isHistoricalSync: boolean) => void;
   onFileAnnounced?: (manifest: FileManifest) => void;
   onTransferProgress?: (progress: SwarmTransferProgress) => void;
@@ -203,6 +210,7 @@ export interface RoomPeerEngine {
   stop(): Promise<void>;
   updateLocalCert(cert: PeerIdentityCert): void;
   isCenterConnected(): boolean;
+  getSignalingPeerCount(): number;
   getVerifiedPeers(): VerifiedPeerInfo[];
   getMessages(): ChatMessageEnvelope[];
   getFiles(): FileManifest[];

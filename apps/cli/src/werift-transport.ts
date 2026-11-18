@@ -1,3 +1,4 @@
+import * as net from "node:net";
 import * as os from "node:os";
 import {
   CONTROL_CHANNEL_ID,
@@ -23,6 +24,7 @@ import {
   RTCCertificate,
   RTCPeerConnection,
   SignatureAlgorithm,
+  TcpTransport,
   UdpTransport,
   type PeerConfig,
   type RTCDataChannel,
@@ -30,6 +32,8 @@ import {
 } from "werift";
 
 const WERIFT_UDP_ERROR_GUARDED = Symbol.for("simpleim.werift.udpErrorGuarded");
+const WERIFT_TCP_ERROR_GUARDED = Symbol.for("simpleim.werift.tcpErrorGuarded");
+const TURN_TCP_CONNECT_TIMEOUT_MS = 4_000;
 
 function attachSafeSocketErrorHandler(emitterCandidate: unknown): void {
   const emitter = emitterCandidate as
@@ -71,6 +75,118 @@ function ensureWeriftUdpTransportGuarded(): void {
   }): Promise<void> {
     attachSafeSocketErrorHandler(this.socket);
     return origInit.call(this);
+  };
+}
+
+interface InternalWeriftTcpTransport {
+  addr: [string, number];
+  closed: boolean;
+  client?: net.Socket;
+  connecting?: Promise<void>;
+  onData: (data: Buffer, addr: [string | undefined, number | undefined]) => void;
+  send: (data: Buffer) => Promise<void>;
+  connect: () => void;
+}
+
+function ensureWeriftTcpTransportGuarded(): void {
+  const proto = (
+    TcpTransport as unknown as {
+      prototype?: {
+        connect?: () => void;
+        [WERIFT_TCP_ERROR_GUARDED]?: boolean;
+      };
+    }
+  ).prototype;
+  if (
+    !proto ||
+    typeof proto.connect !== "function" ||
+    proto[WERIFT_TCP_ERROR_GUARDED]
+  ) {
+    return;
+  }
+  proto[WERIFT_TCP_ERROR_GUARDED] = true;
+  proto.connect = function guardedTcpTransportConnect(
+    this: InternalWeriftTcpTransport,
+  ): void {
+    if (this.closed) {
+      return;
+    }
+    if (this.client) {
+      this.client.destroy();
+    }
+
+    let settled = false;
+    let connectedOnce = false;
+    const connectingPromise = new Promise<void>((resolve, reject) => {
+      const failInitial = (err: Error): void => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
+
+      let socket: net.Socket;
+      try {
+        socket = net.connect({ port: this.addr[1], host: this.addr[0] });
+      } catch (err) {
+        failInitial(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+
+      this.client = socket;
+      socket.setTimeout(TURN_TCP_CONNECT_TIMEOUT_MS);
+
+      socket.once("connect", () => {
+        socket.setTimeout(0);
+        connectedOnce = true;
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      });
+
+      socket.once("timeout", () => {
+        const timeoutErr = new Error(
+          `TURN TCP connect timed out (${this.addr[0]}:${this.addr[1]})`,
+        );
+        socket.destroy(timeoutErr);
+        failInitial(timeoutErr);
+      });
+
+      socket.on("data", (data: Buffer) => {
+        if (this.client !== socket || this.closed) return;
+        this.onData(data, [socket.remoteAddress, socket.remotePort]);
+      });
+
+      socket.on("end", () => {
+        if (!this.closed && connectedOnce && this.client === socket) {
+          this.connect();
+        }
+      });
+
+      socket.on("error", (err: Error) => {
+        failInitial(err);
+      });
+
+      socket.on("close", () => {
+        failInitial(
+          new Error(
+            `TURN TCP closed before handshake (${this.addr[0]}:${this.addr[1]})`,
+          ),
+        );
+      });
+    });
+
+    // Attach silent catch so background reconnect rejections never trigger unhandledRejection
+    void connectingPromise.catch(() => {});
+    this.connecting = connectingPromise;
+    this.send = async (data: Buffer): Promise<void> => {
+      if (this.closed) return;
+      await this.connecting;
+      if (this.closed || !this.client || this.client.destroyed) return;
+      this.client.write(data, () => {
+        // Ignore transient write errors on closing sockets without polluting stdout
+      });
+    };
   };
 }
 
@@ -182,18 +298,22 @@ type LocalIceCandidatePayload = Extract<
   { kind: "ice-candidate" }
 >;
 
-interface MappedIceConfig {
+export interface MappedIceConfig {
   iceServers: RTCIceServer[];
   hasStunServer: boolean;
   hasTurnServer: boolean;
   forceTurnTCP: boolean;
 }
 
-function mapContractIceServers(configs: readonly IceServerConfig[]): MappedIceConfig {
+export function mapContractIceServers(
+  configs: readonly IceServerConfig[],
+): MappedIceConfig {
   const iceServers: RTCIceServer[] = [];
+  const seenKeys = new Set<string>();
   let hasStunServer = false;
   let hasTurnServer = false;
-  let forceTurnTCP = false;
+  let sawUdpTurn = false;
+  let sawTcpTurn = false;
 
   for (const entry of configs) {
     for (const rawUrl of entry.urls) {
@@ -204,35 +324,51 @@ function mapContractIceServers(configs: readonly IceServerConfig[]): MappedIceCo
         const hostPort = trimmed.replace(/^stuns?:/, "").split("?")[0] ?? "";
         if (hostPort) {
           hasStunServer = true;
-          iceServers.push({ urls: `stun:${hostPort}` });
+          const mappedUrl = `stun:${hostPort}`;
+          if (!seenKeys.has(mappedUrl)) {
+            seenKeys.add(mappedUrl);
+            iceServers.push({ urls: mappedUrl });
+          }
         }
         continue;
       }
 
       if (trimmed.startsWith("turn:") || trimmed.startsWith("turns:")) {
-        if (
+        const isTcpOrTls =
           trimmed.startsWith("turns:") ||
-          trimmed.toLowerCase().includes("transport=tcp")
-        ) {
-          forceTurnTCP = true;
+          trimmed.toLowerCase().includes("transport=tcp");
+        if (isTcpOrTls) {
+          sawTcpTurn = true;
+        } else {
+          sawUdpTurn = true;
         }
         const hostPort = trimmed.replace(/^turns?:/, "").split("?")[0] ?? "";
         if (hostPort) {
           if (entry.username && entry.credential) {
             hasTurnServer = true;
           }
-          iceServers.push({
-            urls: `turn:${hostPort}`,
-            ...(entry.username !== undefined ? { username: entry.username } : {}),
-            ...(entry.credential !== undefined
-              ? { credential: entry.credential }
-              : {}),
-          });
+          const mappedUrl = `turn:${hostPort}`;
+          const dedupKey = `${mappedUrl}|${entry.username ?? ""}|${entry.credential ?? ""}`;
+          if (!seenKeys.has(dedupKey)) {
+            seenKeys.add(dedupKey);
+            iceServers.push({
+              urls: mappedUrl,
+              ...(entry.username !== undefined
+                ? { username: entry.username }
+                : {}),
+              ...(entry.credential !== undefined
+                ? { credential: entry.credential }
+                : {}),
+            });
+          }
         }
       }
     }
   }
 
+  // Prefer UDP TURN (which in werift automatically falls back to TCP TURN on error);
+  // only force TCP TURN when exclusively TCP/TLS TURN URLs are configured.
+  const forceTurnTCP = sawTcpTurn && !sawUdpTurn;
   return { iceServers, hasStunServer, hasTurnServer, forceTurnTCP };
 }
 
@@ -503,6 +639,7 @@ class WeriftPeerConnectionAdapter implements PeerConnectionPort {
     };
 
     ensureWeriftUdpTransportGuarded();
+    ensureWeriftTcpTransportGuarded();
     this.pc = new RTCPeerConnection(peerConfig);
     // Replace default STUN array explicitly because werift's deepMerge preserves default array items when given []
     this.pc.config.iceServers = mapped.iceServers;

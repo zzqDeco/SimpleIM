@@ -100,6 +100,8 @@ export const es = {
   "room.files.action.save": "Guardar",
 
   "security.peerRejected": "Se rechazó un par no verificado ({reason}).",
+  "security.iceFailed":
+    "Hay miembros en la sala, pero falló la conexión P2P/TURN de WebRTC (revisa el puerto UDP/TCP 3478, firewall o proxy; reintentando automáticamente y los mensajes se sincronizarán al conectar).",
   "validation.username": "El usuario debe tener 3–24 caracteres (a-z, 0-9, _ o -).",
   "validation.passwordRequired": "Introduce tu contraseña.",
   "validation.passwordLength": "La contraseña debe tener entre 8 y 128 caracteres.",

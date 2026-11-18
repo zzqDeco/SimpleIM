@@ -100,6 +100,8 @@ export const ja = {
   "room.files.action.save": "保存",
 
   "security.peerRejected": "未検証ピアの接続を拒否しました（{reason}）。",
+  "security.iceFailed":
+    "ルーム内に他のメンバーがいますが、WebRTC P2P/TURN 経路の確立に失敗しました（UDP/TCP 3478 ポート、ファイアウォール、またはプロキシ設定をご確認ください。自動で再試行し、接続後にメッセージは自動同期されます）。",
   "validation.username": "ユーザー名は 3〜24 文字の英小文字・数字・_・- で入力してください。",
   "validation.passwordRequired": "パスワードを入力してください。",
   "validation.passwordLength": "パスワードは 8〜128 文字で入力してください。",

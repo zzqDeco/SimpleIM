@@ -300,6 +300,7 @@ export function createRoomPeerEngine(
         }
       } else {
         joinedOnCurrentConnection = false;
+        meshManager.onCenterDisconnected();
         // Center-Detached Liveness: NEVER close active or verified PeerConnectionPorts!
         const changed = centerConnected;
         centerConnected = false;
@@ -406,6 +407,10 @@ export function createRoomPeerEngine(
 
     isCenterConnected(): boolean {
       return centerConnected;
+    },
+
+    getSignalingPeerCount(): number {
+      return meshManager.getSignalingPeerCount();
     },
 
     getVerifiedPeers(): VerifiedPeerInfo[] {

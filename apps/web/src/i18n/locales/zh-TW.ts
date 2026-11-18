@@ -100,6 +100,8 @@ export const zhTW = {
   "room.files.action.save": "儲存",
 
   "security.peerRejected": "已拒絕未通過身分驗證的連線（{reason}）。",
+  "security.iceFailed":
+    "房間內有其他成員在線，但 WebRTC 點對點/TURN 通道未能打通（請檢查 UDP/TCP 3478 連接埠、防火牆或開啟代理 TUN/直連；系統正在背景自動重連，打通後本機訊息將自動補發同步）。",
   "validation.username": "使用者名稱須為 3–24 位小寫字母、數字、_ 或 -。",
   "validation.passwordRequired": "請輸入帳號密碼。",
   "validation.passwordLength": "密碼長度須介於 8–128 個字元之間。",

@@ -146,12 +146,18 @@ function createTestPeerRig(params: {
         centerStates.push(connected);
         params.extraEvents?.onCenterConnectionChange?.(connected);
       },
+      onSignalingPeersChange: (count) => {
+        params.extraEvents?.onSignalingPeersChange?.(count);
+      },
       onPeersChange: (peers) => {
         params.extraEvents?.onPeersChange?.(peers);
       },
       onPeerAuthRejected: (remotePeerId, reason) => {
         authRejections.push({ remotePeerId, reason });
         params.extraEvents?.onPeerAuthRejected?.(remotePeerId, reason);
+      },
+      onPeerTransportFailure: (remotePeerId, reason) => {
+        params.extraEvents?.onPeerTransportFailure?.(remotePeerId, reason);
       },
       onChatMessage: (msg, isHistoricalSync) => {
         receivedChat.push({ msg, isHistoricalSync });
@@ -2525,6 +2531,93 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
     } finally {
       await aliceEngine.stop();
       await bobEngine.stop();
+    }
+  });
+
+  test("11. ICE failure reporting & automatic P2P retry: surfaces onPeerTransportFailure when initial ICE fails and heals automatically to sync queued messages", async () => {
+    const ca = createTestServerCA();
+    const hub = new MockSignalingHub();
+    const network = new MockPeerTransportNetwork();
+    const roomKeys = deriveRoomKeys("ice-failure-auto-retry-room", FAST_KDF);
+
+    let aliceAttempts = 0;
+    const aliceTransportFailures: Array<{
+      remotePeerId: string;
+      reason: string;
+    }> = [];
+    const bobTransportFailures: Array<{
+      remotePeerId: string;
+      reason: string;
+    }> = [];
+
+    const alice = createTestPeerRig({
+      ca,
+      hub,
+      network,
+      roomKeys,
+      peerId: "peer_01alice_ice",
+      username: "alice",
+      transportConfig: () => {
+        aliceAttempts += 1;
+        return { failIceOnAcceptAnswer: aliceAttempts === 1 };
+      },
+      extraEvents: {
+        onPeerTransportFailure: (remotePeerId, reason) => {
+          aliceTransportFailures.push({ remotePeerId, reason });
+        },
+      },
+    });
+
+    const bob = createTestPeerRig({
+      ca,
+      hub,
+      network,
+      roomKeys,
+      peerId: "peer_02bob_ice",
+      username: "bob",
+      extraEvents: {
+        onPeerTransportFailure: (remotePeerId, reason) => {
+          bobTransportFailures.push({ remotePeerId, reason });
+        },
+      },
+    });
+
+    try {
+      await Promise.all([alice.engine.start(), bob.engine.start()]);
+
+      // Attempt #1 fails ICE -> both peers observe signalingPeerCount === 1 and receive onPeerTransportFailure("...", "ice_failed")
+      await waitFor(
+        () =>
+          aliceTransportFailures.length === 1 &&
+          bobTransportFailures.length === 1,
+      );
+      expect(aliceTransportFailures[0]).toEqual({
+        remotePeerId: "peer_02bob_ice",
+        reason: "ice_failed",
+      });
+      expect(alice.engine.getSignalingPeerCount()).toBe(1);
+      expect(alice.engine.getVerifiedPeers().length).toBe(0);
+
+      // Alice sends a message while P2P is still down -> stored locally, ready for automatic catch-up sync
+      await alice.engine.sendChatMessage(
+        "Queued while TURN TCP 3478 was temporarily blocked!",
+      );
+      expect(bob.engine.getMessages().length).toBe(0);
+
+      // Automatic mesh retry (~3s) establishes the WebRTC DataChannel, completes HELLO_AUTH, and syncs Alice's queued message!
+      await waitFor(
+        () =>
+          alice.engine.getVerifiedPeers().length === 1 &&
+          bob.engine.getVerifiedPeers().length === 1 &&
+          bob.engine.getMessages().length === 1,
+        5_500,
+      );
+      expect(bob.engine.getMessages()[0]?.body).toBe(
+        "Queued while TURN TCP 3478 was temporarily blocked!",
+      );
+    } finally {
+      await alice.engine.stop();
+      await bob.engine.stop();
     }
   });
 });

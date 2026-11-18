@@ -25,6 +25,7 @@ import type {
   DataChannelPort,
   PeerConnectionPort,
   PeerTransportFactoryPort,
+  PeerTransportFailureReason,
   RoomPeerEngineEvents,
   VerifiedPeerInfo,
 } from "./ports.ts";
@@ -32,6 +33,9 @@ import type { VerifiedSwarmPeerLink } from "./swarm-scheduler.ts";
 
 const PRESENCE_PING_INTERVAL_MS = 15_000;
 const PRE_OPEN_CONNECT_TIMEOUT_MS = 30_000;
+const DISCONNECTED_GRACE_MS = 5_000;
+const INITIAL_MESH_RETRY_MS = 3_000;
+const MAX_MESH_RETRY_MS = 15_000;
 const MAX_BUFFERED_ICE_PER_PEER = 128;
 const MAX_EARLY_ICE_PEERS = 32;
 
@@ -92,6 +96,7 @@ interface PeerSession {
   rttMs: number | null;
   connectedAt: number;
   connectTimer: TimerHandle | null;
+  disconnectGraceTimer: TimerHandle | null;
   helloAuthTimer: TimerHandle | null;
   pingInterval: IntervalHandle | null;
 }
@@ -111,6 +116,10 @@ export class MeshSessionManager {
   private readonly callbacks: MeshSessionCallbacks;
 
   private readonly sessions = new Map<string, PeerSession>();
+  private readonly signalingPeerIds = new Set<string>();
+  private readonly retryTimers = new Map<string, TimerHandle>();
+  private readonly retryAttempts = new Map<string, number>();
+  private readonly authBlockedPeers = new Set<string>();
   private readonly earlyIceByPeer = new Map<string, BufferedIceItem[]>();
   private stopped = false;
 
@@ -134,10 +143,30 @@ export class MeshSessionManager {
     this.localCert = nextCert;
   }
 
+  getSignalingPeerCount(): number {
+    return this.signalingPeerIds.size;
+  }
+
+  onCenterDisconnected(): void {
+    if (this.stopped) return;
+    this.clearAllRetryTimers();
+    if (this.signalingPeerIds.size > 0) {
+      this.signalingPeerIds.clear();
+      this.events?.onSignalingPeersChange?.(0);
+    }
+  }
+
   onRoomJoined(peers: readonly string[]): void {
     if (this.stopped) return;
+    this.signalingPeerIds.clear();
     for (const remotePeerId of peers) {
-      this.onPeerJoined(remotePeerId);
+      if (remotePeerId !== this.localPeerId && isValidPeerId(remotePeerId)) {
+        this.signalingPeerIds.add(remotePeerId);
+      }
+    }
+    this.events?.onSignalingPeersChange?.(this.signalingPeerIds.size);
+    for (const remotePeerId of peers) {
+      this.connectKnownPeer(remotePeerId);
     }
   }
 
@@ -146,6 +175,21 @@ export class MeshSessionManager {
     if (remotePeerId === this.localPeerId || !isValidPeerId(remotePeerId)) {
       return;
     }
+    this.authBlockedPeers.delete(remotePeerId);
+    const added = !this.signalingPeerIds.has(remotePeerId);
+    this.signalingPeerIds.add(remotePeerId);
+    if (added) {
+      this.events?.onSignalingPeersChange?.(this.signalingPeerIds.size);
+    }
+    this.connectKnownPeer(remotePeerId);
+  }
+
+  private connectKnownPeer(remotePeerId: string): void {
+    if (this.stopped) return;
+    if (remotePeerId === this.localPeerId || !isValidPeerId(remotePeerId)) {
+      return;
+    }
+    this.clearRetryTimer(remotePeerId);
 
     const existing = this.sessions.get(remotePeerId);
     if (existing) {
@@ -169,6 +213,13 @@ export class MeshSessionManager {
   onPeerLeft(remotePeerId: string): void {
     if (this.stopped) return;
     this.earlyIceByPeer.delete(remotePeerId);
+    this.clearRetryTimer(remotePeerId);
+    this.retryAttempts.delete(remotePeerId);
+    this.authBlockedPeers.delete(remotePeerId);
+
+    if (this.signalingPeerIds.delete(remotePeerId)) {
+      this.events?.onSignalingPeersChange?.(this.signalingPeerIds.size);
+    }
 
     const existing = this.sessions.get(remotePeerId);
     if (!existing) return;
@@ -306,6 +357,10 @@ export class MeshSessionManager {
   stop(): void {
     this.stopped = true;
     this.earlyIceByPeer.clear();
+    this.clearAllRetryTimers();
+    this.retryAttempts.clear();
+    this.signalingPeerIds.clear();
+    this.authBlockedPeers.clear();
     const active = Array.from(this.sessions.values());
     this.sessions.clear();
     for (const session of active) {
@@ -314,6 +369,10 @@ export class MeshSessionManager {
       if (session.connectTimer !== null) {
         clearTimeout(session.connectTimer);
         session.connectTimer = null;
+      }
+      if (session.disconnectGraceTimer !== null) {
+        clearTimeout(session.disconnectGraceTimer);
+        session.disconnectGraceTimer = null;
       }
       if (session.helloAuthTimer !== null) {
         clearTimeout(session.helloAuthTimer);
@@ -331,10 +390,55 @@ export class MeshSessionManager {
     }
   }
 
+  private clearRetryTimer(remotePeerId: string): void {
+    const timer = this.retryTimers.get(remotePeerId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.retryTimers.delete(remotePeerId);
+    }
+  }
+
+  private clearAllRetryTimers(): void {
+    for (const timer of this.retryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.retryTimers.clear();
+  }
+
+  private schedulePeerRetryIfEligible(remotePeerId: string): void {
+    if (
+      this.stopped ||
+      this.authBlockedPeers.has(remotePeerId) ||
+      !this.signalingPeerIds.has(remotePeerId) ||
+      this.localPeerId >= remotePeerId ||
+      this.retryTimers.has(remotePeerId)
+    ) {
+      return;
+    }
+    const attempt = this.retryAttempts.get(remotePeerId) ?? 0;
+    this.retryAttempts.set(remotePeerId, attempt + 1);
+    const delayMs = Math.min(
+      MAX_MESH_RETRY_MS,
+      INITIAL_MESH_RETRY_MS * 2 ** Math.min(attempt, 3),
+    );
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(remotePeerId);
+      if (
+        this.stopped ||
+        this.authBlockedPeers.has(remotePeerId) ||
+        !this.signalingPeerIds.has(remotePeerId)
+      ) {
+        return;
+      }
+      this.connectKnownPeer(remotePeerId);
+    }, delayMs);
+    this.retryTimers.set(remotePeerId, timer);
+  }
+
   private isSessionHealthyOrConnecting(session: PeerSession): boolean {
     if (session.closed) return false;
     const st = session.pc.state;
-    if (st === "failed" || st === "closed" || st === "disconnected") {
+    if (st === "failed" || st === "closed") {
       return false;
     }
     if (
@@ -381,6 +485,7 @@ export class MeshSessionManager {
       rttMs: null,
       connectedAt: 0,
       connectTimer: null,
+      disconnectGraceTimer: null,
       helloAuthTimer: null,
       pingInterval: null,
     };
@@ -398,7 +503,7 @@ export class MeshSessionManager {
         !session.verified &&
         session.pc.controlChannel.readyState !== "open"
       ) {
-        this.closeSession(session);
+        this.closeSession(session, "connect_timeout");
       }
     }, preOpenTimeoutMs);
 
@@ -421,11 +526,31 @@ export class MeshSessionManager {
 
     pc.onStateChange((state) => {
       if (this.stopped || session.closed) return;
-      if (
-        state === "failed" ||
-        state === "closed" ||
-        state === "disconnected"
-      ) {
+      if (state === "connected" || state === "connecting") {
+        if (session.disconnectGraceTimer !== null) {
+          clearTimeout(session.disconnectGraceTimer);
+          session.disconnectGraceTimer = null;
+        }
+        return;
+      }
+      if (state === "disconnected") {
+        if (session.disconnectGraceTimer === null) {
+          session.disconnectGraceTimer = setTimeout(() => {
+            session.disconnectGraceTimer = null;
+            if (
+              !this.stopped &&
+              !session.closed &&
+              session.pc.state === "disconnected"
+            ) {
+              this.closeSession(session, "ice_failed");
+            }
+          }, DISCONNECTED_GRACE_MS);
+        }
+        return;
+      }
+      if (state === "failed") {
+        this.closeSession(session, "ice_failed");
+      } else if (state === "closed") {
         this.closeSession(session);
       }
     });
@@ -859,10 +984,16 @@ export class MeshSessionManager {
 
     session.verified = true;
     session.connectedAt = this.now();
+    this.retryAttempts.delete(session.remotePeerId);
+    this.clearRetryTimer(session.remotePeerId);
 
     if (session.connectTimer !== null) {
       clearTimeout(session.connectTimer);
       session.connectTimer = null;
+    }
+    if (session.disconnectGraceTimer !== null) {
+      clearTimeout(session.disconnectGraceTimer);
+      session.disconnectGraceTimer = null;
     }
     if (session.helloAuthTimer !== null) {
       clearTimeout(session.helloAuthTimer);
@@ -897,11 +1028,16 @@ export class MeshSessionManager {
   private rejectSessionAuth(session: PeerSession, reason: string): void {
     if (session.authRejected || session.closed) return;
     session.authRejected = true;
+    this.authBlockedPeers.add(session.remotePeerId);
+    this.clearRetryTimer(session.remotePeerId);
     this.closeSession(session);
     this.events?.onPeerAuthRejected?.(session.remotePeerId, reason);
   }
 
-  private closeSession(session: PeerSession): void {
+  private closeSession(
+    session: PeerSession,
+    failureReason?: PeerTransportFailureReason,
+  ): void {
     if (session.closed) return;
     const wasVerified = session.verified;
     session.closed = true;
@@ -910,6 +1046,10 @@ export class MeshSessionManager {
     if (session.connectTimer !== null) {
       clearTimeout(session.connectTimer);
       session.connectTimer = null;
+    }
+    if (session.disconnectGraceTimer !== null) {
+      clearTimeout(session.disconnectGraceTimer);
+      session.disconnectGraceTimer = null;
     }
     if (session.helloAuthTimer !== null) {
       clearTimeout(session.helloAuthTimer);
@@ -930,9 +1070,20 @@ export class MeshSessionManager {
       // Ignore redundant close errors
     }
 
-    if (wasVerified && !this.stopped) {
-      this.callbacks.onVerifiedPeerDisconnected(session.remotePeerId);
-      this.events?.onPeersChange?.(this.getVerifiedPeers());
+    if (!this.stopped) {
+      if (wasVerified) {
+        this.callbacks.onVerifiedPeerDisconnected(session.remotePeerId);
+        this.events?.onPeersChange?.(this.getVerifiedPeers());
+      } else if (!session.authRejected && failureReason !== undefined) {
+        this.events?.onPeerTransportFailure?.(
+          session.remotePeerId,
+          failureReason,
+        );
+      }
+
+      if (!session.authRejected) {
+        this.schedulePeerRetryIfEligible(session.remotePeerId);
+      }
     }
   }
 
