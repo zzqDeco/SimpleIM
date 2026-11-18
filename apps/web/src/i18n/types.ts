@@ -122,6 +122,7 @@ export interface TranslationSchema {
 
   // Security & Validation / Error Catalog
   "security.peerRejected": string;
+  "security.iceFailed": string;
   "validation.username": string;
   "validation.passwordRequired": string;
   "validation.passwordLength": string;

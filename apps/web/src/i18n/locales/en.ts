@@ -100,6 +100,8 @@ export const en = {
   "room.files.action.save": "Save",
 
   "security.peerRejected": "Rejected unverified peer connection ({reason}).",
+  "security.iceFailed":
+    "Room peers are present on signaling, but WebRTC P2P/TURN traversal failed (check UDP/TCP port 3478, firewall, or proxy TUN/DIRECT rules; retrying automatically and queued messages will sync once connected).",
   "validation.username": "Username must be 3–24 chars using a-z, 0-9, _ or -.",
   "validation.passwordRequired": "Please enter your password.",
   "validation.passwordLength": "Password must be 8–128 characters.",

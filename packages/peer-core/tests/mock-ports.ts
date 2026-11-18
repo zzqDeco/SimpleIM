@@ -442,6 +442,7 @@ export interface MockPeerConnectionConfig {
   overrideLocalFingerprint?: string;
   overrideRemoteFingerprint?: string;
   autoOpenChannels?: boolean;
+  failIceOnAcceptAnswer?: boolean;
 }
 
 export class MockPeerConnection implements PeerConnectionPort {
@@ -541,6 +542,16 @@ export class MockPeerConnection implements PeerConnectionPort {
     await Promise.resolve();
 
     if (this.state === "closed") return;
+    if (this.config?.failIceOnAcceptAnswer) {
+      const remote = this.linkedRemotePc;
+      this.linkedRemotePc = null;
+      if (remote) {
+        remote.linkedRemotePc = null;
+      }
+      this.setState("failed");
+      remote?.setState("failed");
+      return;
+    }
     this.activateDirectLink();
     this.linkedRemotePc?.activateDirectLink();
   }

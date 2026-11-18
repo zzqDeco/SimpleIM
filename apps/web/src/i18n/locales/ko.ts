@@ -100,6 +100,8 @@ export const ko = {
   "room.files.action.save": "저장",
 
   "security.peerRejected": "검증되지 않은 피어 연결을 차단했습니다 ({reason}).",
+  "security.iceFailed":
+    "방에 다른 참여자가 온라인 상태이지만 WebRTC P2P/TURN 연결에 실패했습니다 (UDP/TCP 3478 포트, 방화벽 또는 프록시 설정을 확인하세요. 자동으로 재연결하며 연결 시 로컬 메시지가 동기화됩니다).",
   "validation.username": "사용자 이름은 3–24자의 영문 소문자, 숫자, _, -만 가능합니다.",
   "validation.passwordRequired": "비밀번호를 입력해 주세요.",
   "validation.passwordLength": "비밀번호는 8–128자여야 합니다.",

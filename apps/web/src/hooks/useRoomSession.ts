@@ -48,6 +48,7 @@ export type JoinPhase = "idle" | "deriving" | "connecting";
 
 export type SecurityEvent =
   | { readonly kind: "peer_rejected"; readonly reason: string }
+  | { readonly kind: "ice_failed" }
   | { readonly kind: "engine_error"; readonly failure: AppFailure };
 
 interface ActiveRoomEngineInstance {
@@ -542,6 +543,14 @@ export function useRoomSession({
                   return;
                 }
                 entry.peers = [...nextPeers];
+                if (
+                  selectedRoomIdRef.current === roomId &&
+                  nextPeers.length > 0
+                ) {
+                  setSecurityEvent((prev) =>
+                    prev?.kind === "ice_failed" ? null : prev,
+                  );
+                }
                 publishSnapshot(currentUser.id);
               },
               onPeerAuthRejected: (_remotePeerId, reason) => {
@@ -550,6 +559,21 @@ export function useRoomSession({
                 }
                 if (selectedRoomIdRef.current === roomId) {
                   setSecurityEvent({ kind: "peer_rejected", reason });
+                }
+              },
+              onPeerTransportFailure: () => {
+                if (!isEntryLive(expectedGen, roomId, entry)) {
+                  return;
+                }
+                if (
+                  selectedRoomIdRef.current === roomId &&
+                  entry.peers.length === 0
+                ) {
+                  setSecurityEvent((prev) =>
+                    prev?.kind === "peer_rejected"
+                      ? prev
+                      : { kind: "ice_failed" },
+                  );
                 }
               },
               onChatMessage: (msg) => {

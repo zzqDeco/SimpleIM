@@ -124,7 +124,9 @@ export function RoomScreen({
       ? null
       : securityEvent.kind === "peer_rejected"
         ? t("security.peerRejected", { reason: securityEvent.reason })
-        : formatAppFailure(securityEvent.failure, t);
+        : securityEvent.kind === "ice_failed"
+          ? t("security.iceFailed")
+          : formatAppFailure(securityEvent.failure, t);
 
   return (
     <div className="room-shell">

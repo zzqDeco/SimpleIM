@@ -100,6 +100,8 @@ export const zhCN = {
   "room.files.action.save": "保存",
 
   "security.peerRejected": "已拒绝未通过身份校验的连接（{reason}）。",
+  "security.iceFailed":
+    "房间内有其他成员在线，但 WebRTC 点对点/TURN 通道未能打通（请检查 UDP/TCP 3478 端口、防火墙或开启代理 TUN/直连；系统正在后台自动重连，打通后本机消息将自动补发同步）。",
   "validation.username": "用户名需为 3–24 位小写字母、数字、_ 或 -。",
   "validation.passwordRequired": "请输入账号密码。",
   "validation.passwordLength": "密码长度需在 8–128 个字符之间。",
