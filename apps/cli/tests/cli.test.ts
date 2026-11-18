@@ -40,6 +40,8 @@ import {
   CliSignalingClient,
   CliUsageError,
   CredentialStore,
+  DtlsHandshakeReassembler,
+  ensureWeriftDtlsFragmentReassemblyGuarded,
   executeJoinInputLine,
   FsChunkStorageAdapter,
   isMdnsIceCandidate,
@@ -1827,5 +1829,249 @@ describe("Real WeriftTransportFactory P2P Loopback", () => {
       connA.close();
       connB.close();
     }
+  });
+
+  test("DTLS fragmented Post-Quantum ClientHello regression: DtlsHandshakeReassembler & DtlsServer survive dropped frag0, duplicate tail fragments, and out-of-order 3-fragment flights without 'dtls cipher suite negotiation failed'", async () => {
+    const reassembler = new DtlsHandshakeReassembler();
+    const fullBodySeq0 = Buffer.from(randomBytes(2_550));
+    const fullBodySeq1 = Buffer.from(randomBytes(1_800));
+
+    const frag0 = {
+      msg_type: 1,
+      length: 2_550,
+      message_seq: 0,
+      fragment_offset: 0,
+      fragment_length: 1_100,
+      fragment: fullBodySeq0.subarray(0, 1_100),
+    };
+    const frag1 = {
+      msg_type: 1,
+      length: 2_550,
+      message_seq: 0,
+      fragment_offset: 1_100,
+      fragment_length: 1_100,
+      fragment: fullBodySeq0.subarray(1_100, 2_200),
+    };
+    const frag2 = {
+      msg_type: 1,
+      length: 2_550,
+      message_seq: 0,
+      fragment_offset: 2_200,
+      fragment_length: 350,
+      fragment: fullBodySeq0.subarray(2_200, 2_550),
+    };
+
+    // Exact production crash reproduction: frag0 dropped while [frag1, frag2] + duplicate frag2 arrive!
+    expect(reassembler.ingest([frag1])).toEqual([]);
+    expect(reassembler.ingest([frag2])).toEqual([]);
+    expect(reassembler.ingest([frag2])).toEqual([]);
+
+    // Interleaved fragment from message_seq=1 must not mix into message_seq=0
+    expect(
+      reassembler.ingest([
+        {
+          msg_type: 1,
+          length: 1_800,
+          message_seq: 1,
+          fragment_offset: 0,
+          fragment_length: 900,
+          fragment: fullBodySeq1.subarray(0, 900),
+        },
+      ]),
+    ).toEqual([]);
+
+    // Now delayed/retransmitted frag0 arrives -> message_seq=0 completes intact!
+    const done0 = reassembler.ingest([frag0]);
+    expect(done0.length).toBe(1);
+    expect(done0[0]!.message_seq).toBe(0);
+    expect(done0[0]!.fragment_offset).toBe(0);
+    expect(done0[0]!.fragment_length).toBe(2_550);
+    expect(done0[0]!.fragment.equals(fullBodySeq0)).toBe(true);
+
+    // Overlapping re-fragmented retransmission completes message_seq=1 cleanly
+    expect(
+      reassembler.ingest([
+        {
+          msg_type: 1,
+          length: 1_800,
+          message_seq: 1,
+          fragment_offset: 800,
+          fragment_length: 600,
+          fragment: fullBodySeq1.subarray(800, 1_400),
+        },
+      ]),
+    ).toEqual([]);
+    const done1 = reassembler.ingest([
+      {
+        msg_type: 1,
+        length: 1_800,
+        message_seq: 1,
+        fragment_offset: 1_300,
+        fragment_length: 500,
+        fragment: fullBodySeq1.subarray(1_300, 1_800),
+      },
+    ]);
+    expect(done1.length).toBe(1);
+    expect(done1[0]!.message_seq).toBe(1);
+    expect(done1[0]!.fragment.equals(fullBodySeq1)).toBe(true);
+
+    // Real werift DtlsServer <-> DtlsClient handshake where the network MTU splits ClientHello
+    // into 3 DTLS handshake fragments, drops frag0 + delivers [frag2, frag1, frag2] first,
+    // and delivers Flight 3 out-of-order [frag2, frag0, frag1]!
+    ensureWeriftDtlsFragmentReassemblyGuarded();
+    const {
+      createSelfSignedCertificate,
+      DtlsClient,
+      DtlsServer,
+      HashAlgorithm,
+      NamedCurveAlgorithm,
+      SignatureAlgorithm,
+    } = await import("werift");
+
+    const serverCert = await createSelfSignedCertificate(
+      {
+        signature: SignatureAlgorithm.ecdsa_3,
+        hash: HashAlgorithm.sha256_4,
+      },
+      NamedCurveAlgorithm.secp256r1_23,
+    );
+    const clientCert = await createSelfSignedCertificate(
+      {
+        signature: SignatureAlgorithm.ecdsa_3,
+        hash: HashAlgorithm.sha256_4,
+      },
+      NamedCurveAlgorithm.secp256r1_23,
+    );
+
+    let recSeq = 100;
+    const splitClientHelloIntoThreeFragments = (
+      record: Buffer,
+    ): [Buffer, Buffer, Buffer] | null => {
+      if (record.length < 25 || record[0] !== 22) return null;
+      const epoch = record.readUInt16BE(3);
+      if (epoch !== 0) return null;
+      const hs = record.subarray(13);
+      const msgType = hs[0]!;
+      if (msgType !== 1) return null;
+      const totalLen = hs.readUIntBE(1, 3);
+      const msgSeq = hs.readUInt16BE(4);
+      const body = hs.subarray(12, 12 + totalLen);
+      if (body.length < 30) return null;
+
+      const c1 = Math.floor(totalLen / 3);
+      const c2 = Math.floor((totalLen * 2) / 3);
+      const slices: Array<[number, Buffer]> = [
+        [0, body.subarray(0, c1)],
+        [c1, body.subarray(c1, c2)],
+        [c2, body.subarray(c2)],
+      ];
+
+      return slices.map(([offset, chunk]) => {
+        const out = Buffer.alloc(13 + 12 + chunk.length);
+        out[0] = 22;
+        out[1] = record[1]!;
+        out[2] = record[2]!;
+        out.writeUInt16BE(0, 3);
+        out.writeUIntBE(++recSeq, 5, 6);
+        out.writeUInt16BE(12 + chunk.length, 11);
+        out[13] = msgType;
+        out.writeUIntBE(totalLen, 14, 3);
+        out.writeUInt16BE(msgSeq, 17);
+        out.writeUIntBE(offset, 19, 3);
+        out.writeUIntBE(chunk.length, 22, 3);
+        chunk.copy(out, 25);
+        return out;
+      }) as [Buffer, Buffer, Buffer];
+    };
+
+    let clientHelloCount = 0;
+    const serverSocket = {
+      onData: (_buf: Buffer) => {},
+      send: async (buf: Buffer) => {
+        queueMicrotask(() => clientSocket.onData(Buffer.from(buf)));
+      },
+      close: () => {},
+    };
+    const clientSocket = {
+      onData: (_buf: Buffer) => {},
+      send: async (buf: Buffer) => {
+        const records: Buffer[] = [];
+        let pos = 0;
+        while (pos + 13 <= buf.length) {
+          const recLen = buf.readUInt16BE(pos + 11);
+          if (pos + 13 + recLen > buf.length) break;
+          records.push(Buffer.from(buf.subarray(pos, pos + 13 + recLen)));
+          pos += 13 + recLen;
+        }
+        for (const rec of records) {
+          const frags = splitClientHelloIntoThreeFragments(rec);
+          if (frags) {
+            clientHelloCount += 1;
+            const [f0, f1, f2] = frags;
+            if (clientHelloCount === 1) {
+              // Flight 1: deliver [f2, f1, f2] first (f0 delayed!), which crashed unpatched werift 100% of the time!
+              queueMicrotask(() => {
+                serverSocket.onData(f2);
+                serverSocket.onData(f1);
+                serverSocket.onData(f2);
+              });
+              setTimeout(() => serverSocket.onData(f0), 15);
+            } else {
+              // Flight 3 (cookie ClientHello): deliver out-of-order [f2, f0, f1]
+              queueMicrotask(() => {
+                serverSocket.onData(f2);
+                serverSocket.onData(f0);
+                serverSocket.onData(f1);
+              });
+            }
+            continue;
+          }
+          queueMicrotask(() => serverSocket.onData(rec));
+        }
+      },
+      close: () => {},
+    };
+
+    const dtlsErrors: unknown[] = [];
+    const server = new DtlsServer({
+      cert: serverCert.certPem,
+      key: serverCert.keyPem,
+      signatureHash: serverCert.signatureHash,
+      transport: serverSocket as never,
+      extendedMasterSecret: true,
+    });
+    const client = new DtlsClient({
+      cert: clientCert.certPem,
+      key: clientCert.keyPem,
+      signatureHash: clientCert.signatureHash,
+      transport: clientSocket as never,
+      extendedMasterSecret: true,
+    });
+
+    server.onError.subscribe((err) => dtlsErrors.push(err));
+    client.onError.subscribe((err) => dtlsErrors.push(err));
+
+    const serverConnected = new Promise<void>((resolve, reject) => {
+      server.onConnect.once(() => resolve());
+      server.onError.once((err) => reject(err));
+    });
+    const clientConnected = new Promise<void>((resolve, reject) => {
+      client.onConnect.once(() => resolve());
+      client.onError.once((err) => reject(err));
+    });
+
+    void client.connect();
+    await Promise.all([serverConnected, clientConnected]);
+    expect(clientHelloCount).toBeGreaterThanOrEqual(2);
+    expect(dtlsErrors).toEqual([]);
+
+    const serverReceived = new Promise<string>((resolve) => {
+      server.onData.once((buf) => resolve(buf.toString("utf8")));
+    });
+    await client.send(Buffer.from("pq-fragmented-dtls-ok", "utf8"));
+    expect(await serverReceived).toBe("pq-fragmented-dtls-ok");
+
+    server.close();
+    client.close();
   });
 });
