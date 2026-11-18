@@ -35,6 +35,12 @@ Public endpoint returning the server's `Ed25519` identity public key and ICE boo
     "maxPeersPerRoom": 16,
     "maxRoomsPerConnection": 8,
     "maxSignalPayloadBytes": 32768
+  },
+  "relay": {
+    "enabled": true,
+    "ttlMs": 86400000,
+    "maxFileBytes": 104857600,
+    "maxTotalBytes": 2147483648
   }
 }
 ```
@@ -135,3 +141,14 @@ Binds the authenticated user to a client-generated ephemeral `Ed25519` keypair f
 3. `room.peer_left`: `{ "type": "room.peer_left", "roomId": "<64-hex>", "peerId": "peer_01jc..." }`
 4. `signal.deliver`: `{ "type": "signal.deliver", "roomId": "<64-hex>", "fromPeerId": "peer_01jb...", "envelope": { "nonce": "...", "ciphertext": "..." } }`
 5. `error`: `{ "type": "error", "code": "room_full | rate_limited | invalid_frame", "roomId": "<64-hex>?" }`
+
+---
+
+## 5. Zero-Knowledge Ephemeral Blind Ciphertext Relay (`/api/v1/relay/*`)
+
+All `/api/v1/relay/*` endpoints require an authenticated session (`Cookie` + validated `Origin` + `X-CSRF-Token` for `web` mutations; `Authorization: Bearer <sessionToken>` for `cli`). The server SQLite database remains strictly untouched (`users` and `sessions` only); encrypted blobs live in an isolated filesystem cache directory governed by `relay.ttlMs` (`24h` default), `relay.maxFileBytes` (`100 MiB` default per blinded `fileTag`), and `relay.maxTotalBytes` (`2 GiB` global LRU cap).
+
+- `PUT /api/v1/relay/:boxId/envelopes/:blobId` (`application/octet-stream`, `41..65,536 B`): Idempotently stores an `XChaCha20-Poly1305` encrypted chat/manifest/hash-page envelope under `boxId` (`64-hex`) and `blobId` (`32-hex`). Returns `{ "ok": true, "seq": 1, "created": true, "expiresAt": 1763133600000 }`.
+- `GET /api/v1/relay/:boxId/envelopes?afterSeq=<n>&limit=<1..100>`: Lists non-expired encrypted envelopes in `boxId` with `seq > afterSeq`. Returns `{ "ok": true, "items": [{ "seq": 1, "blobId": "<32-hex>", "payloadB64": "<base64url-raw-aead>", "expiresAt": 1763133600000 }], "nextCursor": 1, "hasMore": false }`.
+- `PUT /api/v1/relay/:boxId/files/:fileTag/chunks/:chunkBlobId` (`application/octet-stream`, `40..65,576 B`): Idempotently stores an `XChaCha20-Poly1305` encrypted `<= 64 KiB` Swarm chunk. Rejects with `413 payload_too_large` if cumulative unique chunk bytes for `(boxId, fileTag)` exceed `relay.maxFileBytes`. Returns `{ "ok": true, "created": true, "expiresAt": 1763133600000 }`.
+- `GET /api/v1/relay/:boxId/files/:fileTag/chunks/:chunkBlobId`: Streams the raw binary AEAD chunk (`application/octet-stream`) or `404 not_found` if absent/expired/evicted.

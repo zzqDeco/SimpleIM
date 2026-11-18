@@ -21,11 +21,13 @@ import {
   type PasswordHasherPort,
   type RateLimiterPort,
   type RateLimitRule,
+  type RelayConfig,
   type Session,
   type SessionRepositoryPort,
   type User,
   type UserRepositoryPort,
 } from "../domain/index.ts";
+import { DEFAULT_RELAY_CONFIG } from "./relay-service.ts";
 
 export const DEFAULT_STUN_URLS: readonly string[] = [
   "stun:stun.cloudflare.com:3478",
@@ -61,6 +63,7 @@ export interface AuthServiceDependencies {
   readonly clock: ClockPort;
   readonly stunUrls?: readonly string[];
   readonly limits?: ServerLimits;
+  readonly relay?: RelayConfig;
   readonly sessionTtlMs?: number;
   readonly peerCertTtlMs?: number;
   readonly popMaxSkewMs?: number;
@@ -85,6 +88,7 @@ export class AuthService {
   private readonly clock: ClockPort;
   private readonly stunUrls: readonly string[];
   private readonly limits: ServerLimits;
+  private readonly relay: RelayConfig;
   private readonly sessionTtlMs: number;
   private readonly peerCertTtlMs: number;
   private readonly popMaxSkewMs: number;
@@ -100,6 +104,7 @@ export class AuthService {
     this.clock = deps.clock;
     this.stunUrls = deps.stunUrls ?? DEFAULT_STUN_URLS;
     this.limits = deps.limits ?? DEFAULT_SERVER_LIMITS;
+    this.relay = deps.relay ?? DEFAULT_RELAY_CONFIG;
     this.sessionTtlMs = deps.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
     this.peerCertTtlMs = deps.peerCertTtlMs ?? DEFAULT_PEER_CERT_TTL_MS;
     this.popMaxSkewMs = deps.popMaxSkewMs ?? DEFAULT_POP_MAX_SKEW_MS;
@@ -132,6 +137,7 @@ export class AuthService {
       serverSignPubKey: this.identitySigner.serverSignPubKey,
       iceServers,
       limits: { ...this.limits },
+      relay: { ...this.relay },
     };
   }
 

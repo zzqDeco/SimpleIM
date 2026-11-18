@@ -17,6 +17,9 @@ const INFO_ROOM_ID = utf8ToBytes("simpleim/v1/room-id");
 const INFO_SIGNALING_AEAD = utf8ToBytes("simpleim/v1/signaling-aead");
 const INFO_ROOM_AUTH_HMAC = utf8ToBytes("simpleim/v1/room-auth-hmac");
 const INFO_ROOM_APP_AEAD = utf8ToBytes("simpleim/v1/room-app-aead");
+const INFO_RELAY_BOX_ID = utf8ToBytes("simpleim/v1/relay-box-id");
+const INFO_RELAY_BLOB_AEAD = utf8ToBytes("simpleim/v1/relay-blob-aead");
+const INFO_RELAY_ITEM_HMAC = utf8ToBytes("simpleim/v1/relay-item-hmac");
 
 export interface DerivedRoomKeys {
   roomId: string;
@@ -24,6 +27,13 @@ export interface DerivedRoomKeys {
   signalingKey: Uint8Array;
   roomAuthKey: Uint8Array;
   roomAppKey: Uint8Array;
+}
+
+export interface DerivedRelayKeys {
+  relayBoxId: string;
+  relayBoxIdPrefix: string;
+  relayKey: Uint8Array;
+  relayIdKey: Uint8Array;
 }
 
 export interface DeriveRoomKeyOptions {
@@ -104,4 +114,45 @@ export function wipeRoomKeys(keys: DerivedRoomKeys): void {
   keys.signalingKey.fill(0);
   keys.roomAuthKey.fill(0);
   keys.roomAppKey.fill(0);
+}
+
+export function deriveRelayKeys(roomAppKey: Uint8Array): DerivedRelayKeys {
+  if (roomAppKey.byteLength !== 32) {
+    throw new ContractValidationError("roomAppKey must be 32 bytes");
+  }
+  const boxBytes = hkdf(
+    sha256,
+    roomAppKey,
+    EMPTY_HKDF_SALT,
+    INFO_RELAY_BOX_ID,
+    32,
+  );
+  const relayBoxId = bytesToHex(boxBytes);
+  boxBytes.fill(0);
+
+  const relayKey = hkdf(
+    sha256,
+    roomAppKey,
+    EMPTY_HKDF_SALT,
+    INFO_RELAY_BLOB_AEAD,
+    32,
+  );
+  const relayIdKey = hkdf(
+    sha256,
+    roomAppKey,
+    EMPTY_HKDF_SALT,
+    INFO_RELAY_ITEM_HMAC,
+    32,
+  );
+  return {
+    relayBoxId,
+    relayBoxIdPrefix: relayBoxId.slice(0, 8),
+    relayKey,
+    relayIdKey,
+  };
+}
+
+export function wipeRelayKeys(keys: DerivedRelayKeys): void {
+  keys.relayKey.fill(0);
+  keys.relayIdKey.fill(0);
 }

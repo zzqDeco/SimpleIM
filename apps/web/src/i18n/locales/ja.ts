@@ -98,6 +98,11 @@ export const ja = {
   "room.files.action.download": "受信",
   "room.files.action.cancel": "中止",
   "room.files.action.save": "保存",
+  "room.files.relay.uploading":
+    "☁️ 暗号化一時キャッシュ中 {percent}%（完了後は画面を閉じても取得可）",
+  "room.files.relay.cached": "☁️ 暗号化キャッシュ済（24h オフライン取得可）",
+  "room.files.relay.tooLarge": "100 MB 超 · オンライン P2P のみ",
+  "room.files.relay.error": "一時キャッシュ未完了 · オンライン P2P のみ",
 
   "security.peerRejected": "未検証ピアの接続を拒否しました（{reason}）。",
   "security.iceFailed":

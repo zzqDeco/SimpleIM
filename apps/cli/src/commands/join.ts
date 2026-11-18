@@ -236,10 +236,16 @@ export async function executeJoinInputLine(params: {
               ? Math.floor((prog.completedChunks / f.totalChunks) * 100)
               : 0;
         const status = prog ? `${prog.status} ${pct}%` : "announced";
+        const relaySuffix =
+          prog?.relayCacheState && prog.relayCacheState !== "none"
+            ? prog.relayCacheState === "uploading"
+              ? ` [relay:uploading ${f.totalChunks === 0 ? 100 : Math.floor(((prog.relayCachedChunks ?? 0) / f.totalChunks) * 100)}%]`
+              : ` [relay:${prog.relayCacheState}]`
+            : "";
         const savedPath = chunkStorage.getCompletedFilePath(f.fileId);
         const savedSuffix = savedPath ? ` -> ${savedPath}` : "";
         stdout.write(
-          `  [${i + 1}] ${f.fileId}  ${f.fileName} (${formatHumanBytes(f.fileSize)}) from @${f.senderCert.payload.username} [${status}]${savedSuffix}\n`,
+          `  [${i + 1}] ${f.fileId}  ${f.fileName} (${formatHumanBytes(f.fileSize)}) from @${f.senderCert.payload.username} [${status}]${relaySuffix}${savedSuffix}\n`,
         );
       });
       return "continue";
@@ -308,6 +314,10 @@ export async function runJoinCommand(
   const chunkStorage = new FsChunkStorageAdapter({
     downloadDir: cmd.downloadDir,
   });
+  const relayClient = api.createBlindRelayClient(
+    creds.sessionToken,
+    meta.relay,
+  );
   const sharedFiles = new LocalSharedFileRegistry();
 
   const engine = createRoomPeerEngine({
@@ -321,6 +331,7 @@ export async function runJoinCommand(
     signaling,
     transportFactory,
     chunkStorage,
+    relayClient,
     events: {
       onCenterConnectionChange: (connected) => {
         stdout.write(

@@ -1,4 +1,5 @@
 import { ContractValidationError } from "./errors.ts";
+import type { RelayMetaConfig } from "./relay.ts";
 
 export type ClientKind = "web" | "cli";
 
@@ -27,6 +28,7 @@ export interface MetaResponse {
   serverSignPubKey: string;
   iceServers: IceServerConfig[];
   limits: ServerLimits;
+  relay?: RelayMetaConfig;
 }
 
 export interface VersionResponse {

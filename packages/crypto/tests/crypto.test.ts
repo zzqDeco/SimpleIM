@@ -7,14 +7,22 @@ import {
   createPopRequest,
   createSignedFileManifestFromChunks,
   createSignedFileManifestWithPages,
+  deriveRelayChunkBlobId,
+  deriveRelayEnvelopeBlobId,
+  deriveRelayFileTag,
+  deriveRelayKeys,
   deriveRoomKeys,
   extractSdpSha256Fingerprint,
   generateEd25519KeyPair,
   generatePrefixedId,
   issuePeerIdentityCert,
   openPostAuthControlFrame,
+  openRelayChunkBinary,
+  openRelayEnvelopeBinary,
   openSignalingPayload,
   sealPostAuthControlFrame,
+  sealRelayChunkBinary,
+  sealRelayEnvelopeBinary,
   sealSignalingPayload,
   signChatMessage,
   verifyChatMessage,
@@ -24,6 +32,7 @@ import {
   verifyHelloProveFrame,
   verifyPeerIdentityCert,
   verifyPopRequest,
+  wipeRelayKeys,
   wipeRoomKeys,
 } from "../src/index.ts";
 
@@ -427,5 +436,85 @@ describe("@simpleim/crypto", () => {
         pagedRes.manifest.hashPageHashes![1]!,
       ),
     ).toBe(false);
+
+    // Blind relay HKDF subkeys + binary XChaCha20-Poly1305 envelope & chunk AEAD binding
+    const relayKeys = deriveRelayKeys(roomKeys.roomAppKey);
+    const relayKeysDup = deriveRelayKeys(roomKeys.roomAppKey);
+    expect(relayKeys.relayBoxId).toBe(relayKeysDup.relayBoxId);
+    expect(relayKeys.relayBoxId).not.toBe(roomKeys.roomId);
+
+    const chatBlobId = deriveRelayEnvelopeBlobId(
+      relayKeys.relayIdKey,
+      "chat",
+      chatMsg.msgId,
+    );
+    expect(chatBlobId).toHaveLength(32);
+    const sealedEnv = sealRelayEnvelopeBinary(
+      relayKeys.relayKey,
+      relayKeys.relayBoxId,
+      chatBlobId,
+      { type: "relay.chat", message: chatMsg },
+    );
+    const openedEnv = openRelayEnvelopeBinary(
+      relayKeys.relayKey,
+      relayKeys.relayBoxId,
+      chatBlobId,
+      sealedEnv,
+    );
+    expect(openedEnv).toEqual({ type: "relay.chat", message: chatMsg });
+
+    // Cross-box or cross-blobId substitution must fail Poly1305 AAD check
+    expect(() =>
+      openRelayEnvelopeBinary(
+        relayKeys.relayKey,
+        "0".repeat(64),
+        chatBlobId,
+        sealedEnv,
+      ),
+    ).toThrow();
+
+    const fileTag = deriveRelayFileTag(relayKeys.relayIdKey, manifest.fileId);
+    const chunk0Id = deriveRelayChunkBlobId(
+      relayKeys.relayIdKey,
+      manifest.fileId,
+      0,
+    );
+    const chunk1Id = deriveRelayChunkBlobId(
+      relayKeys.relayIdKey,
+      manifest.fileId,
+      1,
+    );
+    const rawChunk0 = fileData.subarray(0, SWARM_CHUNK_SIZE);
+    const sealedChunk0 = sealRelayChunkBinary(
+      relayKeys.relayKey,
+      relayKeys.relayBoxId,
+      fileTag,
+      chunk0Id,
+      rawChunk0,
+    );
+    expect(sealedChunk0.byteLength).toBe(SWARM_CHUNK_SIZE + 40);
+    expect(
+      openRelayChunkBinary(
+        relayKeys.relayKey,
+        relayKeys.relayBoxId,
+        fileTag,
+        chunk0Id,
+        sealedChunk0,
+      ),
+    ).toEqual(rawChunk0);
+    // Swapping chunk0 into chunk1 slot must fail AEAD AAD check
+    expect(() =>
+      openRelayChunkBinary(
+        relayKeys.relayKey,
+        relayKeys.relayBoxId,
+        fileTag,
+        chunk1Id,
+        sealedChunk0,
+      ),
+    ).toThrow();
+
+    wipeRelayKeys(relayKeys);
+    wipeRelayKeys(relayKeysDup);
+    expect(relayKeys.relayKey.every((b) => b === 0)).toBe(true);
   });
 });

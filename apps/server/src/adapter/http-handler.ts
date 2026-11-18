@@ -1,13 +1,19 @@
-import type {
-  ApiErrorResponse,
-  CliAuthResponse,
-  ErrorCode,
-  MeResponse,
-  PeerCertResponse,
-  VersionResponse,
-  WebAuthResponse,
+import {
+  MAX_RELAY_CHUNK_CIPHERTEXT_BYTES,
+  MAX_RELAY_ENVELOPE_CIPHERTEXT_BYTES,
+  type ApiErrorResponse,
+  type CliAuthResponse,
+  type ErrorCode,
+  type MeResponse,
+  type PeerCertResponse,
+  type VersionResponse,
+  type WebAuthResponse,
 } from "@simpleim/contracts";
-import type { AuthService, IssuedAuthSession } from "../app/index.ts";
+import type {
+  AuthService,
+  IssuedAuthSession,
+  RelayService,
+} from "../app/index.ts";
 import {
   DomainError,
   toUserProfile,
@@ -32,6 +38,7 @@ const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface HttpHandlerDependencies {
   readonly authService: AuthService;
+  readonly relayService: RelayService;
   readonly logger: LoggerPort;
   readonly clock: ClockPort;
   readonly allowedOrigins: ReadonlySet<string>;
@@ -43,6 +50,7 @@ export interface HttpHandlerDependencies {
 
 export class HttpHandler {
   private readonly authService: AuthService;
+  private readonly relayService: RelayService;
   private readonly logger: LoggerPort;
   private readonly clock: ClockPort;
   private readonly allowedOrigins: ReadonlySet<string>;
@@ -53,6 +61,7 @@ export class HttpHandler {
 
   constructor(deps: HttpHandlerDependencies) {
     this.authService = deps.authService;
+    this.relayService = deps.relayService;
     this.logger = deps.logger;
     this.clock = deps.clock;
     this.allowedOrigins = deps.allowedOrigins;
@@ -71,6 +80,7 @@ export class HttpHandler {
     const corrId = resolveCorrelationId(req);
     const method = req.method.toUpperCase();
     const path = url.pathname;
+    const logPath = sanitizeRelayLogPath(path);
     const originHeader = req.headers.get("origin");
     const corsHeaders = buildCorsHeaders(
       originHeader,
@@ -88,12 +98,12 @@ export class HttpHandler {
           {},
           corrId,
           method,
-          path,
+          logPath,
           startMs,
         );
       }
       const headers = new Headers(corsHeaders);
-      headers.set("access-control-allow-methods", "GET, POST, OPTIONS");
+      headers.set("access-control-allow-methods", "GET, POST, PUT, OPTIONS");
       headers.set(
         "access-control-allow-headers",
         "Content-Type, Authorization, X-CSRF-Token, X-Correlation-Id",
@@ -102,7 +112,7 @@ export class HttpHandler {
       this.logBoundary("info", "http.preflight", {
         corrId,
         method,
-        path,
+        path: logPath,
         status: 204,
         durationMs: this.clock.nowMs() - startMs,
       });
@@ -280,6 +290,160 @@ export class HttpHandler {
         return res;
       }
 
+      if (path.startsWith("/api/v1/relay/")) {
+        const segments = path.split("/");
+
+        if (
+          method === "PUT" &&
+          segments.length === 7 &&
+          segments[5] === "envelopes"
+        ) {
+          const { auth } = this.requireAuthenticated(
+            req,
+            url,
+            originHeader,
+            true,
+          );
+          loggedUserId = auth.user.id;
+          this.relayService.assertEnabled();
+          const body = await readBoundedBinaryBody(
+            req,
+            MAX_RELAY_ENVELOPE_CIPHERTEXT_BYTES,
+          );
+          const payload = this.relayService.putEnvelope({
+            userId: auth.user.id,
+            clientIp,
+            boxId: segments[4] ?? "",
+            blobId: segments[6] ?? "",
+            payload: body,
+          });
+          const status = payload.created ? 201 : 200;
+          const res = this.jsonResponse(status, payload, corsHeaders);
+          this.logBoundary("info", "relay.envelope.put", {
+            corrId,
+            method,
+            path: logPath,
+            status,
+            userId: loggedUserId,
+            durationMs: this.clock.nowMs() - startMs,
+          });
+          return res;
+        }
+
+        if (
+          method === "GET" &&
+          segments.length === 6 &&
+          segments[5] === "envelopes"
+        ) {
+          const { auth } = this.requireAuthenticated(
+            req,
+            url,
+            originHeader,
+            false,
+          );
+          loggedUserId = auth.user.id;
+          this.relayService.assertEnabled();
+          const rawAfterSeq = url.searchParams.get("afterSeq");
+          const rawLimit = url.searchParams.get("limit");
+          const afterSeq =
+            rawAfterSeq === null
+              ? undefined
+              : parseNonNegativeIntQueryParam(rawAfterSeq, "afterSeq");
+          const limit =
+            rawLimit === null
+              ? undefined
+              : parseNonNegativeIntQueryParam(rawLimit, "limit");
+          const payload = this.relayService.listEnvelopes({
+            userId: auth.user.id,
+            clientIp,
+            boxId: segments[4] ?? "",
+            afterSeq,
+            limit,
+          });
+          const res = this.jsonResponse(200, payload, corsHeaders);
+          this.logBoundary("info", "relay.envelope.list", {
+            corrId,
+            method,
+            path: logPath,
+            status: 200,
+            userId: loggedUserId,
+            durationMs: this.clock.nowMs() - startMs,
+          });
+          return res;
+        }
+
+        if (
+          method === "PUT" &&
+          segments.length === 9 &&
+          segments[5] === "files" &&
+          segments[7] === "chunks"
+        ) {
+          const { auth } = this.requireAuthenticated(
+            req,
+            url,
+            originHeader,
+            true,
+          );
+          loggedUserId = auth.user.id;
+          this.relayService.assertEnabled();
+          const body = await readBoundedBinaryBody(
+            req,
+            MAX_RELAY_CHUNK_CIPHERTEXT_BYTES,
+          );
+          const payload = this.relayService.putChunk({
+            userId: auth.user.id,
+            clientIp,
+            boxId: segments[4] ?? "",
+            fileTag: segments[6] ?? "",
+            chunkBlobId: segments[8] ?? "",
+            payload: body,
+          });
+          const status = payload.created ? 201 : 200;
+          const res = this.jsonResponse(status, payload, corsHeaders);
+          this.logBoundary("info", "relay.chunk.put", {
+            corrId,
+            method,
+            path: logPath,
+            status,
+            userId: loggedUserId,
+            durationMs: this.clock.nowMs() - startMs,
+          });
+          return res;
+        }
+
+        if (
+          method === "GET" &&
+          segments.length === 9 &&
+          segments[5] === "files" &&
+          segments[7] === "chunks"
+        ) {
+          const { auth } = this.requireAuthenticated(
+            req,
+            url,
+            originHeader,
+            false,
+          );
+          loggedUserId = auth.user.id;
+          const chunkBytes = this.relayService.getChunk({
+            userId: auth.user.id,
+            clientIp,
+            boxId: segments[4] ?? "",
+            fileTag: segments[6] ?? "",
+            chunkBlobId: segments[8] ?? "",
+          });
+          const res = this.binaryResponse(200, chunkBytes, corsHeaders);
+          this.logBoundary("info", "relay.chunk.get", {
+            corrId,
+            method,
+            path: logPath,
+            status: 200,
+            userId: loggedUserId,
+            durationMs: this.clock.nowMs() - startMs,
+          });
+          return res;
+        }
+      }
+
       throw new DomainError("not_found", "Route not found", 404);
     } catch (err) {
       if (err instanceof DomainError) {
@@ -288,7 +452,7 @@ export class HttpHandler {
           corsHeaders,
           corrId,
           method,
-          path,
+          logPath,
           startMs,
           loggedUserId,
         );
@@ -304,7 +468,7 @@ export class HttpHandler {
         corsHeaders,
         corrId,
         method,
-        path,
+        logPath,
         startMs,
         loggedUserId,
       );
@@ -398,6 +562,20 @@ export class HttpHandler {
     return new Response(JSON.stringify(payload), { status, headers });
   }
 
+  private binaryResponse(
+    status: number,
+    payload: Uint8Array,
+    extraHeaders: Record<string, string>,
+  ): Response {
+    const headers = new Headers(extraHeaders);
+    headers.set("content-type", "application/octet-stream");
+    headers.set("content-length", String(payload.byteLength));
+    headers.set("cache-control", "no-store");
+    const copy = new Uint8Array(payload.byteLength);
+    copy.set(payload);
+    return new Response(copy, { status, headers });
+  }
+
   private jsonError(
     err: DomainError,
     extraHeaders: Record<string, string>,
@@ -440,7 +618,7 @@ export class HttpHandler {
       durationMs: Math.max(0, Math.round(fields.durationMs)),
       status: fields.status,
       method: fields.method,
-      path: fields.path,
+      path: sanitizeRelayLogPath(fields.path),
       ...(fields.errorCode ? { errorCode: fields.errorCode } : {}),
       ...(fields.userId ? { userId: fields.userId } : {}),
       ...(fields.peerId ? { peerId: fields.peerId } : {}),
@@ -453,6 +631,108 @@ export class HttpHandler {
       this.logger.info(event, clean);
     }
   }
+}
+
+function sanitizeRelayLogPath(rawPath: string): string {
+  if (rawPath === "/api/v1/relay" || rawPath.startsWith("/api/v1/relay/")) {
+    const segments = rawPath.split("/");
+    const kind = segments[5];
+    if (kind === "envelopes") {
+      return "/api/v1/relay/:boxId/envelopes";
+    }
+    if (kind === "files" || kind === "chunks") {
+      return "/api/v1/relay/:boxId/chunks";
+    }
+    return "/api/v1/relay/:boxId";
+  }
+  return rawPath;
+}
+
+function parseNonNegativeIntQueryParam(raw: string, name: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new DomainError(
+      "invalid_arguments",
+      `Invalid ${name} query parameter`,
+      400,
+    );
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new DomainError(
+      "invalid_arguments",
+      `Invalid ${name} query parameter`,
+      400,
+    );
+  }
+  return parsed;
+}
+
+async function readBoundedBinaryBody(
+  req: Request,
+  maxBytes: number,
+): Promise<Uint8Array> {
+  const contentLengthHeader = req.headers.get("content-length");
+  if (contentLengthHeader !== null) {
+    const declaredLength = Number.parseInt(contentLengthHeader, 10);
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      throw new DomainError(
+        "payload_too_large",
+        `Request body exceeds ${maxBytes} byte limit`,
+        413,
+      );
+    }
+  }
+
+  if (!req.body) {
+    throw new DomainError(
+      "invalid_arguments",
+      "Request body must not be empty",
+      400,
+    );
+  }
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel().catch(() => undefined);
+          throw new DomainError(
+            "payload_too_large",
+            `Request body exceeds ${maxBytes} byte limit`,
+            413,
+          );
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (totalBytes === 0) {
+    throw new DomainError(
+      "invalid_arguments",
+      "Request body must not be empty",
+      400,
+    );
+  }
+
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
 }
 
 async function readBoundedJsonBody(

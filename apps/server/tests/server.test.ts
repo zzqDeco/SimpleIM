@@ -1,23 +1,33 @@
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  DEFAULT_RELAY_MAX_FILE_BYTES,
+  DEFAULT_RELAY_MAX_TOTAL_BYTES,
+  DEFAULT_RELAY_TTL_MS,
+  isValidRelayListEnvelopesResponse,
+  MAX_RELAY_ENVELOPE_CIPHERTEXT_BYTES,
   MAX_SIGNAL_FRAME_BYTES,
   parseServerSignalingFrame,
   type CliAuthResponse,
   type MetaResponse,
   type PeerCertResponse,
+  type RelayListEnvelopesResponse,
+  type RelayPutChunkResponse,
+  type RelayPutEnvelopeResponse,
   type ServerSignalingFrame,
   type WebAuthResponse,
 } from "@simpleim/contracts";
 import {
+  base64UrlToBytes,
   createPopRequest,
   deriveRoomKeys,
   generateEd25519KeyPair,
   generatePrefixedId,
   openSignalingPayload,
+  randomBytes,
   sealSignalingPayload,
   sha256Bytes,
   verifyPeerIdentityCert,
@@ -1125,5 +1135,750 @@ describe("SimpleIM Server Integration Suite", () => {
     expect(meta.iceServers).toEqual([
       { urls: ["stun:120.25.210.202:3478"] },
     ]);
+    expect(meta.relay).toEqual({
+      enabled: true,
+      ttlMs: DEFAULT_RELAY_TTL_MS,
+      maxFileBytes: DEFAULT_RELAY_MAX_FILE_BYTES,
+      maxTotalBytes: DEFAULT_RELAY_MAX_TOTAL_BYTES,
+    });
+  });
+
+  test("10. Blind relay (/api/v1/relay/*): /meta config, Web Cookie+CSRF vs CLI Bearer, idempotent envelope PUT + paginated GET, log redaction, and SQLite zero-room-persistence", async () => {
+    const devOrigin = "http://localhost:5173";
+    const capturedLogs: string[] = [];
+    const srv = startTestServer(
+      {
+        allowedOrigins: [devOrigin],
+        relay: {
+          enabled: true,
+          ttlMs: 120_000,
+          maxFileBytes: 1_048_576,
+          maxTotalBytes: 8_388_608,
+        },
+      },
+      capturedLogs,
+    );
+
+    const metaRes = await fetch(`${srv.url}/api/v1/meta`);
+    expect(metaRes.status).toBe(200);
+    const meta = (await metaRes.json()) as MetaResponse;
+    expect(meta.relay).toEqual({
+      enabled: true,
+      ttlMs: 120_000,
+      maxFileBytes: 1_048_576,
+      maxTotalBytes: 8_388_608,
+    });
+
+    const boxId = "a1b2c3d4e5f60718293a4b5c6d7e8f90".repeat(2);
+    const blob1 = "11112222333344445555666677778888";
+    const blob2 = "9999aaaabbbbccccddddeeeeffff0001";
+    const blob3 = "9999aaaabbbbccccddddeeeeffff0002";
+    const fileTag = "fedcba9876543210fedcba9876543210";
+    const chunkId = "0123456789abcdef0123456789abcdef";
+
+    // CORS preflight on relay PUT includes PUT method and redacts boxId/blobId in logs
+    const preflightRes = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/${blob1}`,
+      {
+        method: "OPTIONS",
+        headers: { Origin: devOrigin },
+      },
+    );
+    expect(preflightRes.status).toBe(204);
+    expect(preflightRes.headers.get("access-control-allow-methods")).toContain(
+      "PUT",
+    );
+
+    // Unauthenticated requests are rejected with 401
+    const unauthGet = await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes`);
+    expect(unauthGet.status).toBe(401);
+
+    // Register Web user (Cookie + CSRF) and CLI user (Bearer)
+    const webRegRes = await fetch(`${srv.url}/api/v1/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: devOrigin },
+      body: JSON.stringify({
+        username: "relay_web",
+        password: "relay-web-password-123",
+        clientKind: "web",
+      }),
+    });
+    expect(webRegRes.status).toBe(201);
+    const webCookie = extractCookiePair(webRegRes.headers.get("set-cookie"));
+    const webAuth = (await webRegRes.json()) as WebAuthResponse;
+
+    const cliRegRes = await fetch(`${srv.url}/api/v1/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "relay_cli",
+        password: "relay-cli-password-123",
+        clientKind: "cli",
+      }),
+    });
+    expect(cliRegRes.status).toBe(201);
+    const cliAuth = (await cliRegRes.json()) as CliAuthResponse;
+
+    const envBytes1 = randomBytes(96);
+    const envBytes2 = randomBytes(128);
+    const envBytes3 = randomBytes(64);
+    const chunkBytes = randomBytes(512);
+
+    // Web Cookie PUT without X-CSRF-Token -> 403 csrf_invalid (both envelope & chunk)
+    const noCsrfEnv = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/${blob1}`,
+      {
+        method: "PUT",
+        headers: {
+          Cookie: webCookie,
+          Origin: devOrigin,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(envBytes1),
+      },
+    );
+    expect(noCsrfEnv.status).toBe(403);
+    expect(await noCsrfEnv.json()).toMatchObject({
+      ok: false,
+      error: { code: "csrf_invalid" },
+    });
+
+    const noCsrfChunk = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkId}`,
+      {
+        method: "PUT",
+        headers: {
+          Cookie: webCookie,
+          Origin: devOrigin,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(chunkBytes),
+      },
+    );
+    expect(noCsrfChunk.status).toBe(403);
+    expect(await noCsrfChunk.json()).toMatchObject({
+      ok: false,
+      error: { code: "csrf_invalid" },
+    });
+
+    // Web Cookie PUT with valid X-CSRF-Token -> 201 Created (seq = 1)
+    const put1Res = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/${blob1}`,
+      {
+        method: "PUT",
+        headers: {
+          Cookie: webCookie,
+          Origin: devOrigin,
+          "X-CSRF-Token": webAuth.csrfToken,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(envBytes1),
+      },
+    );
+    expect(put1Res.status).toBe(201);
+    const put1Json = (await put1Res.json()) as RelayPutEnvelopeResponse;
+    expect(put1Json.ok).toBe(true);
+    expect(put1Json.seq).toBe(1);
+    expect(put1Json.created).toBe(true);
+
+    // Idempotent re-PUT of same (boxId, blobId) -> 200 OK, created: false, seq unchanged
+    const put1DupRes = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/${blob1}`,
+      {
+        method: "PUT",
+        headers: {
+          Cookie: webCookie,
+          Origin: devOrigin,
+          "X-CSRF-Token": webAuth.csrfToken,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(envBytes1),
+      },
+    );
+    expect(put1DupRes.status).toBe(200);
+    const put1DupJson = (await put1DupRes.json()) as RelayPutEnvelopeResponse;
+    expect(put1DupJson).toEqual({
+      ok: true,
+      seq: 1,
+      created: false,
+      expiresAt: put1Json.expiresAt,
+    });
+
+    // CLI Bearer token PUT for blob2 (seq = 2) and blob3 (seq = 3)
+    const bearerHeaders = { Authorization: `Bearer ${cliAuth.sessionToken}` };
+    const put2Res = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/${blob2}`,
+      {
+        method: "PUT",
+        headers: {
+          ...bearerHeaders,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(envBytes2),
+      },
+    );
+    expect(put2Res.status).toBe(201);
+    expect(((await put2Res.json()) as RelayPutEnvelopeResponse).seq).toBe(2);
+
+    const put3Res = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/${blob3}`,
+      {
+        method: "PUT",
+        headers: {
+          ...bearerHeaders,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(envBytes3),
+      },
+    );
+    expect(put3Res.status).toBe(201);
+    expect(((await put3Res.json()) as RelayPutEnvelopeResponse).seq).toBe(3);
+
+    // Paginated GET ?afterSeq=0&limit=2 via Web Cookie (no CSRF needed on GET)
+    const page1Res = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0&limit=2`,
+      {
+        headers: { Cookie: webCookie, Origin: devOrigin },
+      },
+    );
+    expect(page1Res.status).toBe(200);
+    const page1Json = (await page1Res.json()) as RelayListEnvelopesResponse;
+    expect(isValidRelayListEnvelopesResponse(page1Json)).toBe(true);
+    expect(page1Json.items.map((i) => i.seq)).toEqual([1, 2]);
+    expect(page1Json.items.map((i) => i.blobId)).toEqual([blob1, blob2]);
+    expect(page1Json.nextCursor).toBe(2);
+    expect(page1Json.hasMore).toBe(true);
+    expect(base64UrlToBytes(page1Json.items[0]!.payloadB64)).toEqual(envBytes1);
+    expect(base64UrlToBytes(page1Json.items[1]!.payloadB64)).toEqual(envBytes2);
+
+    // Page 2 via CLI Bearer: ?afterSeq=2&limit=2 -> [seq=3], hasMore=false, nextCursor=3
+    const page2Res = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=2&limit=2`,
+      { headers: bearerHeaders },
+    );
+    expect(page2Res.status).toBe(200);
+    const page2Json = (await page2Res.json()) as RelayListEnvelopesResponse;
+    expect(page2Json.items.map((i) => i.seq)).toEqual([3]);
+    expect(page2Json.nextCursor).toBe(3);
+    expect(page2Json.hasMore).toBe(false);
+    expect(base64UrlToBytes(page2Json.items[0]!.payloadB64)).toEqual(envBytes3);
+
+    // Empty page when caught up: nextCursor === afterSeq
+    const page3Res = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=3&limit=10`,
+      { headers: bearerHeaders },
+    );
+    expect(page3Res.status).toBe(200);
+    expect(await page3Res.json()).toEqual({
+      ok: true,
+      items: [],
+      nextCursor: 3,
+      hasMore: false,
+    });
+
+    // Parameter & payload boundary validation (400 / 413)
+    const tooSmallEnv = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/00001111222233334444555566667777`,
+      {
+        method: "PUT",
+        headers: bearerHeaders,
+        body: new Uint8Array(39),
+      },
+    );
+    expect(tooSmallEnv.status).toBe(400);
+
+    const tooLargeEnv = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/00001111222233334444555566667777`,
+      {
+        method: "PUT",
+        headers: bearerHeaders,
+        body: new Uint8Array(MAX_RELAY_ENVELOPE_CIPHERTEXT_BYTES + 1),
+      },
+    );
+    expect(tooLargeEnv.status).toBe(413);
+
+    const badLimitRes = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes?limit=101`,
+      { headers: bearerHeaders },
+    );
+    expect(badLimitRes.status).toBe(400);
+
+    // Chunk PUT + binary GET via CLI Bearer
+    const putChunkRes = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkId}`,
+      {
+        method: "PUT",
+        headers: bearerHeaders,
+        body: new Uint8Array(chunkBytes),
+      },
+    );
+    expect(putChunkRes.status).toBe(201);
+    const putChunkJson = (await putChunkRes.json()) as RelayPutChunkResponse;
+    expect(putChunkJson.ok).toBe(true);
+    expect(putChunkJson.created).toBe(true);
+
+    const getChunkRes = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkId}`,
+      {
+        headers: { ...bearerHeaders, Origin: devOrigin },
+      },
+    );
+    expect(getChunkRes.status).toBe(200);
+    expect(getChunkRes.headers.get("content-type")).toBe(
+      "application/octet-stream",
+    );
+    expect(getChunkRes.headers.get("cache-control")).toBe("no-store");
+    expect(getChunkRes.headers.get("access-control-allow-origin")).toBe(
+      devOrigin,
+    );
+    const downloadedChunk = new Uint8Array(await getChunkRes.arrayBuffer());
+    expect(downloadedChunk).toEqual(new Uint8Array(chunkBytes));
+
+    // CRITICAL: Boundary log verification - boxId, blobId, fileTag, and chunkId NEVER appear in logs
+    expect(capturedLogs.length).toBeGreaterThan(0);
+    const relayLogPaths = new Set<string>();
+    for (const line of capturedLogs) {
+      expect(line).not.toContain(boxId);
+      expect(line).not.toContain(boxId.slice(0, 16));
+      expect(line).not.toContain(blob1);
+      expect(line).not.toContain(blob2);
+      expect(line).not.toContain(blob3);
+      expect(line).not.toContain(fileTag);
+      expect(line).not.toContain(chunkId);
+      const parsed = JSON.parse(line) as { path?: string; event?: string };
+      if (parsed.path?.startsWith("/api/v1/relay")) {
+        relayLogPaths.add(parsed.path);
+      }
+    }
+    expect(Array.from(relayLogPaths).sort()).toEqual([
+      "/api/v1/relay/:boxId/chunks",
+      "/api/v1/relay/:boxId/envelopes",
+    ]);
+
+    // SQLite zero-room-persistence verification
+    const tables = srv.sqliteDb
+      .query<{ name: string }, []>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name ASC",
+      )
+      .all()
+      .map((r) => r.name);
+    expect(tables).toEqual(["schema_migrations", "sessions", "users"]);
+
+    const dumpJson = JSON.stringify({
+      users: srv.sqliteDb.query("SELECT * FROM users").all(),
+      sessions: srv.sqliteDb
+        .query("SELECT id, user_id, client_kind FROM sessions")
+        .all(),
+    });
+    expect(dumpJson).not.toContain(boxId.slice(0, 16));
+    expect(dumpJson).not.toContain(blob1);
+    expect(dumpJson).not.toContain(fileTag);
+  });
+
+  test("11. Relay quotas (per-file 413 maxFileBytes & global maxTotalBytes LRU eviction), ttlMs expiration, disabled relay (404), and rate limiting (429)", async () => {
+    let now = 1_763_000_000_000;
+    const clock = { nowMs: () => now };
+
+    const srv = startTestServer({
+      clock,
+      relay: {
+        enabled: true,
+        ttlMs: 10_000,
+        maxFileBytes: 250,
+        maxTotalBytes: 350,
+        sweepIntervalMs: 0,
+      },
+      relayEnvelopeRateLimit: {
+        capacity: 4,
+        refillPerSecond: 0,
+      },
+    });
+
+    const regRes = await fetch(`${srv.url}/api/v1/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "quota_tester",
+        password: "quota-password-123",
+        clientKind: "cli",
+      }),
+    });
+    const auth = (await regRes.json()) as CliAuthResponse;
+    const headers = { Authorization: `Bearer ${auth.sessionToken}` };
+
+    const boxId = "b".repeat(64);
+    const fileA = "1".repeat(32);
+    const fileB = "2".repeat(32);
+    const c1 = "a".repeat(32);
+    const c2 = "b".repeat(32);
+    const c3 = "c".repeat(32);
+    const cB1 = "d".repeat(32);
+
+    const bytes120A = randomBytes(120);
+    const bytes120B = randomBytes(120);
+    const bytes40 = randomBytes(40);
+    const bytes150 = randomBytes(150);
+
+    // Put c1 (120 B) and c2 (120 B) under fileA -> 240 B <= 250 B maxFileBytes
+    now += 10;
+    expect(
+      (
+        await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/files/${fileA}/chunks/${c1}`,
+          { method: "PUT", headers, body: new Uint8Array(bytes120A) },
+        )
+      ).status,
+    ).toBe(201);
+
+    now += 10;
+    expect(
+      (
+        await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/files/${fileA}/chunks/${c2}`,
+          { method: "PUT", headers, body: new Uint8Array(bytes120B) },
+        )
+      ).status,
+    ).toBe(201);
+
+    // Idempotent re-PUT of c2 at boundary (240 B) succeeds with 200 without exceeding maxFileBytes
+    const dupC2 = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileA}/chunks/${c2}`,
+      { method: "PUT", headers, body: new Uint8Array(bytes120B) },
+    );
+    expect(dupC2.status).toBe(200);
+    expect(((await dupC2.json()) as RelayPutChunkResponse).created).toBe(false);
+
+    // Third chunk c3 (40 B) under fileA -> 240 + 40 = 280 > 250 -> 413 payload_too_large
+    const overFileQuota = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileA}/chunks/${c3}`,
+      { method: "PUT", headers, body: new Uint8Array(bytes40) },
+    );
+    expect(overFileQuota.status).toBe(413);
+    expect(await overFileQuota.json()).toMatchObject({
+      ok: false,
+      error: { code: "payload_too_large" },
+    });
+
+    // Touch c1 via GET so c1 becomes MRU and c2 becomes the oldest LRU entry
+    now += 10;
+    const readC1Before = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileA}/chunks/${c1}`,
+      { headers },
+    );
+    expect(readC1Before.status).toBe(200);
+    expect(new Uint8Array(await readC1Before.arrayBuffer())).toEqual(
+      new Uint8Array(bytes120A),
+    );
+
+    // Put cB1 (150 B) under fileB: total 240 + 150 = 390 > 350 maxTotalBytes -> evicts LRU c2 (120 B), keeping c1!
+    now += 10;
+    const putCB1 = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileB}/chunks/${cB1}`,
+      { method: "PUT", headers, body: new Uint8Array(bytes150) },
+    );
+    expect(putCB1.status).toBe(201);
+
+    // c2 was LRU-evicted -> 404
+    const evictedC2 = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileA}/chunks/${c2}`,
+      { headers },
+    );
+    expect(evictedC2.status).toBe(404);
+
+    // c1 (touched recently) and cB1 (newly added) remain available -> 200
+    expect(
+      (
+        await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/files/${fileA}/chunks/${c1}`,
+          { headers },
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/files/${fileB}/chunks/${cB1}`,
+          { headers },
+        )
+      ).status,
+    ).toBe(200);
+
+    // Put an envelope (consumes 1st of 4 envelope rate-limit tokens)
+    const envBlob = "e".repeat(32);
+    const putEnv = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/${envBlob}`,
+      { method: "PUT", headers, body: new Uint8Array(randomBytes(48)) },
+    );
+    expect(putEnv.status).toBe(201);
+
+    // Advance clock past ttlMs (10_000 ms) -> chunks and envelopes expire immediately
+    now += 15_000;
+
+    const expiredChunkRes = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/files/${fileB}/chunks/${cB1}`,
+      { headers },
+    );
+    expect(expiredChunkRes.status).toBe(404);
+
+    // Uses 2nd envelope token -> expired envelope is purged and omitted
+    const expiredEnvList = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0`,
+      { headers },
+    );
+    expect(expiredEnvList.status).toBe(200);
+    expect(
+      ((await expiredEnvList.json()) as RelayListEnvelopesResponse).items,
+    ).toEqual([]);
+
+    // Exhaust remaining 2 envelope tokens (3rd & 4th), then 5th returns 429 rate_limited
+    await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0`, {
+      headers,
+    });
+    await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0`, {
+      headers,
+    });
+    const rateLimitedEnv = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0`,
+      { headers },
+    );
+    expect(rateLimitedEnv.status).toBe(429);
+    expect(await rateLimitedEnv.json()).toMatchObject({
+      ok: false,
+      error: { code: "rate_limited" },
+    });
+
+    // Disabled relay returns 404 on relay endpoints and reports enabled: false on /meta
+    const disabledSrv = startTestServer({
+      relay: { enabled: false },
+    });
+    const disabledMeta = (await (
+      await fetch(`${disabledSrv.url}/api/v1/meta`)
+    ).json()) as MetaResponse;
+    expect(disabledMeta.relay?.enabled).toBe(false);
+
+    const disabledReg = (await (
+      await fetch(`${disabledSrv.url}/api/v1/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: "disabled_user",
+          password: "disabled-password-123",
+          clientKind: "cli",
+        }),
+      })
+    ).json()) as CliAuthResponse;
+
+    const disabledRelayRes = await fetch(
+      `${disabledSrv.url}/api/v1/relay/${boxId}/envelopes`,
+      {
+        headers: { Authorization: `Bearer ${disabledReg.sessionToken}` },
+      },
+    );
+    expect(disabledRelayRes.status).toBe(404);
+  });
+
+  test("12. FsBlindRelayStore persists non-expired blobs across server restarts, preserves monotonic seq, and purges orphan .tmp & expired files on startup", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "simpleim-relay-fs-"));
+    const dbPath = join(tempDir, "simpleim.sqlite");
+    const cacheDir = join(tempDir, "relay-cache");
+
+    let now = 1_763_500_000_000;
+    const clock = { nowMs: () => now };
+
+    function collectFilesRecursive(dir: string): string[] {
+      if (!existsSync(dir)) return [];
+      const out: string[] = [];
+      for (const name of readdirSync(dir)) {
+        const full = join(dir, name);
+        if (statSync(full).isDirectory()) {
+          out.push(...collectFilesRecursive(full));
+        } else {
+          out.push(full);
+        }
+      }
+      return out;
+    }
+
+    try {
+      const srv1 = startTestServer({
+        sqlitePath: dbPath,
+        clock,
+        relay: {
+          enabled: true,
+          cacheDir,
+          ttlMs: 60_000,
+          maxFileBytes: 1_048_576,
+          maxTotalBytes: 4_194_304,
+          sweepIntervalMs: 0,
+        },
+      });
+
+      const regRes = await fetch(`${srv1.url}/api/v1/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: "fs_relay_user",
+          password: "fs-relay-password-123",
+          clientKind: "cli",
+        }),
+      });
+      expect(regRes.status).toBe(201);
+      const auth = (await regRes.json()) as CliAuthResponse;
+      const headers = { Authorization: `Bearer ${auth.sessionToken}` };
+
+      const boxId = "c".repeat(64);
+      const fileTag = "3".repeat(32);
+      const envBlobExpired = "00000000000000000000000000000001";
+      const envBlobAlive = "00000000000000000000000000000002";
+      const envBlobAfterRestart = "00000000000000000000000000000003";
+      const chunkExpired = "000000000000000000000000000000a1";
+      const chunkAlive = "000000000000000000000000000000a2";
+
+      const envPayloadExpired = randomBytes(80);
+      const envPayloadAlive = randomBytes(104);
+      const envPayloadAfter = randomBytes(72);
+      const chunkPayloadExpired = randomBytes(256);
+      const chunkPayloadAlive = randomBytes(384);
+
+      // At t = now (expires at now + 60_000): store env1 (seq=1) and chunkExpired
+      expect(
+        (
+          await fetch(
+            `${srv1.url}/api/v1/relay/${boxId}/envelopes/${envBlobExpired}`,
+            { method: "PUT", headers, body: new Uint8Array(envPayloadExpired) },
+          )
+        ).status,
+      ).toBe(201);
+      expect(
+        (
+          await fetch(
+            `${srv1.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkExpired}`,
+            {
+              method: "PUT",
+              headers,
+              body: new Uint8Array(chunkPayloadExpired),
+            },
+          )
+        ).status,
+      ).toBe(201);
+
+      // Advance 40s (expires at t0 + 100_000): store env2 (seq=2) and chunkAlive
+      now += 40_000;
+      const putEnv2 = await fetch(
+        `${srv1.url}/api/v1/relay/${boxId}/envelopes/${envBlobAlive}`,
+        { method: "PUT", headers, body: new Uint8Array(envPayloadAlive) },
+      );
+      expect(putEnv2.status).toBe(201);
+      expect(((await putEnv2.json()) as RelayPutEnvelopeResponse).seq).toBe(2);
+
+      expect(
+        (
+          await fetch(
+            `${srv1.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkAlive}`,
+            { method: "PUT", headers, body: new Uint8Array(chunkPayloadAlive) },
+          )
+        ).status,
+      ).toBe(201);
+
+      await srv1.stop(true);
+      srv1.sqliteDb.close(false);
+
+      // Plant orphan .tmp files at root and inside nested v1/envelopes directory
+      const rootOrphanTmp = join(cacheDir, "interrupted-upload.tmp");
+      const nestedOrphanTmp = join(
+        cacheDir,
+        "v1",
+        "envelopes",
+        "cc",
+        boxId,
+        "partial_write.bin.9999.1.tmp",
+      );
+      writeFileSync(rootOrphanTmp, new Uint8Array(64));
+      writeFileSync(nestedOrphanTmp, new Uint8Array(64));
+      expect(existsSync(rootOrphanTmp)).toBe(true);
+      expect(existsSync(nestedOrphanTmp)).toBe(true);
+
+      // Advance clock another 30s (total +70s from t0): env1 & chunkExpired are now expired, env2 & chunkAlive remain valid
+      now += 30_000;
+
+      const srv2 = startTestServer({
+        sqlitePath: dbPath,
+        clock,
+        relay: {
+          enabled: true,
+          cacheDir,
+          ttlMs: 60_000,
+          maxFileBytes: 1_048_576,
+          maxTotalBytes: 4_194_304,
+          sweepIntervalMs: 0,
+        },
+      });
+
+      // Startup scan deleted all .tmp files and expired .bin files on disk
+      expect(existsSync(rootOrphanTmp)).toBe(false);
+      expect(existsSync(nestedOrphanTmp)).toBe(false);
+      const remainingDiskFiles = collectFilesRecursive(cacheDir);
+      expect(remainingDiskFiles.some((f) => f.endsWith(".tmp"))).toBe(false);
+      expect(remainingDiskFiles.some((f) => f.includes(envBlobExpired))).toBe(
+        false,
+      );
+      expect(remainingDiskFiles.some((f) => f.includes(chunkExpired))).toBe(
+        false,
+      );
+      expect(remainingDiskFiles.length).toBe(2);
+
+      // Non-expired envelope (seq=2) survived restart intact; expired seq=1 is absent
+      const listAfterRestart = await fetch(
+        `${srv2.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0`,
+        { headers },
+      );
+      expect(listAfterRestart.status).toBe(200);
+      const listJson =
+        (await listAfterRestart.json()) as RelayListEnvelopesResponse;
+      expect(listJson.items.length).toBe(1);
+      expect(listJson.items[0]?.seq).toBe(2);
+      expect(listJson.items[0]?.blobId).toBe(envBlobAlive);
+      expect(base64UrlToBytes(listJson.items[0]!.payloadB64)).toEqual(
+        envPayloadAlive,
+      );
+
+      // Expired chunk returns 404; surviving chunk returns exact binary payload
+      const deadChunkRes = await fetch(
+        `${srv2.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkExpired}`,
+        { headers },
+      );
+      expect(deadChunkRes.status).toBe(404);
+
+      const aliveChunkRes = await fetch(
+        `${srv2.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkAlive}`,
+        { headers },
+      );
+      expect(aliveChunkRes.status).toBe(200);
+      expect(new Uint8Array(await aliveChunkRes.arrayBuffer())).toEqual(
+        new Uint8Array(chunkPayloadAlive),
+      );
+
+      // New envelope after restart continues monotonic sequence at seq = 3
+      const putEnv3 = await fetch(
+        `${srv2.url}/api/v1/relay/${boxId}/envelopes/${envBlobAfterRestart}`,
+        { method: "PUT", headers, body: new Uint8Array(envPayloadAfter) },
+      );
+      expect(putEnv3.status).toBe(201);
+      expect(((await putEnv3.json()) as RelayPutEnvelopeResponse).seq).toBe(3);
+
+      // SQLite still strictly contains ONLY schema_migrations, sessions, users
+      const sqliteTables = srv2.sqliteDb
+        .query<{ name: string }, []>(
+          "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name ASC",
+        )
+        .all()
+        .map((r) => r.name);
+      expect(sqliteTables).toEqual(["schema_migrations", "sessions", "users"]);
+
+      await srv2.stop(true);
+      srv2.sqliteDb.close(false);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

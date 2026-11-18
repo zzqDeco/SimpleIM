@@ -1,14 +1,25 @@
 import {
+  DEFAULT_RELAY_MAX_FILE_BYTES,
   isRecord,
+  isValidRelayListEnvelopesResponse,
   type ApiErrorResponse,
   type ErrorCode,
   type MetaResponse,
   type PeerCertResponse,
   type PeerIdentityCert,
+  type RelayListEnvelopesResponse,
+  type RelayMetaConfig,
+  type RelayPutChunkResponse,
+  type RelayPutEnvelopeResponse,
   type UserProfile,
   type WebAuthResponse,
 } from "@simpleim/contracts";
-import { createPopRequest, type Ed25519KeyPair } from "@simpleim/crypto";
+import {
+  base64UrlToBytes,
+  createPopRequest,
+  type Ed25519KeyPair,
+} from "@simpleim/crypto";
+import type { BlindRelayClientPort } from "@simpleim/peer-core";
 
 export class HttpApiError extends Error {
   readonly status: number;
@@ -273,6 +284,87 @@ export class HttpAuthClient {
     return res.cert;
   }
 
+  createBlindRelayClient(relayMeta?: RelayMetaConfig): BlindRelayClientPort {
+    const enabled = relayMeta?.enabled ?? false;
+    const maxFileBytes = relayMeta?.maxFileBytes ?? DEFAULT_RELAY_MAX_FILE_BYTES;
+
+    return {
+      enabled,
+      maxFileBytes,
+      putEnvelope: async ({ boxId, blobId, payload }) => {
+        const res = await this.requestBinaryPutJson<RelayPutEnvelopeResponse>(
+          `/api/v1/relay/${encodeURIComponent(boxId)}/envelopes/${encodeURIComponent(blobId)}`,
+          payload,
+        );
+        if (
+          !isRecord(res) ||
+          res.ok !== true ||
+          typeof res.seq !== "number" ||
+          typeof res.expiresAt !== "number"
+        ) {
+          throw new HttpApiError(
+            "Malformed relay putEnvelope response",
+            200,
+            "invalid_frame",
+          );
+        }
+        return { seq: res.seq, expiresAt: res.expiresAt };
+      },
+      listEnvelopes: async ({ boxId, afterSeq, limit }) => {
+        const qs = new URLSearchParams({
+          afterSeq: String(Math.max(0, Math.floor(afterSeq))),
+        });
+        if (limit !== undefined) {
+          qs.set("limit", String(Math.max(1, Math.floor(limit))));
+        }
+        const res = await this.requestJson<RelayListEnvelopesResponse>(
+          "GET",
+          `/api/v1/relay/${encodeURIComponent(boxId)}/envelopes?${qs.toString()}`,
+        );
+        if (!isValidRelayListEnvelopesResponse(res)) {
+          throw new HttpApiError(
+            "Malformed relay listEnvelopes response",
+            200,
+            "invalid_frame",
+          );
+        }
+        return {
+          items: res.items.map((item) => ({
+            seq: item.seq,
+            blobId: item.blobId,
+            payload: base64UrlToBytes(item.payloadB64),
+            expiresAt: item.expiresAt,
+          })),
+          nextCursor: res.nextCursor,
+          hasMore: res.hasMore,
+        };
+      },
+      putChunk: async ({ boxId, fileTag, chunkBlobId, payload }) => {
+        const res = await this.requestBinaryPutJson<RelayPutChunkResponse>(
+          `/api/v1/relay/${encodeURIComponent(boxId)}/files/${encodeURIComponent(fileTag)}/chunks/${encodeURIComponent(chunkBlobId)}`,
+          payload,
+        );
+        if (
+          !isRecord(res) ||
+          res.ok !== true ||
+          typeof res.expiresAt !== "number"
+        ) {
+          throw new HttpApiError(
+            "Malformed relay putChunk response",
+            200,
+            "invalid_frame",
+          );
+        }
+        return { expiresAt: res.expiresAt };
+      },
+      getChunk: async ({ boxId, fileTag, chunkBlobId }) => {
+        return this.requestBinaryGet(
+          `/api/v1/relay/${encodeURIComponent(boxId)}/files/${encodeURIComponent(fileTag)}/chunks/${encodeURIComponent(chunkBlobId)}`,
+        );
+      },
+    };
+  }
+
   private postBroadcast(message: AuthBroadcastMessage): void {
     if (!this.channel) return;
     try {
@@ -402,5 +494,106 @@ export class HttpAuthClient {
     }
 
     return parsed as T;
+  }
+
+  private async requestBinaryPutJson<T>(
+    path: string,
+    payload: Uint8Array,
+  ): Promise<T> {
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Content-Type": "application/octet-stream",
+    };
+    if (this.csrfToken) {
+      headers["X-CSRF-Token"] = this.csrfToken;
+    }
+
+    const bodyCopy = new Uint8Array(payload.byteLength);
+    bodyCopy.set(payload);
+
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      method: "PUT",
+      credentials: "include",
+      headers,
+      body: bodyCopy,
+    });
+
+    const headerCsrf = response.headers.get("x-csrf-token");
+    if (headerCsrf && headerCsrf.length > 0) {
+      this.csrfToken = headerCsrf;
+    }
+
+    let parsed: unknown = null;
+    try {
+      parsed = await response.json();
+    } catch {
+      throw new HttpApiError(
+        `Unexpected non-JSON response (${response.status})`,
+        response.status,
+        "internal_error",
+      );
+    }
+
+    if (!response.ok || (isRecord(parsed) && parsed.ok === false)) {
+      const errEnv = parsed as Partial<ApiErrorResponse>;
+      const code =
+        isRecord(errEnv.error) && typeof errEnv.error.code === "string"
+          ? (errEnv.error.code as ErrorCode)
+          : response.status === 401
+            ? "unauthorized"
+            : "internal_error";
+      const message =
+        isRecord(errEnv.error) && typeof errEnv.error.message === "string"
+          ? errEnv.error.message
+          : `Request failed with status ${response.status}`;
+      throw new HttpApiError(message, response.status, code);
+    }
+
+    return parsed as T;
+  }
+
+  private async requestBinaryGet(path: string): Promise<Uint8Array | null> {
+    const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      method: "GET",
+      credentials: "include",
+      headers: {
+        Accept: "application/octet-stream, application/json",
+      },
+    });
+
+    const headerCsrf = response.headers.get("x-csrf-token");
+    if (headerCsrf && headerCsrf.length > 0) {
+      this.csrfToken = headerCsrf;
+    }
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (!response.ok) {
+      let parsed: unknown = null;
+      try {
+        parsed = await response.json();
+      } catch {
+        parsed = null;
+      }
+      const errEnv = parsed as Partial<ApiErrorResponse> | null;
+      const code =
+        errEnv && isRecord(errEnv.error) && typeof errEnv.error.code === "string"
+          ? (errEnv.error.code as ErrorCode)
+          : response.status === 401
+            ? "unauthorized"
+            : "internal_error";
+      const message =
+        errEnv &&
+        isRecord(errEnv.error) &&
+        typeof errEnv.error.message === "string"
+          ? errEnv.error.message
+          : `Request failed with status ${response.status}`;
+      throw new HttpApiError(message, response.status, code);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return new Uint8Array(arrayBuffer);
   }
 }

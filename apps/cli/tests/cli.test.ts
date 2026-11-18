@@ -22,6 +22,7 @@ import {
   type ServerSignalingFrame,
 } from "@simpleim/contracts";
 import {
+  bytesToBase64Url,
   createSignedFileManifestFromChunks,
   generateEd25519KeyPair,
   generatePrefixedId,
@@ -2073,5 +2074,113 @@ describe("Real WeriftTransportFactory P2P Loopback", () => {
 
     server.close();
     client.close();
+  });
+});
+
+describe("CliApiClient BlindRelayClient", () => {
+  test("attaches Bearer token on binary PUT/GET and decodes listed envelopes", async () => {
+    const authHeaders: Array<string | null> = [];
+    const envBytes = new Uint8Array(56).fill(0x33);
+    const chunkBytes = new Uint8Array(96).fill(0x77);
+    const boxId = "a".repeat(64);
+    const blobId = "b".repeat(32);
+    const fileTag = "c".repeat(32);
+    const chunkBlobId = "d".repeat(32);
+
+    const api = new CliApiClient({
+      serverUrl: "http://127.0.0.1:3999",
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(String(input));
+        const headers = new Headers(init?.headers);
+        authHeaders.push(headers.get("authorization"));
+
+        if (
+          url.pathname === `/api/v1/relay/${boxId}/envelopes/${blobId}` &&
+          init?.method === "PUT"
+        ) {
+          return Response.json(
+            { ok: true, seq: 3, created: true, expiresAt: 1_900_000_000_000 },
+            { status: 201 },
+          );
+        }
+        if (
+          url.pathname === `/api/v1/relay/${boxId}/envelopes` &&
+          init?.method === "GET"
+        ) {
+          return Response.json({
+            ok: true,
+            items: [
+              {
+                seq: 3,
+                blobId,
+                payloadB64: bytesToBase64Url(envBytes),
+                expiresAt: 1_900_000_000_000,
+              },
+            ],
+            nextCursor: 3,
+            hasMore: false,
+          });
+        }
+        if (
+          url.pathname ===
+            `/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkBlobId}` &&
+          init?.method === "PUT"
+        ) {
+          return Response.json(
+            { ok: true, created: true, expiresAt: 1_900_000_000_000 },
+            { status: 201 },
+          );
+        }
+        if (
+          url.pathname ===
+            `/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkBlobId}` &&
+          init?.method === "GET"
+        ) {
+          return new Response(chunkBytes, { status: 200 });
+        }
+        return Response.json(
+          { ok: false, error: { code: "not_found", message: "Not found" } },
+          { status: 404 },
+        );
+      }) as typeof fetch,
+    });
+
+    const relay = api.createBlindRelayClient("cli_tok_secret", {
+      enabled: true,
+      ttlMs: 86_400_000,
+      maxFileBytes: 104_857_600,
+      maxTotalBytes: 2_147_483_648,
+    });
+    expect(relay.enabled).toBe(true);
+
+    const putEnv = await relay.putEnvelope({
+      boxId,
+      blobId,
+      payload: envBytes,
+    });
+    expect(putEnv).toEqual({ seq: 3, expiresAt: 1_900_000_000_000 });
+
+    const listed = await relay.listEnvelopes({ boxId, afterSeq: 0 });
+    expect(listed.items[0]?.payload).toEqual(envBytes);
+
+    const putCh = await relay.putChunk({
+      boxId,
+      fileTag,
+      chunkBlobId,
+      payload: chunkBytes,
+    });
+    expect(putCh.expiresAt).toBe(1_900_000_000_000);
+
+    expect(await relay.getChunk({ boxId, fileTag, chunkBlobId })).toEqual(
+      chunkBytes,
+    );
+    expect(
+      await relay.getChunk({
+        boxId,
+        fileTag,
+        chunkBlobId: "0".repeat(32),
+      }),
+    ).toBeNull();
+    expect(authHeaders.every((h) => h === "Bearer cli_tok_secret")).toBe(true);
   });
 });

@@ -514,6 +514,9 @@ export function useRoomSession({
         const signalingPort = identity.signalingHub.createRoomPort(roomId);
         const transportFactory = new BrowserWebRtcTransportFactory();
         const chunkStorage = new OpfsChunkStorageAdapter();
+        const relayClient = authClient.createBlindRelayClient(
+          identity.meta.relay,
+        );
 
         let activeEngine: RoomPeerEngine | null = null;
         try {
@@ -530,6 +533,7 @@ export function useRoomSession({
             signaling: signalingPort,
             transportFactory,
             chunkStorage,
+            relayClient,
             events: {
               onCenterConnectionChange: (connected) => {
                 if (!isEntryLive(expectedGen, roomId, entry)) {
@@ -693,21 +697,27 @@ export function useRoomSession({
 
           const verifiedMessages = activeEngine.getMessages();
           const verifiedFiles = activeEngine.getFiles();
-          const droppedInvalidMsgs =
-            verifiedMessages.length < entry.messages.length;
-          const droppedInvalidFiles = verifiedFiles.length < entry.files.length;
+          const messagesChanged =
+            verifiedMessages.length !== entry.messages.length;
+          const filesChanged = verifiedFiles.length !== entry.files.length;
 
           entry.centerConnected = activeEngine.isCenterConnected();
           entry.peers = activeEngine.getVerifiedPeers();
           entry.messages = verifiedMessages;
           entry.files = verifiedFiles;
+          for (const f of verifiedFiles) {
+            const prog = activeEngine.getTransferProgress(f.fileId);
+            if (prog) {
+              entry.transfers.set(f.fileId, { ...prog });
+            }
+          }
 
-          if (droppedInvalidMsgs && isEntryLive(expectedGen, roomId, entry)) {
+          if (messagesChanged && isEntryLive(expectedGen, roomId, entry)) {
             void vault
               .saveRoomMessages(currentUser.id, roomId, entry.messages)
               .catch(() => {});
           }
-          if (droppedInvalidFiles && isEntryLive(expectedGen, roomId, entry)) {
+          if (filesChanged && isEntryLive(expectedGen, roomId, entry)) {
             void vault
               .saveRoomFiles(currentUser.id, roomId, entry.files)
               .catch(() => {});
@@ -737,7 +747,7 @@ export function useRoomSession({
 
       await entry.startingPromise;
     },
-    [isEntryLive, publishSnapshot, vault],
+    [authClient, isEntryLive, publishSnapshot, vault],
   );
 
   const rebalanceActiveMeshes = useCallback(

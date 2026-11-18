@@ -1,6 +1,8 @@
 import {
+  DEFAULT_RELAY_MAX_FILE_BYTES,
   isRecord,
   isValidPeerIdentityCert,
+  isValidRelayListEnvelopesResponse,
   type CliAuthResponse,
   type ErrorCode,
   type MeResponse,
@@ -8,13 +10,19 @@ import {
   type PeerCertRequest,
   type PeerCertResponse,
   type PeerIdentityCert,
+  type RelayListEnvelopesResponse,
+  type RelayMetaConfig,
+  type RelayPutChunkResponse,
+  type RelayPutEnvelopeResponse,
 } from "@simpleim/contracts";
 import {
+  base64UrlToBytes,
   createPopRequest,
   generateEd25519KeyPair,
   generatePrefixedId,
   type Ed25519KeyPair,
 } from "@simpleim/crypto";
+import type { BlindRelayClientPort } from "@simpleim/peer-core";
 
 export class CliApiError extends Error {
   readonly code: ErrorCode | "network_error" | "invalid_response";
@@ -265,5 +273,199 @@ export class CliApiClient {
     });
     const { cert } = await this.issuePeerCert(params.sessionToken, popRequest);
     return { peerId, keyPair, cert };
+  }
+
+  private async requestBinaryPutJson<T>(
+    path: string,
+    sessionToken: string,
+    payload: Uint8Array,
+  ): Promise<T> {
+    const bodyCopy = new Uint8Array(payload.byteLength);
+    bodyCopy.set(payload);
+
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.serverUrl}${path}`, {
+        method: "PUT",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/octet-stream",
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: bodyCopy,
+      });
+    } catch (err) {
+      throw new CliApiError(
+        "network_error",
+        err instanceof Error ? err.message : "Failed to reach server",
+        0,
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = await response.json();
+    } catch {
+      throw new CliApiError(
+        "invalid_response",
+        `Server returned non-JSON response (HTTP ${response.status})`,
+        response.status,
+      );
+    }
+
+    if (!response.ok || (isRecord(parsed) && parsed.ok === false)) {
+      const errObj =
+        isRecord(parsed) && isRecord(parsed.error) ? parsed.error : null;
+      const code =
+        errObj && typeof errObj.code === "string"
+          ? (errObj.code as ErrorCode)
+          : "internal_error";
+      const message =
+        errObj && typeof errObj.message === "string"
+          ? errObj.message
+          : `HTTP ${response.status}`;
+      throw new CliApiError(code, message, response.status);
+    }
+
+    return parsed as T;
+  }
+
+  private async requestBinaryGet(
+    path: string,
+    sessionToken: string,
+  ): Promise<Uint8Array | null> {
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.serverUrl}${path}`, {
+        method: "GET",
+        headers: {
+          Accept: "application/octet-stream, application/json",
+          Authorization: `Bearer ${sessionToken}`,
+        },
+      });
+    } catch (err) {
+      throw new CliApiError(
+        "network_error",
+        err instanceof Error ? err.message : "Failed to reach server",
+        0,
+      );
+    }
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (!response.ok) {
+      let parsed: unknown = null;
+      try {
+        parsed = await response.json();
+      } catch {
+        parsed = null;
+      }
+      const errObj =
+        isRecord(parsed) && isRecord(parsed.error) ? parsed.error : null;
+      const code =
+        errObj && typeof errObj.code === "string"
+          ? (errObj.code as ErrorCode)
+          : "internal_error";
+      const message =
+        errObj && typeof errObj.message === "string"
+          ? errObj.message
+          : `HTTP ${response.status}`;
+      throw new CliApiError(code, message, response.status);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return new Uint8Array(arrayBuffer);
+  }
+
+  createBlindRelayClient(
+    sessionToken: string,
+    relayMeta?: RelayMetaConfig,
+  ): BlindRelayClientPort {
+    const enabled = relayMeta?.enabled ?? false;
+    const maxFileBytes = relayMeta?.maxFileBytes ?? DEFAULT_RELAY_MAX_FILE_BYTES;
+
+    return {
+      enabled,
+      maxFileBytes,
+      putEnvelope: async ({ boxId, blobId, payload }) => {
+        const res = await this.requestBinaryPutJson<RelayPutEnvelopeResponse>(
+          `/api/v1/relay/${encodeURIComponent(boxId)}/envelopes/${encodeURIComponent(blobId)}`,
+          sessionToken,
+          payload,
+        );
+        if (
+          !isRecord(res) ||
+          res.ok !== true ||
+          typeof res.seq !== "number" ||
+          typeof res.expiresAt !== "number"
+        ) {
+          throw new CliApiError(
+            "invalid_response",
+            "Malformed relay putEnvelope response",
+            200,
+          );
+        }
+        return { seq: res.seq, expiresAt: res.expiresAt };
+      },
+      listEnvelopes: async ({ boxId, afterSeq, limit }) => {
+        const qs = new URLSearchParams({
+          afterSeq: String(Math.max(0, Math.floor(afterSeq))),
+        });
+        if (limit !== undefined) {
+          qs.set("limit", String(Math.max(1, Math.floor(limit))));
+        }
+        const res = await this.requestJson<RelayListEnvelopesResponse>(
+          `/api/v1/relay/${encodeURIComponent(boxId)}/envelopes?${qs.toString()}`,
+          {
+            method: "GET",
+            sessionToken,
+          },
+        );
+        if (!isValidRelayListEnvelopesResponse(res)) {
+          throw new CliApiError(
+            "invalid_response",
+            "Malformed relay listEnvelopes response",
+            200,
+          );
+        }
+        return {
+          items: res.items.map((item) => ({
+            seq: item.seq,
+            blobId: item.blobId,
+            payload: base64UrlToBytes(item.payloadB64),
+            expiresAt: item.expiresAt,
+          })),
+          nextCursor: res.nextCursor,
+          hasMore: res.hasMore,
+        };
+      },
+      putChunk: async ({ boxId, fileTag, chunkBlobId, payload }) => {
+        const res = await this.requestBinaryPutJson<RelayPutChunkResponse>(
+          `/api/v1/relay/${encodeURIComponent(boxId)}/files/${encodeURIComponent(fileTag)}/chunks/${encodeURIComponent(chunkBlobId)}`,
+          sessionToken,
+          payload,
+        );
+        if (
+          !isRecord(res) ||
+          res.ok !== true ||
+          typeof res.expiresAt !== "number"
+        ) {
+          throw new CliApiError(
+            "invalid_response",
+            "Malformed relay putChunk response",
+            200,
+          );
+        }
+        return { expiresAt: res.expiresAt };
+      },
+      getChunk: async ({ boxId, fileTag, chunkBlobId }) => {
+        return this.requestBinaryGet(
+          `/api/v1/relay/${encodeURIComponent(boxId)}/files/${encodeURIComponent(fileTag)}/chunks/${encodeURIComponent(chunkBlobId)}`,
+          sessionToken,
+        );
+      },
+    };
   }
 }

@@ -98,6 +98,10 @@ export const zhTW = {
   "room.files.action.download": "下載",
   "room.files.action.cancel": "取消",
   "room.files.action.save": "儲存",
+  "room.files.relay.uploading": "☁️ 加密暫存中 {percent}%（完成後可關閉頁面）",
+  "room.files.relay.cached": "☁️ 已加密暫存（24h 可離線下載）",
+  "room.files.relay.tooLarge": "逾 100 MB · 僅線上直傳",
+  "room.files.relay.error": "暫存未完成 · 需線上直傳",
 
   "security.peerRejected": "已拒絕未通過身分驗證的連線（{reason}）。",
   "security.iceFailed":

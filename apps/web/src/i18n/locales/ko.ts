@@ -98,6 +98,11 @@ export const ko = {
   "room.files.action.download": "받기",
   "room.files.action.cancel": "취소",
   "room.files.action.save": "저장",
+  "room.files.relay.uploading":
+    "☁️ 암호화 임시 보관 중 {percent}% (완료 후 창을 닫아도 가능)",
+  "room.files.relay.cached": "☁️ 암호화 임시 보관 완료 (24시간 오프라인 다운로드 가능)",
+  "room.files.relay.tooLarge": "100 MB 초과 · 온라인 P2P 전용",
+  "room.files.relay.error": "임시 보관 미완료 · 온라인 P2P 전용",
 
   "security.peerRejected": "검증되지 않은 피어 연결을 차단했습니다 ({reason}).",
   "security.iceFailed":

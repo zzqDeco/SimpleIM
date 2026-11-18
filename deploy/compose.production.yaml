@@ -71,6 +71,11 @@ services:
       HOST: 0.0.0.0
       PORT: "3000"
       SQLITE_PATH: /data/simpleim.sqlite
+      RELAY_ENABLED: ${RELAY_ENABLED:-true}
+      RELAY_CACHE_DIR: /data/relay-cache
+      RELAY_TTL_MS: ${RELAY_TTL_MS:-86400000}
+      RELAY_MAX_FILE_BYTES: ${RELAY_MAX_FILE_BYTES:-104857600}
+      RELAY_MAX_TOTAL_BYTES: ${RELAY_MAX_TOTAL_BYTES:-2147483648}
       SERVER_KEY_ID: ${SERVER_KEY_ID:-srvk_2026_01}
       SERVER_IDENTITY_PRIVATE_KEY: ${SERVER_IDENTITY_PRIVATE_KEY:?Ed25519 private signing key required}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Comma-separated HTTPS origins required}

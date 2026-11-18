@@ -1,3 +1,9 @@
+import { dirname, join } from "node:path";
+import {
+  DEFAULT_RELAY_MAX_FILE_BYTES,
+  DEFAULT_RELAY_MAX_TOTAL_BYTES,
+  DEFAULT_RELAY_TTL_MS,
+} from "@simpleim/contracts";
 import { JsonBoundaryLogger } from "./infra/logger.ts";
 import { createSimpleImServer } from "./server.ts";
 
@@ -25,12 +31,75 @@ function parsePortEnv(raw: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function parseBooleanEnv(
+  name: string,
+  raw: string | undefined,
+  fallback: boolean,
+): boolean {
+  const trimmed = raw?.trim().toLowerCase();
+  if (!trimmed) {
+    return fallback;
+  }
+  if (trimmed === "true" || trimmed === "1") {
+    return true;
+  }
+  if (trimmed === "false" || trimmed === "0") {
+    return false;
+  }
+  throw new Error(`Invalid ${name} environment variable: ${raw}`);
+}
+
+function parsePositiveIntEnv(
+  name: string,
+  raw: string | undefined,
+  fallback: number,
+): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Invalid ${name} environment variable: ${raw}`);
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid ${name} environment variable: ${raw}`);
+  }
+  return parsed;
+}
+
 if (import.meta.main) {
   const logger = new JsonBoundaryLogger();
   const port = parsePortEnv(process.env.PORT, 3000);
   const host = process.env.HOST?.trim() || "127.0.0.1";
   const sqlitePath =
     process.env.SQLITE_PATH?.trim() || ".runtime/simpleim.sqlite";
+  const defaultRelayCacheDir =
+    sqlitePath === ":memory:" || sqlitePath.startsWith("file::memory:")
+      ? ":memory:"
+      : join(dirname(sqlitePath), "relay-cache");
+  const relayEnabled = parseBooleanEnv(
+    "RELAY_ENABLED",
+    process.env.RELAY_ENABLED,
+    true,
+  );
+  const relayCacheDir =
+    process.env.RELAY_CACHE_DIR?.trim() || defaultRelayCacheDir;
+  const relayTtlMs = parsePositiveIntEnv(
+    "RELAY_TTL_MS",
+    process.env.RELAY_TTL_MS,
+    DEFAULT_RELAY_TTL_MS,
+  );
+  const relayMaxFileBytes = parsePositiveIntEnv(
+    "RELAY_MAX_FILE_BYTES",
+    process.env.RELAY_MAX_FILE_BYTES,
+    DEFAULT_RELAY_MAX_FILE_BYTES,
+  );
+  const relayMaxTotalBytes = parsePositiveIntEnv(
+    "RELAY_MAX_TOTAL_BYTES",
+    process.env.RELAY_MAX_TOTAL_BYTES,
+    DEFAULT_RELAY_MAX_TOTAL_BYTES,
+  );
   const serverIdentityPrivateKey =
     process.env.SERVER_IDENTITY_PRIVATE_KEY?.trim() || undefined;
   const serverKeyId = process.env.SERVER_KEY_ID?.trim() || "srvk_2026_01";
@@ -64,6 +133,13 @@ if (import.meta.main) {
     coturnSharedSecret,
     secureCookies,
     trustProxy,
+    relay: {
+      enabled: relayEnabled,
+      cacheDir: relayCacheDir,
+      ttlMs: relayTtlMs,
+      maxFileBytes: relayMaxFileBytes,
+      maxTotalBytes: relayMaxTotalBytes,
+    },
     logger,
   });
 

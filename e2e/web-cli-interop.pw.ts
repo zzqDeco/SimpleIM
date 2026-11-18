@@ -767,4 +767,180 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       await context.close();
     }
   });
+
+  test("delivers E2EE offline chat messages and multi-chunk files asynchronously via Blind Ephemeral Relay when peers are never online simultaneously", async ({
+    browser,
+  }) => {
+    const cluster = await harness.call<{
+      webOrigin: string;
+      apiUrl: string;
+      sqlitePath: string;
+    }>("startCluster");
+
+    const offlinePassphrase = "async-blind-ephemeral-relay-2026-发完即走";
+    const offlineMessage =
+      "Offline E2EE handover: sender closed browser before receiver joined!";
+    // 3 chunks (2 * 64 KiB + tail = 160 KiB + 333 B)
+    const offlineFileBuffer = makeDeterministicBuffer(160 * 1024 + 333, 0x3c);
+    const expectedOfflineSha = sha256HexNode(offlineFileBuffer);
+
+    // Phase 1: Sender joins alone, sends chat + multi-chunk file, waits for encrypted relay cache, then closes browser completely!
+    const contextSender = await browser.newContext({ acceptDownloads: true });
+    const pageSender = await contextSender.newPage();
+    try {
+      await registerAndJoinRoomOnWeb({
+        page: pageSender,
+        webOrigin: cluster.webOrigin,
+        username: "offline_sender",
+        displayName: "Offline Sender",
+        password: "Password-OfflineSender-123!",
+        passphrase: offlinePassphrase,
+      });
+
+      await expect(pageSender.getByTestId("peer-list-empty")).toBeVisible();
+
+      await pageSender.getByTestId("chat-input").fill(offlineMessage);
+      await pageSender.getByTestId("chat-send").click();
+      await expect(pageSender.locator(".message-stream")).toContainText(
+        offlineMessage,
+      );
+
+      await pageSender.getByTestId("file-input").setInputFiles({
+        name: "offline-handover.bin",
+        mimeType: "application/octet-stream",
+        buffer: offlineFileBuffer,
+      });
+
+      const senderFileCard = pageSender
+        .getByTestId("file-list")
+        .locator(".file-card", { hasText: "offline-handover.bin" });
+      await expect(senderFileCard).toHaveAttribute(
+        "data-transfer-status",
+        "seeding",
+      );
+      await expect(senderFileCard).toHaveAttribute(
+        "data-relay-state",
+        "cached",
+        { timeout: 25_000 },
+      );
+      await expect(senderFileCard.getByTestId("file-relay-badge")).toBeVisible();
+    } finally {
+      // Completely close Sender's browser context so 0 peers remain online in the room!
+      await contextSender.close();
+    }
+
+    // Phase 2: Late Web Receiver joins with 0 online peers, automatically receives offline chat & file manifest, and downloads verified file!
+    const contextReceiver = await browser.newContext({ acceptDownloads: true });
+    const pageReceiver = await contextReceiver.newPage();
+    try {
+      await registerAndJoinRoomOnWeb({
+        page: pageReceiver,
+        webOrigin: cluster.webOrigin,
+        username: "offline_receiver",
+        displayName: "Offline Receiver",
+        password: "Password-OfflineReceiver-123!",
+        passphrase: offlinePassphrase,
+      });
+
+      await expect(pageReceiver.getByTestId("peer-list-empty")).toBeVisible();
+
+      await expect(pageReceiver.locator(".message-stream")).toContainText(
+        offlineMessage,
+        { timeout: 20_000 },
+      );
+
+      const receiverFileCard = pageReceiver
+        .getByTestId("file-list")
+        .locator(".file-card", { hasText: "offline-handover.bin" });
+      await expect(receiverFileCard).toBeVisible({ timeout: 20_000 });
+      await expect(receiverFileCard).toHaveAttribute(
+        "data-relay-state",
+        "cached",
+      );
+
+      await receiverFileCard.getByTestId("file-download-button").click();
+      await expect(receiverFileCard).toHaveAttribute(
+        "data-transfer-status",
+        "seeding",
+        { timeout: 25_000 },
+      );
+
+      const downloadPromise = pageReceiver.waitForEvent("download");
+      await receiverFileCard.getByTestId("file-save-button").click();
+      const browserDownload = await downloadPromise;
+      expect(browserDownload.suggestedFilename()).toBe("offline-handover.bin");
+      const downloadedPath = await browserDownload.path();
+      expect(downloadedPath).toBeTruthy();
+      const downloadedBytes = await readFile(downloadedPath!);
+      expect(downloadedBytes.byteLength).toBe(offlineFileBuffer.byteLength);
+      expect(sha256HexNode(downloadedBytes)).toBe(expectedOfflineSha);
+    } finally {
+      // Close Web Receiver too before testing late CLI joiner!
+      await contextReceiver.close();
+    }
+
+    // Phase 3: Late CLI peer joins with 0 online peers and also pulls offline chat + verified multi-chunk file from Blind Relay!
+    const cliLate = await harness.call<{ peerId: string; username: string }>(
+      "spawnCliPeer",
+      {
+        username: "cli_late_reader",
+        displayName: "Late CLI Reader",
+        password: "Password-LateCli-123!",
+        passphrase: offlinePassphrase,
+      },
+    );
+
+    let lateFileId = "";
+    await expect
+      .poll(
+        async () => {
+          const st = await harness.call<CliStateSnapshot>("getCliState", {
+            peerId: cliLate.peerId,
+          });
+          const hasMsg = st.messages.some((m) =>
+            m.body.includes(offlineMessage),
+          );
+          const fileEntry = st.files.find(
+            (f) => f.fileName === "offline-handover.bin",
+          );
+          if (fileEntry) {
+            lateFileId = fileEntry.fileId;
+          }
+          return hasMsg && Boolean(fileEntry) && st.verifiedPeers.length === 0;
+        },
+        { timeout: 20_000 },
+      )
+      .toBe(true);
+
+    const cliLateDownloaded = await harness.call<{
+      finalPath: string;
+      byteLength: number;
+      diskSha256: string;
+    }>("cliDownloadFile", {
+      peerId: cliLate.peerId,
+      fileId: lateFileId,
+    });
+    expect(cliLateDownloaded.byteLength).toBe(offlineFileBuffer.byteLength);
+    expect(cliLateDownloaded.diskSha256).toBe(expectedOfflineSha);
+
+    // Phase 4: Verify SQLite still holds strictly 3 tables and zero secrets / filenames / chat text!
+    const sqliteAudit = await harness.call<{
+      tables: string[];
+      leaked: string[];
+    }>("auditSqlite", {
+      forbiddenStrings: [
+        offlinePassphrase,
+        offlineMessage,
+        "offline-handover.bin",
+        "Password-OfflineSender-123!",
+        "Password-OfflineReceiver-123!",
+      ],
+    });
+    expect(sqliteAudit.tables).toEqual([
+      "schema_migrations",
+      "sessions",
+      "users",
+    ]);
+    expect(sqliteAudit.leaked).toEqual([]);
+  });
 });

@@ -16,10 +16,14 @@ import {
   bytesToBase64Url,
   computeChannelBindingTranscript,
   createHelloProveFrame,
+  deriveRelayChunkBlobId,
+  deriveRelayFileTag,
+  deriveRelayKeys,
   deriveRoomKeys,
   generateEd25519KeyPair,
   issuePeerIdentityCert,
   sealPostAuthControlFrame,
+  sealRelayChunkBinary,
   signChatMessage,
   type DerivedRoomKeys,
   type Ed25519KeyPair,
@@ -27,12 +31,14 @@ import {
 import {
   createRoomPeerEngine,
   SignalingServerError,
+  type BlindRelayClientPort,
   type RoomPeerEngine,
   type RoomPeerEngineEvents,
 } from "../src/index.ts";
 import {
   InMemoryChunkStorage,
   makeDeterministicFingerprint,
+  MockBlindRelayHub,
   MockPeerTransportNetwork,
   MockSignalingClient,
   MockSignalingHub,
@@ -86,6 +92,9 @@ function createTestPeerRig(params: {
   syncIntervalMs?: number;
   maxSignalPayloadBytes?: number;
   now?: () => number;
+  relayClient?: BlindRelayClientPort;
+  initialMessages?: readonly ChatMessageEnvelope[];
+  initialFiles?: readonly FileManifest[];
   signalingOptions?: ConstructorParameters<typeof MockSignalingClient>[2];
   transportConfig?: (p: {
     localPeerId: string;
@@ -137,6 +146,9 @@ function createTestPeerRig(params: {
     signaling,
     transportFactory: factory,
     chunkStorage: storage,
+    relayClient: params.relayClient,
+    initialMessages: params.initialMessages,
+    initialFiles: params.initialFiles,
     maxInFlightPerPeer: params.maxInFlightPerPeer,
     requestTimeoutMs: params.requestTimeoutMs,
     helloAuthTimeoutMs: params.helloAuthTimeoutMs,
@@ -2806,6 +2818,409 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
         expect(initiatorAttempts).toBe(2);
       } finally {
         await Promise.all([initiator.engine.stop(), responder.engine.stop()]);
+      }
+    }
+  });
+
+  test("13. Hybrid P2P + Zero-Knowledge Blind Ephemeral Relay: 100% asynchronous offline chat + 4-chunk & 520-chunk paged file transfers, P2P-first priority, too_large state, and tampered relay chunk rejection", async () => {
+    const ca = createTestServerCA();
+
+    // 13a. 100% Asynchronous Offline Chat + 4-Chunk File Transfer (0 simultaneous P2P peers)
+    // + P2P-first verification when a live seeder IS online!
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+      const relayHub = new MockBlindRelayHub();
+      const roomKeys = deriveRoomKeys(
+        "async-blind-relay-offline-catchup-room",
+        FAST_KDF,
+      );
+      const inspectRelayKeys = deriveRelayKeys(roomKeys.roomAppKey);
+
+      const aliceRelay = relayHub.createClient();
+      const alice = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01alice_async",
+        username: "alice",
+        relayClient: aliceRelay,
+        syncIntervalMs: 80,
+      });
+
+      const fileBytes = makeDeterministicPayload(3 * SWARM_CHUNK_SIZE + 17_777); // 4 chunks
+      let sharedManifest!: FileManifest;
+      let msg1!: ChatMessageEnvelope;
+      let msg2!: ChatMessageEnvelope;
+
+      try {
+        await alice.engine.start();
+        expect(alice.engine.getVerifiedPeers()).toHaveLength(0);
+
+        msg1 = await alice.engine.sendChatMessage(
+          "Offline note #1 left in encrypted blind box",
+        );
+        msg2 = await alice.engine.sendChatMessage(
+          "Offline reply #2 while Bob is asleep",
+          msg1.msgId,
+        );
+
+        sharedManifest = await alice.engine.shareFile({
+          fileName: "async-design-spec.pdf",
+          fileSize: fileBytes.byteLength,
+          mimeType: "application/pdf",
+          readChunk: makeSliceReader(fileBytes),
+        });
+        expect(sharedManifest.totalChunks).toBe(4);
+
+        await waitFor(
+          () =>
+            alice.engine.getTransferProgress(sharedManifest.fileId)
+              ?.relayCacheState === "cached" &&
+            relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId) === 3,
+        );
+
+        const aliceCachedProgress = alice.engine.getTransferProgress(
+          sharedManifest.fileId,
+        );
+        expect(aliceCachedProgress?.relayCacheState).toBe("cached");
+        expect(aliceCachedProgress?.relayCachedChunks).toBe(4);
+        expect(aliceCachedProgress?.relayExpiresAt).toBeDefined();
+        expect(
+          relayHub.getStoredChunkCount(inspectRelayKeys.relayBoxId),
+        ).toBe(4);
+      } finally {
+        // Alice goes completely offline; signaling room is now 100% empty!
+        await alice.engine.stop();
+      }
+
+      // Inject a garbage/corrupted ciphertext envelope on the blind relay to verify Bob ignores it cleanly
+      relayHub.injectCorruptedEnvelope(
+        inspectRelayKeys.relayBoxId,
+        "0123456789abcdef0123456789abcdef",
+        new Uint8Array(96).fill(0xaa),
+      );
+
+      const bobRelay = relayHub.createClient();
+      const bob = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02bob_async",
+        username: "bob",
+        clientKind: "cli",
+        relayClient: bobRelay,
+        syncIntervalMs: 80,
+      });
+
+      try {
+        await bob.engine.start();
+        expect(bob.engine.getSignalingPeerCount()).toBe(0);
+        expect(bob.engine.getVerifiedPeers()).toHaveLength(0);
+
+        // Bob automatically pulls both signed chat messages and the FileManifest from the blind relay!
+        await waitFor(
+          () =>
+            bob.engine.getMessages().length === 2 &&
+            bob.engine.getFiles().length === 1,
+        );
+
+        const bobMsgs = bob.engine.getMessages();
+        expect(bobMsgs.map((m) => m.msgId)).toEqual([msg1.msgId, msg2.msgId]);
+        expect(bobMsgs[0]?.body).toBe(
+          "Offline note #1 left in encrypted blind box",
+        );
+        expect(bobMsgs[1]?.replyToMsgId).toBe(msg1.msgId);
+        expect(bob.receivedChat.every((c) => c.isHistoricalSync)).toBe(true);
+
+        const bobAnnouncedProgress = bob.engine.getTransferProgress(
+          sharedManifest.fileId,
+        );
+        expect(bobAnnouncedProgress?.relayCacheState).toBe("cached");
+        expect(bobAnnouncedProgress?.relayCachedChunks).toBe(4);
+        expect(bobAnnouncedProgress?.relayExpiresAt).toBeDefined();
+
+        // Bob downloads all 4 chunks from the blind relay with 0 P2P peers online!
+        await bob.engine.downloadFile(sharedManifest.fileId);
+        await waitFor(
+          () =>
+            bob.completedFiles.length === 1 &&
+            bob.engine.getTransferProgress(sharedManifest.fileId)?.status ===
+              "seeding",
+        );
+
+        expect(bobRelay.getChunkCalls).toBe(4);
+        expect(bob.storage.getFinalizedBytes(sharedManifest.fileId)).toEqual(
+          fileBytes,
+        );
+
+        // Now Carol joins while Bob IS online and seeding -> P2P-First rule must fetch from Bob with 0 relay chunk fetches!
+        const carolRelay = relayHub.createClient();
+        const carol = createTestPeerRig({
+          ca,
+          hub,
+          network,
+          roomKeys,
+          peerId: "peer_03carol_p2p",
+          username: "carol",
+          relayClient: carolRelay,
+          syncIntervalMs: 80,
+        });
+        try {
+          await carol.engine.start();
+          await waitFor(
+            () =>
+              carol.engine.getVerifiedPeers().length === 1 &&
+              carol.engine.getFiles().length === 1 &&
+              (carol.engine.getTransferProgress(sharedManifest.fileId)
+                ?.availableSeeders ?? 0) === 1,
+          );
+          await carol.engine.downloadFile(sharedManifest.fileId);
+          await waitFor(() => carol.completedFiles.length === 1);
+          expect(carolRelay.getChunkCalls).toBe(0);
+          expect(
+            carol.storage.getFinalizedBytes(sharedManifest.fileId),
+          ).toEqual(fileBytes);
+        } finally {
+          await carol.engine.stop();
+        }
+      } finally {
+        await bob.engine.stop();
+      }
+
+      // Verify local-authored initialMessages composed while offline are pushed to blind relay on start()
+      // (while foreign-authored initialMessages are NOT redundantly re-uploaded by non-authors!)
+      const daveKeyPair = generateEd25519KeyPair();
+      const daveCert = issuePeerIdentityCert({
+        serverKeyId: ca.serverKeyId,
+        serverSignPrivKey: ca.keyPair.privateKeyBytes,
+        userId: "usr_dave000000",
+        username: "dave",
+        displayName: "DAVE",
+        peerId: "peer_04dave_init",
+        peerSignPubKey: daveKeyPair.publicKeyBase64Url,
+        clientKind: "cli",
+      });
+      const daveOfflineMsg = signChatMessage({
+        roomId: roomKeys.roomId,
+        lamport: 5,
+        body: "Composed offline by Dave before reconnecting",
+        authorCert: daveCert,
+        peerSignPrivKey: daveKeyPair.privateKeyBytes,
+      });
+      const envCountBeforeDave = relayHub.getStoredEnvelopeCount(
+        inspectRelayKeys.relayBoxId,
+      );
+      const daveEngine = createRoomPeerEngine({
+        localPeerId: "peer_04dave_init",
+        localCert: daveCert,
+        localSignKeyPair: daveKeyPair,
+        serverSignPubKey: ca.keyPair.publicKeyBase64Url,
+        roomKeys,
+        iceServers: [],
+        signaling: hub.createClient("peer_04dave_init"),
+        transportFactory: network.createFactory().factory,
+        chunkStorage: new InMemoryChunkStorage(),
+        relayClient: relayHub.createClient(),
+        initialMessages: [msg1, daveOfflineMsg],
+      });
+      try {
+        await daveEngine.start();
+        await waitFor(
+          () =>
+            relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId) ===
+            envCountBeforeDave + 1,
+        );
+      } finally {
+        await daveEngine.stop();
+      }
+    }
+
+    // 13b. Paged >512-chunk file (520 chunks) offline relay + >maxFileBytes ("too_large") state
+    // + tampered relay chunk AEAD & SHA-256 poisoning rejection!
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+      const pagedSizeBytes = 519 * SWARM_CHUNK_SIZE + 4_321; // 520 chunks (2 hash pages)
+      const maxRelayFileBytes = 530 * SWARM_CHUNK_SIZE;
+      const relayHub = new MockBlindRelayHub({
+        maxFileBytes: maxRelayFileBytes,
+      });
+      const roomKeys = deriveRoomKeys(
+        "paged-relay-and-tamper-rejection-room",
+        FAST_KDF,
+      );
+      const inspectRelayKeys = deriveRelayKeys(roomKeys.roomAppKey);
+
+      const alice = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01alice_paged",
+        username: "alice",
+        relayClient: relayHub.createClient(),
+      });
+
+      const pagedBytes = makeDeterministicPayload(pagedSizeBytes);
+      const oversizedBytes = makeDeterministicPayload(
+        maxRelayFileBytes + SWARM_CHUNK_SIZE,
+      );
+      const poisonTestBytes = makeDeterministicPayload(
+        2 * SWARM_CHUNK_SIZE + 999,
+      ); // 3 chunks
+
+      let pagedManifest!: FileManifest;
+      let oversizedManifest!: FileManifest;
+      let poisonManifest!: FileManifest;
+
+      try {
+        await alice.engine.start();
+
+        // 1) > maxFileBytes immediately enters relayCacheState === "too_large" without uploading chunks
+        oversizedManifest = await alice.engine.shareFile({
+          fileName: "huge-archive.tar",
+          fileSize: oversizedBytes.byteLength,
+          readChunk: makeSliceReader(oversizedBytes),
+        });
+        expect(
+          alice.engine.getTransferProgress(oversizedManifest.fileId)
+            ?.relayCacheState,
+        ).toBe("too_large");
+        expect(
+          relayHub.getStoredChunkCount(inspectRelayKeys.relayBoxId),
+        ).toBe(0);
+
+        // 2) 520-chunk paged file uploads all 520 chunks + 2 hash pages + manifest atomically last
+        pagedManifest = await alice.engine.shareFile({
+          fileName: "paged-dataset-520.bin",
+          fileSize: pagedBytes.byteLength,
+          readChunk: makeSliceReader(pagedBytes),
+        });
+        expect(pagedManifest.totalChunks).toBe(520);
+        expect(pagedManifest.hashPageHashes).toHaveLength(2);
+
+        // 3) 3-chunk file that will have chunk #1 poisoned on the relay server after Alice disconnects
+        poisonManifest = await alice.engine.shareFile({
+          fileName: "tamper-target.bin",
+          fileSize: poisonTestBytes.byteLength,
+          readChunk: makeSliceReader(poisonTestBytes),
+        });
+        expect(poisonManifest.totalChunks).toBe(3);
+
+        await waitFor(
+          () =>
+            alice.engine.getTransferProgress(pagedManifest.fileId)
+              ?.relayCacheState === "cached" &&
+            alice.engine.getTransferProgress(poisonManifest.fileId)
+              ?.relayCacheState === "cached",
+          5_000,
+        );
+        expect(
+          alice.engine.getTransferProgress(pagedManifest.fileId)
+            ?.relayCachedChunks,
+        ).toBe(520);
+      } finally {
+        await alice.engine.stop();
+      }
+
+      // Corrupt chunk #1 ciphertext of poisonManifest on the relay server (AEAD bit-flip tamper)
+      const poisonFileTag = deriveRelayFileTag(
+        inspectRelayKeys.relayIdKey,
+        poisonManifest.fileId,
+      );
+      const poisonChunk1BlobId = deriveRelayChunkBlobId(
+        inspectRelayKeys.relayIdKey,
+        poisonManifest.fileId,
+        1,
+      );
+      relayHub.tamperChunkBytes(
+        inspectRelayKeys.relayBoxId,
+        poisonFileTag,
+        poisonChunk1BlobId,
+        (bytes) => {
+          const copy = bytes.slice();
+          const lastIdx = copy.byteLength - 1;
+          copy[lastIdx] = (copy[lastIdx] ?? 0) ^ 0xff;
+          return copy;
+        },
+      );
+
+      const bob = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02bob_paged",
+        username: "bob",
+        relayClient: relayHub.createClient(),
+      });
+
+      try {
+        await bob.engine.start();
+        await waitFor(() => bob.engine.getFiles().length === 2);
+
+        // Bob downloads the 520-chunk paged file completely offline via blind relay!
+        await bob.engine.downloadFile(pagedManifest.fileId);
+        await waitFor(
+          () =>
+            bob.completedFiles.some((f) => f.fileId === pagedManifest.fileId),
+          5_000,
+        );
+        expect(bob.storage.getFinalizedBytes(pagedManifest.fileId)).toEqual(
+          pagedBytes,
+        );
+
+        // Attempt #1 on poisonManifest: AEAD authentication rejects tampered chunk #1; never written to storage!
+        await bob.engine.downloadFile(poisonManifest.fileId);
+        await waitFor(
+          () =>
+            bob.engine.getTransferProgress(poisonManifest.fileId)?.status ===
+            "error",
+        );
+        expect(
+          bob.engine.getTransferProgress(poisonManifest.fileId)?.errorMessage,
+        ).toBe("Offline relay cache unavailable or expired; peer seeder required");
+        expect(bob.storage.hasReceivedChunk(poisonManifest.fileId, 1)).toBe(
+          false,
+        );
+        expect(
+          bob.storage.getFinalizedBytes(poisonManifest.fileId),
+        ).toBeUndefined();
+
+        // Attempt #2 on poisonManifest: replace chunk #1 with valid AEAD ciphertext sealing WRONG plaintext
+        // (simulating an insider with relayKey trying to poison chunk bytes against Alice's Ed25519 manifest!)
+        const wrongPlaintext = new Uint8Array(SWARM_CHUNK_SIZE).fill(0x42);
+        const validAeadWrongPlaintext = sealRelayChunkBinary(
+          inspectRelayKeys.relayKey,
+          inspectRelayKeys.relayBoxId,
+          poisonFileTag,
+          poisonChunk1BlobId,
+          wrongPlaintext,
+        );
+        relayHub.overwriteRawChunk(
+          inspectRelayKeys.relayBoxId,
+          poisonFileTag,
+          poisonChunk1BlobId,
+          validAeadWrongPlaintext,
+        );
+
+        await bob.engine.downloadFile(poisonManifest.fileId);
+        await waitFor(
+          () =>
+            bob.engine.getTransferProgress(poisonManifest.fileId)?.status ===
+            "error",
+        );
+        expect(bob.storage.hasReceivedChunk(poisonManifest.fileId, 1)).toBe(
+          false,
+        );
+        expect(
+          bob.storage.getFinalizedBytes(poisonManifest.fileId),
+        ).toBeUndefined();
+      } finally {
+        await bob.engine.stop();
       }
     }
   });

@@ -140,6 +140,50 @@ export type TransferStatus =
   | "paused"
   | "error";
 
+export type RelayFileCacheState =
+  | "none"
+  | "uploading"
+  | "cached"
+  | "too_large"
+  | "error";
+
+export interface BlindRelayListedEnvelope {
+  seq: number;
+  blobId: string;
+  payload: Uint8Array;
+  expiresAt: number;
+}
+
+export interface BlindRelayClientPort {
+  readonly enabled: boolean;
+  readonly maxFileBytes: number;
+  putEnvelope(params: {
+    boxId: string;
+    blobId: string;
+    payload: Uint8Array;
+  }): Promise<{ seq: number; expiresAt: number }>;
+  listEnvelopes(params: {
+    boxId: string;
+    afterSeq: number;
+    limit?: number;
+  }): Promise<{
+    items: BlindRelayListedEnvelope[];
+    nextCursor: number;
+    hasMore: boolean;
+  }>;
+  putChunk(params: {
+    boxId: string;
+    fileTag: string;
+    chunkBlobId: string;
+    payload: Uint8Array;
+  }): Promise<{ expiresAt: number }>;
+  getChunk(params: {
+    boxId: string;
+    fileTag: string;
+    chunkBlobId: string;
+  }): Promise<Uint8Array | null>;
+}
+
 export interface SwarmTransferProgress {
   fileId: string;
   fileName: string;
@@ -152,6 +196,9 @@ export interface SwarmTransferProgress {
   availablePeersWithChunks: number;
   status: TransferStatus;
   errorMessage?: string;
+  relayCacheState?: RelayFileCacheState;
+  relayCachedChunks?: number;
+  relayExpiresAt?: number;
 }
 
 export type PeerTransportFailureReason = "ice_failed" | "connect_timeout";
@@ -182,6 +229,7 @@ export interface RoomPeerEngineOptions {
   signaling: SignalingClientPort;
   transportFactory: PeerTransportFactoryPort;
   chunkStorage: ChunkStoragePort;
+  relayClient?: BlindRelayClientPort;
   initialMessages?: readonly ChatMessageEnvelope[];
   initialFiles?: readonly FileManifest[];
   events?: RoomPeerEngineEvents;

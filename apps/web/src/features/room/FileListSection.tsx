@@ -74,6 +74,7 @@ export function FileListSection({
                 key={manifest.fileId}
                 className="file-row file-card"
                 data-transfer-status={vm.status}
+                data-relay-state={vm.relayCacheState}
               >
                 <div className="file-row-top">
                   <span className="file-row-name">{vm.fileName}</span>
@@ -105,6 +106,15 @@ export function FileListSection({
                   </Byline>
                   <span>{vm.percent}%</span>
                 </div>
+
+                {vm.relayBadgeKey ? (
+                  <div
+                    className={`file-relay-badge file-relay-badge-${vm.relayCacheState}`}
+                    data-testid="file-relay-badge"
+                  >
+                    {t(vm.relayBadgeKey, { percent: vm.relayCachePercent })}
+                  </div>
+                ) : null}
 
                 {vm.errorMessage ? (
                   <NoticeBanner tone="error">{vm.errorMessage}</NoticeBanner>

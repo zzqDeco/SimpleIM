@@ -84,6 +84,10 @@ export async function runSeedCommand(
     downloadDir: cmd.storageDir,
     maxStorageBytes,
   });
+  const relayClient = api.createBlindRelayClient(
+    creds.sessionToken,
+    meta.relay,
+  );
 
   let quotaController: SeedQuotaController | null = null;
 
@@ -98,6 +102,7 @@ export async function runSeedCommand(
     signaling,
     transportFactory,
     chunkStorage,
+    relayClient,
     events: {
       onCenterConnectionChange: (connected) => {
         logger.info("seed.center.connection_changed", {

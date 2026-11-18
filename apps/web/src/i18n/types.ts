@@ -119,6 +119,10 @@ export interface TranslationSchema {
   "room.files.action.download": string;
   "room.files.action.cancel": string;
   "room.files.action.save": string;
+  "room.files.relay.uploading": string;
+  "room.files.relay.cached": string;
+  "room.files.relay.tooLarge": string;
+  "room.files.relay.error": string;
 
   // Security & Validation / Error Catalog
   "security.peerRejected": string;

@@ -129,3 +129,24 @@ Every message on `"file-swarm"` is a `Uint8Array` with a fixed **26-byte big-end
 - **Chunk Size**: `65,536 B` (`64 KiB`) for all chunks `0 .. totalChunks - 2`; final chunk `1 .. 65,536 B`.
 - **Backpressure**: Pause outbound `CHUNK` transmission on a channel whenever `dc.bufferedAmount >= 1_048_576` (`1 MiB`), resuming on `bufferedamountlow` (`threshold = 262_144`).
 - **Verification**: Compute `SHA-256(payload)` before persisting to OPFS or disk. Drop mismatched chunks immediately and increment peer `strikeCount` (disconnect peer at `3` strikes). Immediately broadcast `HAVE(fileId, chunkIndex)` to connected room peers upon verified commit.
+
+---
+
+## 6. Blind Ephemeral Relay Subkey Derivation & AEAD Framing
+
+To support asynchronous offline messaging and `<= 100 MiB` file transfers without revealing `roomId`, passphrases, filenames, or participant identities to the server, clients derive orthogonal blind-relay subkeys from `roomAppKey`:
+
+```text
+relayBoxId = Hex(HKDF_SHA256(roomAppKey, salt = "", info = "simpleim/v1/relay-box-id",    len = 32))
+relayKey   =     HKDF_SHA256(roomAppKey, salt = "", info = "simpleim/v1/relay-blob-aead", len = 32)
+relayIdKey =     HKDF_SHA256(roomAppKey, salt = "", info = "simpleim/v1/relay-item-hmac", len = 32)
+```
+
+- **Blinded Item & Chunk Identifiers** (`32` lowercase hex chars = first 16 bytes of HMAC-SHA256):
+  - Envelope `blobId`: `Hex(HMAC_SHA256(relayIdKey, "simpleim/v1/relay-id:" + kind + ":" + logicalId)[0..16])`
+  - File quota tag `fileTag`: `Hex(HMAC_SHA256(relayIdKey, "simpleim/v1/relay-file:" + fileId)[0..16])`
+  - Chunk `chunkBlobId`: `Hex(HMAC_SHA256(relayIdKey, "simpleim/v1/relay-chunk:" + fileId + ":" + chunkIndex)[0..16])`
+- **Binary AEAD Wire Format** (`[24B nonce || ciphertext || 16B tag]`):
+  - Envelopes (`relay.chat`, `relay.manifest`, `relay.hash_page`): `XChaCha20-Poly1305(key = relayKey, nonce = random(24), aad = UTF8("simpleim/v1/relay-env:" + relayBoxId + ":" + blobId))`
+  - Chunks (`0..65,536 B` raw chunk): `XChaCha20-Poly1305(key = relayKey, nonce = random(24), aad = UTF8("simpleim/v1/relay-chk:" + relayBoxId + ":" + fileTag + ":" + chunkBlobId))`
+- **End-to-End Verification**: Every decrypted `relay.chat` message and `relay.manifest` / `relay.hash_page` / chunk must pass the exact same `Ed25519` certificate/author signature and per-chunk `SHA-256` checks as live P2P traffic.
