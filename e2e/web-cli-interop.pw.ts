@@ -780,6 +780,8 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
     const offlinePassphrase = "async-blind-ephemeral-relay-2026-发完即走";
     const offlineMessage =
       "Offline E2EE handover: sender closed browser before receiver joined!";
+    const retriedOfflineMessage =
+      "Outbox retry E2EE memo: recovered after transient relay outage!";
     // 3 chunks (2 * 64 KiB + tail = 160 KiB + 333 B)
     const offlineFileBuffer = makeDeterministicBuffer(160 * 1024 + 333, 0x3c);
     const expectedOfflineSha = sha256HexNode(offlineFileBuffer);
@@ -801,8 +803,50 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
 
       await pageSender.getByTestId("chat-input").fill(offlineMessage);
       await pageSender.getByTestId("chat-send").click();
-      await expect(pageSender.locator(".message-stream")).toContainText(
-        offlineMessage,
+      const firstSentEntry = pageSender
+        .locator(".msg-entry-self", { hasText: offlineMessage });
+      await expect(firstSentEntry).toBeVisible();
+      await expect(firstSentEntry).toHaveAttribute(
+        "data-delivery-status",
+        "relayed",
+        { timeout: 15_000 },
+      );
+
+      // Simulate transient relay outage -> send a second message -> verify failed state + manual Retry button -> recover to relayed!
+      await pageSender.route("**/api/v1/relay/*/envelopes/*", async (route) => {
+        if (route.request().method() === "PUT") {
+          await route.fulfill({
+            status: 503,
+            contentType: "application/json",
+            body: JSON.stringify({
+              ok: false,
+              error: { code: "internal_error", message: "Simulated relay outage" },
+            }),
+          });
+          return;
+        }
+        await route.continue();
+      });
+
+      await pageSender.getByTestId("chat-input").fill(retriedOfflineMessage);
+      await pageSender.getByTestId("chat-send").click();
+      const retriedEntry = pageSender
+        .locator(".msg-entry-self", { hasText: retriedOfflineMessage });
+      await expect(retriedEntry).toBeVisible();
+      await expect(retriedEntry).toHaveAttribute(
+        "data-delivery-status",
+        "failed",
+        { timeout: 15_000 },
+      );
+      await expect(retriedEntry.getByTestId("msg-retry-button")).toBeVisible();
+
+      // Restore relay reachability and click Retry button -> transitions atomically to relayed!
+      await pageSender.unroute("**/api/v1/relay/*/envelopes/*");
+      await retriedEntry.getByTestId("msg-retry-button").click();
+      await expect(retriedEntry).toHaveAttribute(
+        "data-delivery-status",
+        "relayed",
+        { timeout: 15_000 },
       );
 
       await pageSender.getByTestId("file-input").setInputFiles({
@@ -846,6 +890,10 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
 
       await expect(pageReceiver.locator(".message-stream")).toContainText(
         offlineMessage,
+        { timeout: 20_000 },
+      );
+      await expect(pageReceiver.locator(".message-stream")).toContainText(
+        retriedOfflineMessage,
         { timeout: 20_000 },
       );
 
@@ -931,6 +979,7 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       forbiddenStrings: [
         offlinePassphrase,
         offlineMessage,
+        retriedOfflineMessage,
         "offline-handover.bin",
         "Password-OfflineSender-123!",
         "Password-OfflineReceiver-123!",

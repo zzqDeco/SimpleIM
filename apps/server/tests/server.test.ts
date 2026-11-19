@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES,
   DEFAULT_RELAY_MAX_FILE_BYTES,
   DEFAULT_RELAY_MAX_TOTAL_BYTES,
   DEFAULT_RELAY_TTL_MS,
@@ -32,6 +33,12 @@ import {
   sha256Bytes,
   verifyPeerIdentityCert,
 } from "@simpleim/crypto";
+import {
+  FsBlindRelayStore,
+  InMemoryBlindRelayStore,
+  type ChunkIndexEntry,
+  type EnvelopeIndexEntry,
+} from "../src/infra/blind-relay-store.ts";
 import {
   createSimpleImServer,
   type SimpleImServerInstance,
@@ -1140,6 +1147,7 @@ describe("SimpleIM Server Integration Suite", () => {
       ttlMs: DEFAULT_RELAY_TTL_MS,
       maxFileBytes: DEFAULT_RELAY_MAX_FILE_BYTES,
       maxTotalBytes: DEFAULT_RELAY_MAX_TOTAL_BYTES,
+      maxEnvelopeTotalBytes: DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES,
     });
   });
 
@@ -1154,6 +1162,7 @@ describe("SimpleIM Server Integration Suite", () => {
           ttlMs: 120_000,
           maxFileBytes: 1_048_576,
           maxTotalBytes: 8_388_608,
+          maxEnvelopeTotalBytes: 2_097_152,
         },
       },
       capturedLogs,
@@ -1167,6 +1176,7 @@ describe("SimpleIM Server Integration Suite", () => {
       ttlMs: 120_000,
       maxFileBytes: 1_048_576,
       maxTotalBytes: 8_388_608,
+      maxEnvelopeTotalBytes: 2_097_152,
     });
 
     const boxId = "a1b2c3d4e5f60718293a4b5c6d7e8f90".repeat(2);
@@ -1879,6 +1889,663 @@ describe("SimpleIM Server Integration Suite", () => {
       srv2.sqliteDb.close(false);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("13. Blind relay reliability: isolated envelope/chunk quota pools, reserve-write-commit/rollback on ENOSPC, and cursorReset recovery after restart", async () => {
+    // Reject invalid maxEnvelopeTotalBytes config
+    expect(() =>
+      createSimpleImServer({
+        port: 0,
+        host: "127.0.0.1",
+        sqlitePath: ":memory:",
+        relay: { maxEnvelopeTotalBytes: 0 },
+      }),
+    ).toThrow(/maxEnvelopeTotalBytes/);
+
+    // (a) Quota pool isolation (HTTP integration)
+    {
+      let now = 1_764_000_000_000;
+      const clock = { nowMs: () => now };
+
+      const srv = startTestServer({
+        clock,
+        relay: {
+          enabled: true,
+          ttlMs: 60_000,
+          maxFileBytes: 10_000,
+          maxTotalBytes: 300, // chunk pool cap
+          maxEnvelopeTotalBytes: 250, // isolated envelope pool cap
+          sweepIntervalMs: 0,
+        },
+      });
+
+      const regRes = await fetch(`${srv.url}/api/v1/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: "pool_iso_user",
+          password: "pool-iso-password-123",
+          clientKind: "cli",
+        }),
+      });
+      expect(regRes.status).toBe(201);
+      const auth = (await regRes.json()) as CliAuthResponse;
+      const headers = { Authorization: `Bearer ${auth.sessionToken}` };
+
+      const boxId = "d".repeat(64);
+      const fileTag = "4".repeat(32);
+
+      // Put 3 chat envelopes (80 B each = 240 B <= 250 B maxEnvelopeTotalBytes)
+      const envIds = [
+        "00000000000000000000000000000101",
+        "00000000000000000000000000000102",
+        "00000000000000000000000000000103",
+      ];
+      const envPayloads = envIds.map(() => randomBytes(80));
+      for (let i = 0; i < envIds.length; i++) {
+        now += 10;
+        const putRes = await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/envelopes/${envIds[i]!}`,
+          { method: "PUT", headers, body: new Uint8Array(envPayloads[i]!) },
+        );
+        expect(putRes.status).toBe(201);
+        expect(((await putRes.json()) as RelayPutEnvelopeResponse).seq).toBe(
+          i + 1,
+        );
+      }
+
+      // Envelope exceeding maxEnvelopeTotalBytes (260 B > 250 B) is rejected with 413 even though 260 <= 300 maxTotalBytes
+      const oversizedEnvRes = await fetch(
+        `${srv.url}/api/v1/relay/${boxId}/envelopes/00000000000000000000000000000199`,
+        { method: "PUT", headers, body: new Uint8Array(randomBytes(260)) },
+      );
+      expect(oversizedEnvRes.status).toBe(413);
+
+      // Hammer 6 chunk uploads (120 B each = 720 B >> 300 B maxTotalBytes) to trigger heavy chunk LRU eviction
+      const chunkIds = [
+        "00000000000000000000000000000c01",
+        "00000000000000000000000000000c02",
+        "00000000000000000000000000000c03",
+        "00000000000000000000000000000c04",
+        "00000000000000000000000000000c05",
+        "00000000000000000000000000000c06",
+      ];
+      const chunkPayloads = chunkIds.map(() => randomBytes(120));
+      for (let i = 0; i < chunkIds.length; i++) {
+        now += 10;
+        const putRes = await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkIds[i]!}`,
+          { method: "PUT", headers, body: new Uint8Array(chunkPayloads[i]!) },
+        );
+        expect(putRes.status).toBe(201);
+      }
+
+      // Oldest 4 chunks were LRU-evicted (only last 2 fit in 300 B: 240 B <= 300 B)
+      for (let i = 0; i < 4; i++) {
+        const res = await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkIds[i]!}`,
+          { headers },
+        );
+        expect(res.status).toBe(404);
+      }
+      for (let i = 4; i < 6; i++) {
+        const res = await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkIds[i]!}`,
+          { headers },
+        );
+        expect(res.status).toBe(200);
+        expect(new Uint8Array(await res.arrayBuffer())).toEqual(
+          new Uint8Array(chunkPayloads[i]!),
+        );
+      }
+
+      // 100% of unexpired chat envelopes survived heavy chunk eviction untouched!
+      const envListRes = await fetch(
+        `${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0`,
+        { headers },
+      );
+      expect(envListRes.status).toBe(200);
+      const envList = (await envListRes.json()) as RelayListEnvelopesResponse;
+      expect(envList.items.map((item) => item.seq)).toEqual([1, 2, 3]);
+      expect(envList.items.map((item) => item.blobId)).toEqual(envIds);
+      for (let i = 0; i < envPayloads.length; i++) {
+        expect(base64UrlToBytes(envList.items[i]!.payloadB64)).toEqual(
+          envPayloads[i]!,
+        );
+      }
+
+      // Reverse direction: push 2 more envelopes (100 B each) to trigger envelope LRU eviction -> never evicts chunks!
+      const env4Id = "00000000000000000000000000000104";
+      const env5Id = "00000000000000000000000000000105";
+      const env4Payload = randomBytes(100);
+      const env5Payload = randomBytes(100);
+
+      now += 10;
+      expect(
+        (
+          await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${env4Id}`, {
+            method: "PUT",
+            headers,
+            body: new Uint8Array(env4Payload),
+          })
+        ).status,
+      ).toBe(201);
+
+      now += 10;
+      expect(
+        (
+          await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${env5Id}`, {
+            method: "PUT",
+            headers,
+            body: new Uint8Array(env5Payload),
+          })
+        ).status,
+      ).toBe(201);
+
+      // Envelope LRU evicted oldest envelopes (only 200 B = env4+env5 fit in 250 B; env1..3 evicted)
+      const afterEnvEvict = (await (
+        await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0`, {
+          headers,
+        })
+      ).json()) as RelayListEnvelopesResponse;
+      expect(afterEnvEvict.items.map((item) => item.blobId)).toEqual([
+        env4Id,
+        env5Id,
+      ]);
+
+      // Surviving chunks in the chunk pool remain 100% untouched!
+      for (let i = 4; i < 6; i++) {
+        const res = await fetch(
+          `${srv.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkIds[i]!}`,
+          { headers },
+        );
+        expect(res.status).toBe(200);
+        expect(new Uint8Array(await res.arrayBuffer())).toEqual(
+          new Uint8Array(chunkPayloads[i]!),
+        );
+      }
+    }
+
+    // (b) Reserve -> Write -> Commit / Rollback on simulated ENOSPC (both InMemory & Fs stores)
+    {
+      const tempDir = mkdtempSync(join(tmpdir(), "simpleim-relay-enospc-"));
+      try {
+        let now = 1_764_100_000_000;
+        const clock = { nowMs: () => now };
+        const boxId = "e".repeat(64);
+        const fileTag = "5".repeat(32);
+
+        class FailingInMemoryStore extends InMemoryBlindRelayStore {
+          failNextEnvelope = false;
+          failNextChunk = false;
+          observedReservedEnvDuringWrite = -1;
+          observedReservedChunkDuringWrite = -1;
+          observedReservedFileDuringWrite = -1;
+
+          protected override writeEnvelopePayload(
+            entry: EnvelopeIndexEntry,
+            payload: Uint8Array,
+          ): void {
+            this.observedReservedEnvDuringWrite =
+              this.getReservedEnvelopeBytes();
+            if (this.failNextEnvelope) {
+              this.failNextEnvelope = false;
+              const err = new Error("ENOSPC: no space left on device") as Error & {
+                code: string;
+              };
+              err.code = "ENOSPC";
+              throw err;
+            }
+            super.writeEnvelopePayload(entry, payload);
+          }
+
+          protected override writeChunkPayload(
+            entry: ChunkIndexEntry,
+            payload: Uint8Array,
+          ): void {
+            this.observedReservedChunkDuringWrite =
+              this.getReservedChunkBytes();
+            this.observedReservedFileDuringWrite = this.getReservedFileBytes(
+              entry.boxId,
+              entry.fileTag,
+            );
+            if (this.failNextChunk) {
+              this.failNextChunk = false;
+              const err = new Error("ENOSPC: no space left on device") as Error & {
+                code: string;
+              };
+              err.code = "ENOSPC";
+              throw err;
+            }
+            super.writeChunkPayload(entry, payload);
+          }
+        }
+
+        class FailingFsStore extends FsBlindRelayStore {
+          failNextEnvelope = false;
+          failNextChunk = false;
+          observedReservedEnvDuringWrite = -1;
+          observedReservedChunkDuringWrite = -1;
+          observedReservedFileDuringWrite = -1;
+
+          protected override writeEnvelopePayload(
+            entry: EnvelopeIndexEntry,
+            payload: Uint8Array,
+          ): void {
+            this.observedReservedEnvDuringWrite =
+              this.getReservedEnvelopeBytes();
+            if (this.failNextEnvelope) {
+              this.failNextEnvelope = false;
+              const err = new Error("ENOSPC: no space left on device") as Error & {
+                code: string;
+              };
+              err.code = "ENOSPC";
+              throw err;
+            }
+            super.writeEnvelopePayload(entry, payload);
+          }
+
+          protected override writeChunkPayload(
+            entry: ChunkIndexEntry,
+            payload: Uint8Array,
+          ): void {
+            this.observedReservedChunkDuringWrite =
+              this.getReservedChunkBytes();
+            this.observedReservedFileDuringWrite = this.getReservedFileBytes(
+              entry.boxId,
+              entry.fileTag,
+            );
+            if (this.failNextChunk) {
+              this.failNextChunk = false;
+              const err = new Error("ENOSPC: no space left on device") as Error & {
+                code: string;
+              };
+              err.code = "ENOSPC";
+              throw err;
+            }
+            super.writeChunkPayload(entry, payload);
+          }
+        }
+
+        const stores = [
+          new FailingInMemoryStore({
+            maxTotalBytes: 500,
+            maxEnvelopeTotalBytes: 500,
+            clock,
+            sweepIntervalMs: 0,
+          }),
+          new FailingFsStore({
+            cacheDir: join(tempDir, "fs-enospc"),
+            maxTotalBytes: 500,
+            maxEnvelopeTotalBytes: 500,
+            clock,
+            sweepIntervalMs: 0,
+          }),
+        ];
+
+        for (const store of stores) {
+          try {
+            // Seed 1 valid envelope (80 B, seq=1) and 1 valid chunk (120 B)
+            const seedEnv = store.putEnvelope({
+              boxId,
+              blobId: "00000000000000000000000000000201",
+              payload: randomBytes(80),
+              nowMs: now,
+              ttlMs: 60_000,
+            });
+            expect(seedEnv.seq).toBe(1);
+
+            const seedChunk = store.putChunk({
+              boxId,
+              fileTag,
+              chunkBlobId: "00000000000000000000000000000d01",
+              payload: randomBytes(120),
+              nowMs: now,
+              ttlMs: 60_000,
+              maxFileBytes: 250,
+            });
+            expect(seedChunk.created).toBe(true);
+
+            expect(store.getTotalBytes()).toBe(200);
+            expect(store.getEnvelopeTotalBytes()).toBe(80);
+            expect(store.getChunkTotalBytes()).toBe(120);
+            expect(store.getReservedEnvelopeBytes()).toBe(0);
+            expect(store.getReservedChunkBytes()).toBe(0);
+            expect(store.getFileBytes(boxId, fileTag)).toBe(120);
+            expect(store.getReservedFileBytes(boxId, fileTag)).toBe(0);
+            expect(store.getNextSeq(boxId)).toBe(2);
+
+            // Simulate ENOSPC during envelope write (90 B)
+            store.failNextEnvelope = true;
+            expect(() =>
+              store.putEnvelope({
+                boxId,
+                blobId: "00000000000000000000000000000202",
+                payload: randomBytes(90),
+                nowMs: now,
+                ttlMs: 60_000,
+              }),
+            ).toThrow(/ENOSPC/);
+
+            // Reservation was active during write, then rolled back cleanly with zero drift
+            expect(store.observedReservedEnvDuringWrite).toBe(90);
+            expect(store.getTotalBytes()).toBe(200);
+            expect(store.getEnvelopeTotalBytes()).toBe(80);
+            expect(store.getChunkTotalBytes()).toBe(120);
+            expect(store.getReservedEnvelopeBytes()).toBe(0);
+            expect(store.getReservedChunkBytes()).toBe(0);
+            expect(store.getEntryCount()).toBe(2);
+            expect(store.getNextSeq(boxId)).toBe(2);
+            expect(
+              store
+                .listEnvelopes({ boxId, afterSeq: 0, limit: 10, nowMs: now })
+                .items.map((i) => i.seq),
+            ).toEqual([1]);
+
+            // Simulate ENOSPC during chunk write (130 B)
+            store.failNextChunk = true;
+            expect(() =>
+              store.putChunk({
+                boxId,
+                fileTag,
+                chunkBlobId: "00000000000000000000000000000d02",
+                payload: randomBytes(130),
+                nowMs: now,
+                ttlMs: 60_000,
+                maxFileBytes: 250,
+              }),
+            ).toThrow(/ENOSPC/);
+
+            // Both chunk pool and per-file reservations were active during write, then rolled back cleanly
+            expect(store.observedReservedChunkDuringWrite).toBe(130);
+            expect(store.observedReservedFileDuringWrite).toBe(130);
+            expect(store.getTotalBytes()).toBe(200);
+            expect(store.getEnvelopeTotalBytes()).toBe(80);
+            expect(store.getChunkTotalBytes()).toBe(120);
+            expect(store.getReservedEnvelopeBytes()).toBe(0);
+            expect(store.getReservedChunkBytes()).toBe(0);
+            expect(store.getFileBytes(boxId, fileTag)).toBe(120);
+            expect(store.getReservedFileBytes(boxId, fileTag)).toBe(0);
+            expect(store.getEntryCount()).toBe(2);
+            expect(
+              store.getChunk({
+                boxId,
+                fileTag,
+                chunkBlobId: "00000000000000000000000000000d02",
+                nowMs: now,
+              }),
+            ).toBeNull();
+
+            // Subsequent valid envelope succeeds with exact monotonic seq = 2 (no gap!) and exact byte accounting
+            const okEnvPayload = randomBytes(90);
+            const okEnv = store.putEnvelope({
+              boxId,
+              blobId: "00000000000000000000000000000202",
+              payload: okEnvPayload,
+              nowMs: now,
+              ttlMs: 60_000,
+            });
+            expect(okEnv.seq).toBe(2);
+            expect(okEnv.created).toBe(true);
+            expect(store.getEnvelopeTotalBytes()).toBe(170);
+            expect(store.getReservedEnvelopeBytes()).toBe(0);
+            expect(store.getNextSeq(boxId)).toBe(3);
+
+            // Subsequent valid chunk at exact maxFileBytes boundary (120 + 130 = 250) succeeds cleanly
+            const okChunkPayload = randomBytes(130);
+            const okChunk = store.putChunk({
+              boxId,
+              fileTag,
+              chunkBlobId: "00000000000000000000000000000d02",
+              payload: okChunkPayload,
+              nowMs: now,
+              ttlMs: 60_000,
+              maxFileBytes: 250,
+            });
+            expect(okChunk.created).toBe(true);
+            expect(store.getChunkTotalBytes()).toBe(250);
+            expect(store.getReservedChunkBytes()).toBe(0);
+            expect(store.getFileBytes(boxId, fileTag)).toBe(250);
+            expect(store.getReservedFileBytes(boxId, fileTag)).toBe(0);
+            expect(store.getTotalBytes()).toBe(420);
+            expect(store.getEntryCount()).toBe(4);
+            expect(
+              store.getChunk({
+                boxId,
+                fileTag,
+                chunkBlobId: "00000000000000000000000000000d02",
+                nowMs: now,
+              }),
+            ).toEqual(okChunkPayload);
+          } finally {
+            store.close();
+          }
+        }
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // (c) cursorReset recovery after full expiration + server restart & independent restart trimming
+    {
+      const tempDir = mkdtempSync(join(tmpdir(), "simpleim-relay-reset-"));
+      const dbPath = join(tempDir, "simpleim.sqlite");
+      const cacheDir = join(tempDir, "relay-cache");
+
+      let now = 1_764_200_000_000;
+      const clock = { nowMs: () => now };
+
+      try {
+        const srv1 = startTestServer({
+          sqlitePath: dbPath,
+          clock,
+          relay: {
+            enabled: true,
+            cacheDir,
+            ttlMs: 30_000,
+            maxFileBytes: 1_048_576,
+            maxTotalBytes: 4_194_304,
+            maxEnvelopeTotalBytes: 1_048_576,
+            sweepIntervalMs: 0,
+          },
+        });
+
+        const regRes = await fetch(`${srv1.url}/api/v1/auth/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: "cursor_reset_user",
+            password: "cursor-reset-password-123",
+            clientKind: "cli",
+          }),
+        });
+        expect(regRes.status).toBe(201);
+        const auth = (await regRes.json()) as CliAuthResponse;
+        const headers = { Authorization: `Bearer ${auth.sessionToken}` };
+
+        const boxId = "f".repeat(64);
+        for (let i = 1; i <= 3; i++) {
+          now += 100;
+          const putRes = await fetch(
+            `${srv1.url}/api/v1/relay/${boxId}/envelopes/${String(i).padStart(32, "0")}`,
+            { method: "PUT", headers, body: new Uint8Array(randomBytes(64)) },
+          );
+          expect(putRes.status).toBe(201);
+          expect(((await putRes.json()) as RelayPutEnvelopeResponse).seq).toBe(
+            i,
+          );
+        }
+
+        // Caught up at afterSeq=3 -> no cursorReset field
+        const caughtUpRes = await fetch(
+          `${srv1.url}/api/v1/relay/${boxId}/envelopes?afterSeq=3`,
+          { headers },
+        );
+        expect(caughtUpRes.status).toBe(200);
+        expect(await caughtUpRes.json()).toEqual({
+          ok: true,
+          items: [],
+          nextCursor: 3,
+          hasMore: false,
+        });
+
+        await srv1.stop(true);
+        srv1.sqliteDb.close(false);
+
+        // Advance clock past TTL so all seq 1..3 expire, then restart server -> empty box resets seq to 1
+        now += 60_000;
+
+        const srv2 = startTestServer({
+          sqlitePath: dbPath,
+          clock,
+          relay: {
+            enabled: true,
+            cacheDir,
+            ttlMs: 30_000,
+            maxFileBytes: 1_048_576,
+            maxTotalBytes: 4_194_304,
+            maxEnvelopeTotalBytes: 1_048_576,
+            sweepIntervalMs: 0,
+          },
+        });
+
+        // Querying the empty reset box with stale afterSeq=3 returns cursorReset: true & nextCursor: 0
+        const emptyResetRes = await fetch(
+          `${srv2.url}/api/v1/relay/${boxId}/envelopes?afterSeq=3`,
+          { headers },
+        );
+        expect(emptyResetRes.status).toBe(200);
+        const emptyResetJson =
+          (await emptyResetRes.json()) as RelayListEnvelopesResponse;
+        expect(isValidRelayListEnvelopesResponse(emptyResetJson)).toBe(true);
+        expect(emptyResetJson).toEqual({
+          ok: true,
+          items: [],
+          nextCursor: 0,
+          hasMore: false,
+          cursorReset: true,
+        });
+
+        // Write a new envelope after restart -> receives seq = 1
+        const newBlobId = "000000000000000000000000000000a1";
+        const newPayload = randomBytes(72);
+        const putNewRes = await fetch(
+          `${srv2.url}/api/v1/relay/${boxId}/envelopes/${newBlobId}`,
+          { method: "PUT", headers, body: new Uint8Array(newPayload) },
+        );
+        expect(putNewRes.status).toBe(201);
+        expect(((await putNewRes.json()) as RelayPutEnvelopeResponse).seq).toBe(
+          1,
+        );
+
+        // Query with stale afterSeq=3 -> returns cursorReset: true, items: [seq=1], nextCursor: 1
+        const recoveredRes = await fetch(
+          `${srv2.url}/api/v1/relay/${boxId}/envelopes?afterSeq=3`,
+          { headers },
+        );
+        expect(recoveredRes.status).toBe(200);
+        const recoveredJson =
+          (await recoveredRes.json()) as RelayListEnvelopesResponse;
+        expect(isValidRelayListEnvelopesResponse(recoveredJson)).toBe(true);
+        expect(recoveredJson.cursorReset).toBe(true);
+        expect(recoveredJson.nextCursor).toBe(1);
+        expect(recoveredJson.hasMore).toBe(false);
+        expect(recoveredJson.items.length).toBe(1);
+        expect(recoveredJson.items[0]?.seq).toBe(1);
+        expect(recoveredJson.items[0]?.blobId).toBe(newBlobId);
+        expect(base64UrlToBytes(recoveredJson.items[0]!.payloadB64)).toEqual(
+          newPayload,
+        );
+
+        // Follow-up query with updated cursor afterSeq=1 -> normal caught-up response without cursorReset
+        const followUpRes = await fetch(
+          `${srv2.url}/api/v1/relay/${boxId}/envelopes?afterSeq=1`,
+          { headers },
+        );
+        expect(followUpRes.status).toBe(200);
+        expect(await followUpRes.json()).toEqual({
+          ok: true,
+          items: [],
+          nextCursor: 1,
+          hasMore: false,
+        });
+
+        // Persist 2 chunks alongside the surviving envelope, then restart with tighter chunk cap -> only oldest chunk trimmed, envelope untouched
+        const fileTag = "6".repeat(32);
+        const chunkOld = "000000000000000000000000000000f1";
+        const chunkNew = "000000000000000000000000000000f2";
+        const chunkOldPayload = randomBytes(120);
+        const chunkNewPayload = randomBytes(120);
+
+        now += 1_000;
+        expect(
+          (
+            await fetch(
+              `${srv2.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkOld}`,
+              { method: "PUT", headers, body: new Uint8Array(chunkOldPayload) },
+            )
+          ).status,
+        ).toBe(201);
+
+        now += 2_000;
+        expect(
+          (
+            await fetch(
+              `${srv2.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkNew}`,
+              { method: "PUT", headers, body: new Uint8Array(chunkNewPayload) },
+            )
+          ).status,
+        ).toBe(201);
+
+        await srv2.stop(true);
+        srv2.sqliteDb.close(false);
+
+        const srv3 = startTestServer({
+          sqlitePath: dbPath,
+          clock,
+          relay: {
+            enabled: true,
+            cacheDir,
+            ttlMs: 30_000,
+            maxFileBytes: 1_048_576,
+            maxTotalBytes: 150, // tighter chunk pool trims chunkOld (240 > 150 -> keeps chunkNew 120 B)
+            maxEnvelopeTotalBytes: 1_048_576, // envelope pool still generous
+            sweepIntervalMs: 0,
+          },
+        });
+
+        expect(
+          (
+            await fetch(
+              `${srv3.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkOld}`,
+              { headers },
+            )
+          ).status,
+        ).toBe(404);
+        const survivingChunkRes = await fetch(
+          `${srv3.url}/api/v1/relay/${boxId}/files/${fileTag}/chunks/${chunkNew}`,
+          { headers },
+        );
+        expect(survivingChunkRes.status).toBe(200);
+        expect(new Uint8Array(await survivingChunkRes.arrayBuffer())).toEqual(
+          new Uint8Array(chunkNewPayload),
+        );
+
+        const survivingEnvList = (await (
+          await fetch(`${srv3.url}/api/v1/relay/${boxId}/envelopes?afterSeq=0`, {
+            headers,
+          })
+        ).json()) as RelayListEnvelopesResponse;
+        expect(survivingEnvList.items.map((item) => item.blobId)).toEqual([
+          newBlobId,
+        ]);
+
+        await srv3.stop(true);
+        srv3.sqliteDb.close(false);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
     }
   });
 });

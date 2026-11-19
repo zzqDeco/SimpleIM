@@ -156,6 +156,9 @@ export function createSimpleImServer(
       options.relay?.maxFileBytes ?? DEFAULT_RELAY_CONFIG.maxFileBytes,
     maxTotalBytes:
       options.relay?.maxTotalBytes ?? DEFAULT_RELAY_CONFIG.maxTotalBytes,
+    maxEnvelopeTotalBytes:
+      options.relay?.maxEnvelopeTotalBytes ??
+      DEFAULT_RELAY_CONFIG.maxEnvelopeTotalBytes,
   };
 
   if (!Number.isSafeInteger(relayConfig.ttlMs) || relayConfig.ttlMs <= 0) {
@@ -177,6 +180,14 @@ export function createSimpleImServer(
       `Invalid relay.maxTotalBytes (${relayConfig.maxTotalBytes}); expected > 0`,
     );
   }
+  if (
+    !Number.isSafeInteger(relayConfig.maxEnvelopeTotalBytes) ||
+    relayConfig.maxEnvelopeTotalBytes <= 0
+  ) {
+    throw new Error(
+      `Invalid relay.maxEnvelopeTotalBytes (${relayConfig.maxEnvelopeTotalBytes}); expected > 0`,
+    );
+  }
 
   const rawRelayCacheDir = options.relay?.cacheDir?.trim();
   const relayStore: BlindRelayStorePort =
@@ -184,11 +195,13 @@ export function createSimpleImServer(
       ? new FsBlindRelayStore({
           cacheDir: rawRelayCacheDir,
           maxTotalBytes: relayConfig.maxTotalBytes,
+          maxEnvelopeTotalBytes: relayConfig.maxEnvelopeTotalBytes,
           clock,
           sweepIntervalMs: options.relay?.sweepIntervalMs,
         })
       : new InMemoryBlindRelayStore({
           maxTotalBytes: relayConfig.maxTotalBytes,
+          maxEnvelopeTotalBytes: relayConfig.maxEnvelopeTotalBytes,
           clock,
           sweepIntervalMs: options.relay?.sweepIntervalMs,
         });

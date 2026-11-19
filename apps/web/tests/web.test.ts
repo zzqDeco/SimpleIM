@@ -16,6 +16,7 @@ import {
   generateEd25519KeyPair,
   issuePeerIdentityCert,
   sha256Hex,
+  signChatMessage,
   wipeRoomKeys,
 } from "@simpleim/crypto";
 import { SignalingServerError } from "@simpleim/peer-core";
@@ -78,6 +79,7 @@ import {
   InMemoryVaultBackend,
   RoomVault,
   type VaultRoomMetadata,
+  type VaultWebLocksLike,
 } from "../src/storage/room-vault.ts";
 import { BrowserSignalingClient } from "../src/transport/browser-signaling.ts";
 import { MultiplexedSignalingHub } from "../src/transport/multiplexed-signaling.ts";
@@ -1858,5 +1860,283 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(offlineReceiverVm.relayCacheState).toBe("cached");
     expect(offlineReceiverVm.relayCachePercent).toBe(100);
     expect(offlineReceiverVm.relayBadgeKey).toBe("room.files.relay.cached");
+  });
+
+  test("HttpAuthClient BlindRelayClient forwards keepalive: true and cursorReset: true, and deriveMessageViewModel exposes self delivery badges", async () => {
+    const seenKeepalive: Array<boolean | undefined> = [];
+    const boxId = "1".repeat(64);
+    const blobId = "2".repeat(32);
+
+    const client = new HttpAuthClient({
+      baseUrl: "https://im.example.test",
+      enableBroadcastChannel: false,
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/v1/auth/login") {
+          return Response.json({
+            ok: true,
+            csrfToken: "csrf_ka_01",
+            user: {
+              id: "usr_019a0000000070008000000000000001",
+              username: "alice",
+              displayName: "Alice",
+              createdAt: 1_763_000_000_000,
+            },
+          });
+        }
+        if (init?.method === "PUT") {
+          seenKeepalive.push(init.keepalive);
+          return Response.json(
+            { ok: true, seq: 1, created: true, expiresAt: 1_900_000_000_000 },
+            { status: 201 },
+          );
+        }
+        return Response.json({
+          ok: true,
+          items: [],
+          nextCursor: 0,
+          hasMore: false,
+          cursorReset: true,
+        });
+      }) as typeof fetch,
+    });
+
+    await client.login({ username: "alice", password: "Password!123" });
+    const relay = client.createBlindRelayClient({
+      enabled: true,
+      ttlMs: 86_400_000,
+      maxFileBytes: 104_857_600,
+      maxTotalBytes: 2_147_483_648,
+    });
+
+    await relay.putEnvelope({
+      boxId,
+      blobId,
+      payload: new Uint8Array(64).fill(0x11),
+      keepalive: true,
+    });
+    expect(seenKeepalive).toEqual([true]);
+
+    const listed = await relay.listEnvelopes({ boxId, afterSeq: 99 });
+    expect(listed.cursorReset).toBe(true);
+    expect(listed.nextCursor).toBe(0);
+
+    const serverKeys = generateEd25519KeyPair();
+    const peerKeys = generateEd25519KeyPair();
+    const cert = issuePeerIdentityCert({
+      serverKeyId: "srvk_test",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000001",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_019a0000000070008000000000000001",
+      peerSignPubKey: peerKeys.publicKeyBase64Url,
+      clientKind: "web",
+    });
+    const msg = signChatMessage({
+      roomId: "a".repeat(64),
+      lamport: 1,
+      body: "delivery badge test",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: 1_763_000_000_000,
+    });
+
+    const selfFailedVm = deriveMessageViewModel(
+      msg,
+      cert.payload.peerId,
+      new Map([[msg.msgId, msg]]),
+      cert.payload.userId,
+      new Map([[msg.msgId, "failed"]]),
+    );
+    expect(selfFailedVm.deliveryStatus).toBe("failed");
+    expect(selfFailedVm.deliveryLabelKey).toBe("room.msg.delivery.failed");
+
+    const peerVm = deriveMessageViewModel(
+      msg,
+      "peer_019a0000000070008000000000000002",
+      new Map([[msg.msgId, msg]]),
+      "usr_019a0000000070008000000000000002",
+      new Map([[msg.msgId, "relayed"]]),
+    );
+    expect(peerVm.isSelf).toBe(false);
+    expect(peerVm.deliveryStatus).toBeNull();
+    expect(peerVm.deliveryLabelKey).toBeNull();
+    client.dispose();
+  });
+
+  test("RoomVault.commitRoomState commits room+messages+files+outbox+cursor in a single atomic transaction and prevents cross-tab Lost Updates via Web Locks", async () => {
+    const sharedBackend = new InMemoryVaultBackend();
+    const lockTails = new Map<string, Promise<void>>();
+    const acquiredLocks: string[] = [];
+
+    const sharedLocks: VaultWebLocksLike = {
+      async request<T>(
+        name: string,
+        _options: { mode?: "exclusive" | "shared" },
+        callback: (lock: object | null) => Promise<T> | T,
+      ): Promise<T> {
+        const prev = lockTails.get(name) ?? Promise.resolve();
+        let release!: () => void;
+        const nextTail = new Promise<void>((r) => {
+          release = r;
+        });
+        lockTails.set(name, nextTail);
+        await prev;
+        acquiredLocks.push(name);
+        try {
+          return await callback({ name });
+        } finally {
+          release();
+        }
+      },
+    };
+
+    const userId = "usr_019a00000000700080000000000000aa";
+    const roomKeys = deriveRoomKeys("atomic-vault-lock-test-passphrase");
+    const serverKeys = generateEd25519KeyPair();
+    const peerKeys = generateEd25519KeyPair();
+    const cert = issuePeerIdentityCert({
+      serverKeyId: "srvk_test",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId,
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_019a00000000700080000000000000aa",
+      peerSignPubKey: peerKeys.publicKeyBase64Url,
+      clientKind: "web",
+    });
+
+    const msg1 = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 1,
+      body: "Message from Tab 1",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: 1_763_000_001_000,
+    });
+    const msg2 = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 2,
+      body: "Message from Tab 2",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: 1_763_000_002_000,
+    });
+    const msg3 = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 3,
+      body: "Aborted tx message",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: 1_763_000_003_000,
+    });
+
+    const baseMeta: VaultRoomMetadata = {
+      roomId: roomKeys.roomId,
+      roomIdPrefix: roomKeys.roomIdPrefix,
+      alias: "Atomic Group",
+      pinned: false,
+      joinedAt: 1_763_000_000_000,
+      lastActiveAt: 1_763_000_001_000,
+      lastReadAt: 1_763_000_001_000,
+    };
+
+    const tab1Vault = new RoomVault(sharedBackend, {
+      locksProvider: () => sharedLocks,
+    });
+    const tab2Vault = new RoomVault(sharedBackend, {
+      locksProvider: () => sharedLocks,
+    });
+
+    // 1. Concurrent commits from two separate tabs sharing one backend: Web Locks + read-merge-commit prevent Lost Update!
+    await Promise.all([
+      tab1Vault.commitRoomState({
+        userId,
+        metadata: { ...baseMeta, lastActiveAt: 1_763_000_001_000 },
+        roomKeys,
+        messages: [msg1],
+        addPendingRelayMsgIds: [msg1.msgId],
+        relayCursor: 5,
+      }),
+      tab2Vault.commitRoomState({
+        userId,
+        metadata: { ...baseMeta, lastActiveAt: 1_763_000_002_000 },
+        roomKeys,
+        messages: [msg2],
+        addPendingRelayMsgIds: [msg2.msgId],
+        relayCursor: 8,
+      }),
+    ]);
+
+    expect(sharedBackend.bundleCommitCount).toBe(2);
+    expect(acquiredLocks.length).toBeGreaterThanOrEqual(2);
+
+    const hydrated1 = await tab1Vault.loadWorkspace(userId);
+    expect(hydrated1).toHaveLength(1);
+    expect(hydrated1[0]!.messages.map((m) => m.body)).toEqual([
+      "Message from Tab 1",
+      "Message from Tab 2",
+    ]);
+    expect(hydrated1[0]!.pendingRelayMsgIds.sort()).toEqual(
+      [msg1.msgId, msg2.msgId].sort(),
+    );
+    expect(hydrated1[0]!.relayCursor).toBe(8);
+    expect(hydrated1[0]!.metadata.lastActiveAt).toBe(1_763_000_002_000);
+
+    // 2. saveRoom (e.g. rename alias / pin) preserves persisted pendingRelayMsgIds and relayCursor!
+    await tab1Vault.saveRoom(
+      userId,
+      { ...baseMeta, alias: "Renamed Group", pinned: true },
+      roomKeys,
+    );
+    const hydratedAfterRename = await tab1Vault.loadWorkspace(userId);
+    expect(hydratedAfterRename[0]!.metadata.alias).toBe("Renamed Group");
+    expect(hydratedAfterRename[0]!.metadata.pinned).toBe(true);
+    expect(hydratedAfterRename[0]!.pendingRelayMsgIds.sort()).toEqual(
+      [msg1.msgId, msg2.msgId].sort(),
+    );
+    expect(hydratedAfterRename[0]!.relayCursor).toBe(8);
+
+    // 3. Aborted atomic bundle commit writes ZERO partial state (neither msg3 nor cursor=12 nor pending update)
+    sharedBackend.onBeforeCommitBundle = () => {
+      throw new Error("Simulated IndexedDB transaction abort");
+    };
+    await expect(
+      tab1Vault.commitRoomState({
+        userId,
+        metadata: { ...baseMeta, lastActiveAt: 1_763_000_003_000 },
+        roomKeys,
+        messages: [msg3],
+        removePendingRelayMsgIds: [msg1.msgId],
+        relayCursor: 12,
+      }),
+    ).rejects.toThrow("Simulated IndexedDB transaction abort");
+    sharedBackend.onBeforeCommitBundle = undefined;
+
+    const hydratedAfterAbort = await tab1Vault.loadWorkspace(userId);
+    expect(hydratedAfterAbort[0]!.messages.map((m) => m.body)).toEqual([
+      "Message from Tab 1",
+      "Message from Tab 2",
+    ]);
+    expect(hydratedAfterAbort[0]!.pendingRelayMsgIds.sort()).toEqual(
+      [msg1.msgId, msg2.msgId].sort(),
+    );
+    expect(hydratedAfterAbort[0]!.relayCursor).toBe(8);
+
+    // 4. cursorReset: true resets persisted relayCursor downward cleanly when server epoch resets
+    await tab1Vault.commitRoomState({
+      userId,
+      metadata: baseMeta,
+      roomKeys,
+      removePendingRelayMsgIds: [msg1.msgId],
+      relayCursor: 1,
+      cursorReset: true,
+    });
+    const hydratedAfterReset = await tab1Vault.loadWorkspace(userId);
+    expect(hydratedAfterReset[0]!.relayCursor).toBe(1);
+    expect(hydratedAfterReset[0]!.pendingRelayMsgIds).toEqual([msg2.msgId]);
+
+    wipeRoomKeys(roomKeys);
   });
 });

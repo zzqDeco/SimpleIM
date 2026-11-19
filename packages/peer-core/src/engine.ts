@@ -1,4 +1,5 @@
 import {
+  MAX_CHAT_LAMPORT,
   MAX_RELAY_LIST_LIMIT,
   type ChatMessageEnvelope,
   type FileManifest,
@@ -13,12 +14,15 @@ import {
   openRelayEnvelopeBinary,
   sealRelayEnvelopeBinary,
   utf8ToBytes,
+  verifyChatMessage,
+  verifyFileManifest,
   wipeRelayKeys,
 } from "@simpleim/crypto";
 import { ChatSyncManager } from "./chat-sync.ts";
 import { MeshSessionManager } from "./mesh-session.ts";
 import {
   SignalingServerError,
+  type ChatDeliveryStatus,
   type RoomPeerEngine,
   type RoomPeerEngineOptions,
   type ShareFileInput,
@@ -33,8 +37,19 @@ const SYNC_BATCH_FILE_SLICE = 10;
 // so every batch stays safely below all browsers' 64 KiB SCTP maxMessageSize floor.
 const MAX_SYNC_BATCH_JSON_BYTES = 32_768;
 const DEFAULT_ANTI_ENTROPY_SYNC_INTERVAL_MS = 15_000;
-const MAX_RELAY_CHAT_UPLOAD_ATTEMPTS = 5;
 const MAX_INITIAL_RELAY_CHAT_MESSAGES = 100;
+const RELAY_CHAT_FAIL_SURFACE_ATTEMPTS = 3;
+const RELAY_CHAT_BASE_BACKOFF_MS = 1_000;
+const RELAY_CHAT_MAX_BACKOFF_MS = 60_000;
+const RELAY_CHAT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_KEEPALIVE_ENVELOPES = 10;
+const MAX_KEEPALIVE_PAYLOAD_BYTES = 60_000;
+
+interface PendingRelayChatEntry {
+  message: ChatMessageEnvelope;
+  attempts: number;
+  nextRetryAt: number;
+}
 
 export function createRoomPeerEngine(
   options: RoomPeerEngineOptions,
@@ -63,16 +78,26 @@ export function createRoomPeerEngine(
   let stopped = false;
   let centerConnected = signaling.isConnected;
   let joinedOnCurrentConnection = false;
+  let relaySyncedDuringStart = false;
   let signalingListenersAttached = false;
   let antiEntropyTimer: ReturnType<typeof setInterval> | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
+  const chatDeliveryStates = new Map<string, ChatDeliveryStatus>();
   const uploadedChatMsgIds = new Set<string>();
-  const pendingRelayChatMessages = new Map<string, ChatMessageEnvelope>();
-  const chatUploadAttempts = new Map<string, number>();
+  const pendingRelayChatMessages = new Map<string, PendingRelayChatEntry>();
   let flushingRelayChat = false;
+  let activeFlushPromise: Promise<void> | null = null;
   let reflushRelayChatNeeded = false;
+  let reflushRelayChatForce = false;
+  let reflushRelayChatIgnoreAge = false;
 
-  let relayCursor = 0;
+  let relayCursor =
+    typeof options.initialRelayCursor === "number" &&
+    Number.isFinite(options.initialRelayCursor)
+      ? Math.max(0, Math.floor(options.initialRelayCursor))
+      : 0;
+  let pullingRelay = false;
   let activeRelayPullPromise: Promise<void> | null = null;
   let pullRelayAgainRequested = false;
 
@@ -85,6 +110,8 @@ export function createRoomPeerEngine(
     initialMessages: options.initialMessages,
     events,
   });
+
+  enqueueInitialRelayChatUploads();
 
   // Late-bound reference so SwarmScheduler and MeshSessionManager can call each other cleanly
   let meshManagerRef: MeshSessionManager | null = null;
@@ -435,96 +462,245 @@ export function createRoomPeerEngine(
     }
   }
 
+  function setChatDeliveryStatus(
+    msgId: string,
+    status: ChatDeliveryStatus,
+  ): void {
+    if (stopped) return;
+    if (chatDeliveryStates.get(msgId) === status) {
+      return;
+    }
+    chatDeliveryStates.set(msgId, status);
+    events?.onChatDeliveryChange?.(msgId, status);
+  }
+
+  function clearRelayRetryTimer(): void {
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  }
+
+  function scheduleRelayChatRetryTimer(): void {
+    clearRelayRetryTimer();
+    if (stopped || !started || !relayClient?.enabled) {
+      return;
+    }
+    let earliestRetryAt = Number.POSITIVE_INFINITY;
+    for (const entry of pendingRelayChatMessages.values()) {
+      if (entry.nextRetryAt < earliestRetryAt) {
+        earliestRetryAt = entry.nextRetryAt;
+      }
+    }
+    if (!Number.isFinite(earliestRetryAt)) {
+      return;
+    }
+    const delayMs = Math.max(0, earliestRetryAt - now());
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (stopped || !started || !relayClient?.enabled) {
+        return;
+      }
+      void flushPendingRelayChatUploads();
+    }, delayMs);
+  }
+
   function enqueueInitialRelayChatUploads(): void {
-    if (!relayClient?.enabled) return;
     const localAuthored = chatSync
       .getMessages()
-      .filter((m) => m.authorCert.payload.userId === localCert.payload.userId)
-      .slice(-MAX_INITIAL_RELAY_CHAT_MESSAGES);
-    for (const msg of localAuthored) {
-      if (
-        !uploadedChatMsgIds.has(msg.msgId) &&
-        !pendingRelayChatMessages.has(msg.msgId)
-      ) {
-        pendingRelayChatMessages.set(msg.msgId, msg);
+      .filter((m) => m.authorCert.payload.userId === localCert.payload.userId);
+    const relayEnabled = Boolean(relayClient?.enabled);
+
+    if (options.initialPendingRelayMsgIds !== undefined) {
+      const pendingIdSet = new Set(options.initialPendingRelayMsgIds);
+      for (const msg of localAuthored) {
+        if (pendingIdSet.has(msg.msgId)) {
+          if (relayEnabled) {
+            if (
+              !uploadedChatMsgIds.has(msg.msgId) &&
+              !pendingRelayChatMessages.has(msg.msgId)
+            ) {
+              pendingRelayChatMessages.set(msg.msgId, {
+                message: msg,
+                attempts: 0,
+                nextRetryAt: 0,
+              });
+            }
+            chatDeliveryStates.set(msg.msgId, "pending");
+          } else {
+            chatDeliveryStates.set(msg.msgId, "p2p_only");
+          }
+        } else {
+          if (relayEnabled) {
+            uploadedChatMsgIds.add(msg.msgId);
+            chatDeliveryStates.set(msg.msgId, "relayed");
+          } else {
+            chatDeliveryStates.set(msg.msgId, "p2p_only");
+          }
+        }
+      }
+      return;
+    }
+
+    if (!relayEnabled) {
+      for (const msg of localAuthored) {
+        chatDeliveryStates.set(msg.msgId, "p2p_only");
+      }
+      return;
+    }
+
+    const cutoff = Math.max(
+      0,
+      localAuthored.length - MAX_INITIAL_RELAY_CHAT_MESSAGES,
+    );
+    for (let i = 0; i < localAuthored.length; i++) {
+      const msg = localAuthored[i]!;
+      if (i < cutoff) {
+        uploadedChatMsgIds.add(msg.msgId);
+        chatDeliveryStates.set(msg.msgId, "relayed");
+      } else {
+        if (
+          !uploadedChatMsgIds.has(msg.msgId) &&
+          !pendingRelayChatMessages.has(msg.msgId)
+        ) {
+          pendingRelayChatMessages.set(msg.msgId, {
+            message: msg,
+            attempts: 0,
+            nextRetryAt: 0,
+          });
+        }
+        chatDeliveryStates.set(msg.msgId, "pending");
       }
     }
   }
 
-  async function flushPendingRelayChatUploads(): Promise<void> {
-    if (stopped || !relayClient?.enabled) return;
+  function flushPendingRelayChatUploads(
+    force = false,
+    ignoreAge = false,
+  ): Promise<void> {
+    if (stopped || !relayClient?.enabled) {
+      return Promise.resolve();
+    }
     if (flushingRelayChat) {
       reflushRelayChatNeeded = true;
-      return;
+      if (force) {
+        reflushRelayChatForce = true;
+      }
+      if (ignoreAge) {
+        reflushRelayChatIgnoreAge = true;
+      }
+      return activeFlushPromise ?? Promise.resolve();
     }
+
     flushingRelayChat = true;
-    const attemptedInPass = new Set<string>();
+    clearRelayRetryTimer();
+    let passForce = force;
+    let passIgnoreAge = ignoreAge;
+    let completedSync = false;
 
-    try {
-      do {
-        reflushRelayChatNeeded = false;
-        for (const [msgId, message] of Array.from(
-          pendingRelayChatMessages.entries(),
-        )) {
-          if (stopped || !relayClient.enabled) return;
-          if (uploadedChatMsgIds.has(msgId)) {
-            pendingRelayChatMessages.delete(msgId);
-            chatUploadAttempts.delete(msgId);
-            continue;
-          }
-          if (attemptedInPass.has(msgId)) {
-            continue;
-          }
-          attemptedInPass.add(msgId);
+    const flushTask = (async () => {
+      try {
+        do {
+          reflushRelayChatNeeded = false;
+          reflushRelayChatForce = false;
+          reflushRelayChatIgnoreAge = false;
 
-          try {
-            const blobId = deriveRelayEnvelopeBlobId(
-              relayKeys.relayIdKey,
-              "chat",
-              message.msgId,
-            );
-            const payload = sealRelayEnvelopeBinary(
-              relayKeys.relayKey,
-              relayKeys.relayBoxId,
-              blobId,
-              { type: "relay.chat", message },
-            );
-            await relayClient.putEnvelope({
-              boxId: relayKeys.relayBoxId,
-              blobId,
-              payload,
-            });
-            if (stopped) return;
-            pendingRelayChatMessages.delete(msgId);
-            chatUploadAttempts.delete(msgId);
-            uploadedChatMsgIds.add(msgId);
-          } catch {
-            if (stopped) return;
-            const attempts = (chatUploadAttempts.get(msgId) ?? 0) + 1;
-            if (attempts >= MAX_RELAY_CHAT_UPLOAD_ATTEMPTS) {
+          for (const [msgId, entry] of Array.from(
+            pendingRelayChatMessages.entries(),
+          )) {
+            if (stopped || !relayClient.enabled) return;
+            if (uploadedChatMsgIds.has(msgId)) {
               pendingRelayChatMessages.delete(msgId);
-              chatUploadAttempts.delete(msgId);
-            } else {
-              chatUploadAttempts.set(msgId, attempts);
+              setChatDeliveryStatus(msgId, "relayed");
+              continue;
+            }
+            const currentNow = now();
+            if (
+              !passIgnoreAge &&
+              currentNow - entry.message.createdAt > RELAY_CHAT_MAX_AGE_MS
+            ) {
+              pendingRelayChatMessages.delete(msgId);
+              setChatDeliveryStatus(msgId, "failed");
+              continue;
+            }
+            if (!passForce && entry.nextRetryAt > currentNow) {
+              continue;
+            }
+
+            try {
+              const blobId = deriveRelayEnvelopeBlobId(
+                relayKeys.relayIdKey,
+                "chat",
+                entry.message.msgId,
+              );
+              const payload = sealRelayEnvelopeBinary(
+                relayKeys.relayKey,
+                relayKeys.relayBoxId,
+                blobId,
+                { type: "relay.chat", message: entry.message },
+              );
+              await relayClient.putEnvelope({
+                boxId: relayKeys.relayBoxId,
+                blobId,
+                payload,
+              });
+              if (stopped) return;
+              pendingRelayChatMessages.delete(msgId);
+              uploadedChatMsgIds.add(msgId);
+              setChatDeliveryStatus(msgId, "relayed");
+            } catch {
+              if (stopped) return;
+              if (
+                uploadedChatMsgIds.has(msgId) ||
+                pendingRelayChatMessages.get(msgId) !== entry
+              ) {
+                continue;
+              }
+              entry.attempts += 1;
+              const delay = Math.min(
+                RELAY_CHAT_MAX_BACKOFF_MS,
+                RELAY_CHAT_BASE_BACKOFF_MS *
+                  2 ** Math.min(entry.attempts - 1, 6),
+              );
+              entry.nextRetryAt = now() + delay;
+              if (entry.attempts >= RELAY_CHAT_FAIL_SURFACE_ATTEMPTS) {
+                setChatDeliveryStatus(msgId, "failed");
+              }
             }
           }
+
+          passForce = reflushRelayChatForce;
+          passIgnoreAge = reflushRelayChatIgnoreAge;
+        } while (reflushRelayChatNeeded && !stopped && relayClient.enabled);
+      } finally {
+        completedSync = true;
+        flushingRelayChat = false;
+        activeFlushPromise = null;
+        if (!stopped && started && relayClient.enabled) {
+          scheduleRelayChatRetryTimer();
         }
-      } while (reflushRelayChatNeeded && !stopped && relayClient.enabled);
-    } finally {
-      flushingRelayChat = false;
+      }
+    })();
+
+    if (!completedSync) {
+      activeFlushPromise = flushTask;
     }
+    return flushTask;
   }
 
   function pullFromBlindRelay(): Promise<void> {
     if (stopped || !relayClient?.enabled) {
       return Promise.resolve();
     }
-    if (activeRelayPullPromise !== null) {
+    if (pullingRelay) {
       pullRelayAgainRequested = true;
-      return activeRelayPullPromise;
+      return activeRelayPullPromise ?? Promise.resolve();
     }
 
-    activeRelayPullPromise = (async () => {
+    pullingRelay = true;
+    let completedSync = false;
+
+    const pullTask = (async () => {
       try {
         do {
           pullRelayAgainRequested = false;
@@ -536,8 +712,17 @@ export function createRoomPeerEngine(
             });
             if (stopped) return;
 
-            const newlyPulledMsgs: ChatMessageEnvelope[] = [];
-            const newlyPulledManifests: FileManifest[] = [];
+            const verifiedMsgs: ChatMessageEnvelope[] = [];
+            const verifiedManifests: FileManifest[] = [];
+            const verifiedManifestEntries: Array<{
+              manifest: FileManifest;
+              expiresAt: number;
+            }> = [];
+            const pulledHashPages: Array<{
+              fileId: string;
+              pageIndex: number;
+              chunkHashes: string[];
+            }> = [];
 
             for (const item of res.items) {
               if (stopped) return;
@@ -556,34 +741,94 @@ export function createRoomPeerEngine(
 
               switch (inner.type) {
                 case "relay.chat": {
-                  uploadedChatMsgIds.add(inner.message.msgId);
-                  pendingRelayChatMessages.delete(inner.message.msgId);
-                  chatUploadAttempts.delete(inner.message.msgId);
-                  if (chatSync.ingestRemoteMessage(inner.message, true)) {
-                    newlyPulledMsgs.push(inner.message);
+                  if (
+                    inner.message.lamport <= MAX_CHAT_LAMPORT &&
+                    verifyChatMessage(inner.message, serverSignPubKey, roomId)
+                  ) {
+                    verifiedMsgs.push(inner.message);
                   }
                   break;
                 }
                 case "relay.manifest": {
                   if (
-                    swarmScheduler.ingestRelayManifest(
-                      inner.manifest,
-                      item.expiresAt,
-                    )
+                    verifyFileManifest(inner.manifest, serverSignPubKey, roomId)
                   ) {
-                    newlyPulledManifests.push(inner.manifest);
+                    verifiedManifests.push(inner.manifest);
+                    verifiedManifestEntries.push({
+                      manifest: inner.manifest,
+                      expiresAt: item.expiresAt,
+                    });
                   }
                   break;
                 }
                 case "relay.hash_page": {
-                  swarmScheduler.ingestRelayHashPage(
-                    inner.fileId,
-                    inner.pageIndex,
-                    inner.chunkHashes,
-                  );
+                  pulledHashPages.push({
+                    fileId: inner.fileId,
+                    pageIndex: inner.pageIndex,
+                    chunkHashes: inner.chunkHashes,
+                  });
                   break;
                 }
               }
+            }
+
+            const cursorReset = res.cursorReset === true;
+            const sanitizedServerCursor = Math.max(0, Math.floor(res.nextCursor));
+            const nextCursor = cursorReset
+              ? sanitizedServerCursor
+              : Math.max(relayCursor, sanitizedServerCursor);
+
+            if (
+              events?.onRelayBatchPulled &&
+              (verifiedMsgs.length > 0 ||
+                verifiedManifests.length > 0 ||
+                nextCursor !== relayCursor ||
+                cursorReset)
+            ) {
+              await events.onRelayBatchPulled({
+                messages: verifiedMsgs,
+                files: verifiedManifests,
+                nextCursor,
+                cursorReset,
+              });
+              if (stopped) return;
+            }
+
+            const newlyPulledMsgs: ChatMessageEnvelope[] = [];
+            const newlyPulledManifests: FileManifest[] = [];
+            let removedAnyPending = false;
+
+            for (const msg of verifiedMsgs) {
+              if (stopped) return;
+              uploadedChatMsgIds.add(msg.msgId);
+              if (pendingRelayChatMessages.delete(msg.msgId)) {
+                removedAnyPending = true;
+              }
+              if (msg.authorCert.payload.userId === localCert.payload.userId) {
+                setChatDeliveryStatus(msg.msgId, "relayed");
+              }
+              if (chatSync.ingestRemoteMessage(msg, true)) {
+                newlyPulledMsgs.push(msg);
+              }
+            }
+            if (removedAnyPending && !flushingRelayChat) {
+              scheduleRelayChatRetryTimer();
+            }
+
+            for (const { manifest, expiresAt } of verifiedManifestEntries) {
+              if (stopped) return;
+              if (swarmScheduler.ingestRelayManifest(manifest, expiresAt)) {
+                newlyPulledManifests.push(manifest);
+              }
+            }
+
+            for (const page of pulledHashPages) {
+              if (stopped) return;
+              swarmScheduler.ingestRelayHashPage(
+                page.fileId,
+                page.pageIndex,
+                page.chunkHashes,
+              );
             }
 
             if (newlyPulledMsgs.length > 0) {
@@ -596,20 +841,26 @@ export function createRoomPeerEngine(
               });
             }
 
-            relayCursor = Math.max(relayCursor, res.nextCursor);
+            relayCursor = nextCursor;
             if (!res.hasMore || res.items.length === 0) {
               break;
             }
           }
         } while (pullRelayAgainRequested && !stopped && relayClient.enabled);
       } catch {
-        // Ignore transient blind relay errors; next tick or reconnect will retry
+        pullRelayAgainRequested = false;
+        // Ignore transient blind relay or persistence errors; next tick or reconnect will retry
       } finally {
+        completedSync = true;
+        pullingRelay = false;
         activeRelayPullPromise = null;
       }
     })();
 
-    return activeRelayPullPromise;
+    if (!completedSync) {
+      activeRelayPullPromise = pullTask;
+    }
+    return pullTask;
   }
 
   function ensureSignalingListeners(): void {
@@ -630,7 +881,11 @@ export function createRoomPeerEngine(
             safeSendSignaling({ type: "room.join", roomId });
           }
           if (relayClient?.enabled) {
-            void flushPendingRelayChatUploads();
+            relaySyncedDuringStart = true;
+            for (const entry of pendingRelayChatMessages.values()) {
+              entry.nextRetryAt = 0;
+            }
+            void flushPendingRelayChatUploads(true);
             void pullFromBlindRelay();
           }
         }
@@ -667,8 +922,8 @@ export function createRoomPeerEngine(
         return;
       }
       ensureSignalingListeners();
-      enqueueInitialRelayChatUploads();
       started = true;
+      relaySyncedDuringStart = false;
 
       if (!signaling.isConnected) {
         try {
@@ -695,7 +950,7 @@ export function createRoomPeerEngine(
         }
       }
 
-      if (relayClient?.enabled) {
+      if (relayClient?.enabled && !relaySyncedDuringStart) {
         void flushPendingRelayChatUploads();
         void pullFromBlindRelay();
       }
@@ -723,9 +978,13 @@ export function createRoomPeerEngine(
         clearInterval(antiEntropyTimer);
         antiEntropyTimer = null;
       }
+      clearRelayRetryTimer();
 
       pendingRelayChatMessages.clear();
-      chatUploadAttempts.clear();
+      reflushRelayChatNeeded = false;
+      reflushRelayChatForce = false;
+      reflushRelayChatIgnoreAge = false;
+      pullRelayAgainRequested = false;
       swarmScheduler.stop();
       meshManager.stop();
       wipeRelayKeys(relayKeys);
@@ -783,6 +1042,10 @@ export function createRoomPeerEngine(
       return chatSync.getMessages();
     },
 
+    getChatDeliveryStates(): ReadonlyMap<string, ChatDeliveryStatus> {
+      return new Map(chatDeliveryStates);
+    },
+
     getFiles(): FileManifest[] {
       return swarmScheduler.getFiles();
     },
@@ -803,13 +1066,139 @@ export function createRoomPeerEngine(
         type: "chat.message",
         message,
       });
-      if (relayClient?.enabled && !uploadedChatMsgIds.has(message.msgId)) {
-        pendingRelayChatMessages.set(message.msgId, message);
-        if (started && !stopped) {
-          void flushPendingRelayChatUploads();
+      if (relayClient?.enabled) {
+        if (!uploadedChatMsgIds.has(message.msgId)) {
+          pendingRelayChatMessages.set(message.msgId, {
+            message,
+            attempts: 0,
+            nextRetryAt: 0,
+          });
+          setChatDeliveryStatus(message.msgId, "pending");
+          if (started && !stopped) {
+            void flushPendingRelayChatUploads();
+          }
         }
+      } else {
+        setChatDeliveryStatus(message.msgId, "p2p_only");
       }
       return message;
+    },
+
+    async retryChatMessage(msgId?: string): Promise<void> {
+      if (stopped || !relayClient?.enabled) {
+        return;
+      }
+      if (activeFlushPromise !== null) {
+        await activeFlushPromise;
+        if (stopped || !relayClient.enabled) {
+          return;
+        }
+      }
+
+      if (msgId !== undefined) {
+        if (uploadedChatMsgIds.has(msgId)) {
+          return;
+        }
+        const existing = pendingRelayChatMessages.get(msgId);
+        if (existing) {
+          existing.attempts = 0;
+          existing.nextRetryAt = 0;
+          setChatDeliveryStatus(msgId, "pending");
+        } else {
+          const found = chatSync.getMessagesByIds([msgId])[0];
+          if (
+            !found ||
+            found.authorCert.payload.userId !== localCert.payload.userId
+          ) {
+            return;
+          }
+          pendingRelayChatMessages.set(msgId, {
+            message: found,
+            attempts: 0,
+            nextRetryAt: 0,
+          });
+          setChatDeliveryStatus(msgId, "pending");
+        }
+        await flushPendingRelayChatUploads(true, true);
+        return;
+      }
+
+      for (const [id, entry] of pendingRelayChatMessages.entries()) {
+        entry.attempts = 0;
+        entry.nextRetryAt = 0;
+        setChatDeliveryStatus(id, "pending");
+      }
+      const failedIds: string[] = [];
+      for (const [id, status] of chatDeliveryStates.entries()) {
+        if (
+          status === "failed" &&
+          !uploadedChatMsgIds.has(id) &&
+          !pendingRelayChatMessages.has(id)
+        ) {
+          failedIds.push(id);
+        }
+      }
+      if (failedIds.length > 0) {
+        for (const msg of chatSync.getMessagesByIds(failedIds)) {
+          if (msg.authorCert.payload.userId === localCert.payload.userId) {
+            pendingRelayChatMessages.set(msg.msgId, {
+              message: msg,
+              attempts: 0,
+              nextRetryAt: 0,
+            });
+            setChatDeliveryStatus(msg.msgId, "pending");
+          }
+        }
+      }
+      if (pendingRelayChatMessages.size > 0) {
+        await flushPendingRelayChatUploads(true, true);
+      }
+    },
+
+    flushPendingRelayKeepalive(): void {
+      if (
+        stopped ||
+        !relayClient?.enabled ||
+        pendingRelayChatMessages.size === 0
+      ) {
+        return;
+      }
+      let dispatched = 0;
+      for (const [msgId, entry] of pendingRelayChatMessages.entries()) {
+        if (dispatched >= MAX_KEEPALIVE_ENVELOPES) {
+          break;
+        }
+        if (uploadedChatMsgIds.has(msgId)) {
+          continue;
+        }
+        try {
+          const blobId = deriveRelayEnvelopeBlobId(
+            relayKeys.relayIdKey,
+            "chat",
+            entry.message.msgId,
+          );
+          const payload = sealRelayEnvelopeBinary(
+            relayKeys.relayKey,
+            relayKeys.relayBoxId,
+            blobId,
+            { type: "relay.chat", message: entry.message },
+          );
+          if (payload.byteLength > MAX_KEEPALIVE_PAYLOAD_BYTES) {
+            continue;
+          }
+          dispatched += 1;
+          void relayClient
+            .putEnvelope({
+              boxId: relayKeys.relayBoxId,
+              blobId,
+              payload,
+              keepalive: true,
+            })
+            .catch(() => {});
+        } catch {
+          // Best-effort synchronous keepalive dispatch during pagehide
+        }
+      }
     },
 
     async shareFile(input: ShareFileInput): Promise<FileManifest> {

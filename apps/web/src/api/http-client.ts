@@ -291,10 +291,11 @@ export class HttpAuthClient {
     return {
       enabled,
       maxFileBytes,
-      putEnvelope: async ({ boxId, blobId, payload }) => {
+      putEnvelope: async ({ boxId, blobId, payload, keepalive }) => {
         const res = await this.requestBinaryPutJson<RelayPutEnvelopeResponse>(
           `/api/v1/relay/${encodeURIComponent(boxId)}/envelopes/${encodeURIComponent(blobId)}`,
           payload,
+          { keepalive },
         );
         if (
           !isRecord(res) ||
@@ -337,6 +338,7 @@ export class HttpAuthClient {
           })),
           nextCursor: res.nextCursor,
           hasMore: res.hasMore,
+          ...(res.cursorReset ? { cursorReset: true } : {}),
         };
       },
       putChunk: async ({ boxId, fileTag, chunkBlobId, payload }) => {
@@ -499,6 +501,7 @@ export class HttpAuthClient {
   private async requestBinaryPutJson<T>(
     path: string,
     payload: Uint8Array,
+    options?: { keepalive?: boolean },
   ): Promise<T> {
     const headers: Record<string, string> = {
       Accept: "application/json",
@@ -516,6 +519,7 @@ export class HttpAuthClient {
       credentials: "include",
       headers,
       body: bodyCopy,
+      ...(options?.keepalive ? { keepalive: true } : {}),
     });
 
     const headerCsrf = response.headers.get("x-csrf-token");

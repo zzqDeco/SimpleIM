@@ -32,6 +32,7 @@ import {
   createRoomPeerEngine,
   SignalingServerError,
   type BlindRelayClientPort,
+  type ChatDeliveryStatus,
   type RoomPeerEngine,
   type RoomPeerEngineEvents,
 } from "../src/index.ts";
@@ -69,6 +70,7 @@ interface TestPeerRig {
   connections: MockPeerConnection[];
   signalingKeyPair: Ed25519KeyPair;
   receivedChat: Array<{ msg: ChatMessageEnvelope; isHistoricalSync: boolean }>;
+  deliveryChanges: Array<{ msgId: string; status: ChatDeliveryStatus }>;
   announcedFiles: FileManifest[];
   completedFiles: FileManifest[];
   progressEvents: SwarmTransferProgress[];
@@ -95,6 +97,8 @@ function createTestPeerRig(params: {
   relayClient?: BlindRelayClientPort;
   initialMessages?: readonly ChatMessageEnvelope[];
   initialFiles?: readonly FileManifest[];
+  initialPendingRelayMsgIds?: readonly string[];
+  initialRelayCursor?: number;
   signalingOptions?: ConstructorParameters<typeof MockSignalingClient>[2];
   transportConfig?: (p: {
     localPeerId: string;
@@ -130,6 +134,8 @@ function createTestPeerRig(params: {
     msg: ChatMessageEnvelope;
     isHistoricalSync: boolean;
   }> = [];
+  const deliveryChanges: Array<{ msgId: string; status: ChatDeliveryStatus }> =
+    [];
   const announcedFiles: FileManifest[] = [];
   const completedFiles: FileManifest[] = [];
   const progressEvents: SwarmTransferProgress[] = [];
@@ -149,6 +155,8 @@ function createTestPeerRig(params: {
     relayClient: params.relayClient,
     initialMessages: params.initialMessages,
     initialFiles: params.initialFiles,
+    initialPendingRelayMsgIds: params.initialPendingRelayMsgIds,
+    initialRelayCursor: params.initialRelayCursor,
     maxInFlightPerPeer: params.maxInFlightPerPeer,
     requestTimeoutMs: params.requestTimeoutMs,
     helloAuthTimeoutMs: params.helloAuthTimeoutMs,
@@ -177,6 +185,15 @@ function createTestPeerRig(params: {
         receivedChat.push({ msg, isHistoricalSync });
         params.extraEvents?.onChatMessage?.(msg, isHistoricalSync);
       },
+      onChatDeliveryChange: (msgId, status) => {
+        deliveryChanges.push({ msgId, status });
+        params.extraEvents?.onChatDeliveryChange?.(msgId, status);
+      },
+      ...(params.extraEvents?.onRelayBatchPulled
+        ? {
+            onRelayBatchPulled: params.extraEvents.onRelayBatchPulled,
+          }
+        : {}),
       onFileAnnounced: (manifest) => {
         announcedFiles.push(manifest);
         params.extraEvents?.onFileAnnounced?.(manifest);
@@ -204,6 +221,7 @@ function createTestPeerRig(params: {
     connections: createdConnections,
     signalingKeyPair: peerKeyPair,
     receivedChat,
+    deliveryChanges,
     announcedFiles,
     completedFiles,
     progressEvents,
@@ -3221,6 +3239,665 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
         ).toBeUndefined();
       } finally {
         await bob.engine.stop();
+      }
+    }
+  });
+
+  test("14. Issue #29 Relay Reliability: persistent outbox exponential backoff & status transitions, keepalive flush, and atomic onRelayBatchPulled + cursorReset", async () => {
+    const ca = createTestServerCA();
+
+    // 14a. Persistent Outbox + Delivery Status transitions (>5 failures, manual retryChatMessage,
+    // WebSocket reconnect immediate flush, 24h max-age cutoff, initialPendingRelayMsgIds, p2p_only, and fast retryTimer)
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+      const relayHub = new MockBlindRelayHub();
+      const roomKeys = deriveRoomKeys(
+        "issue29-persistent-outbox-and-backoff",
+        FAST_KDF,
+      );
+      const inspectRelayKeys = deriveRelayKeys(roomKeys.roomAppKey);
+
+      let fakeNow = 1_765_000_000_000;
+      const aliceRelay = relayHub.createClient();
+      aliceRelay.failNextEnvelopePuts(6);
+
+      const alice = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01alice_outbox",
+        username: "alice",
+        relayClient: aliceRelay,
+        syncIntervalMs: 25,
+        certNowMs: fakeNow - 5_000,
+        certTtlMs: 48 * 3_600_000,
+        now: () => fakeNow,
+      });
+
+      let msg1!: ChatMessageEnvelope;
+      let msg2!: ChatMessageEnvelope;
+      let msgAged!: ChatMessageEnvelope;
+
+      try {
+        await alice.engine.start();
+
+        // Send msg1 while relay fails 6 consecutive times (exceeding old 5-attempt cap!)
+        msg1 = await alice.engine.sendChatMessage(
+          "Must survive 6 transient failures without being dropped",
+        );
+        expect(alice.engine.getChatDeliveryStates().get(msg1.msgId)).toBe(
+          "pending",
+        );
+
+        // Attempt 1 fails immediately (backoff = 1s), status stays "pending"
+        await waitFor(() => aliceRelay.putEnvelopeCalls === 1);
+        expect(alice.engine.getChatDeliveryStates().get(msg1.msgId)).toBe(
+          "pending",
+        );
+
+        // Attempt 2 fails after 1s (backoff = 2s), status stays "pending"
+        fakeNow += 1_000;
+        await waitFor(() => aliceRelay.putEnvelopeCalls === 2);
+        expect(alice.engine.getChatDeliveryStates().get(msg1.msgId)).toBe(
+          "pending",
+        );
+
+        // Attempt 3 fails after 2s (backoff = 4s) -> surfaces "failed"
+        fakeNow += 2_000;
+        await waitFor(
+          () =>
+            aliceRelay.putEnvelopeCalls === 3 &&
+            alice.engine.getChatDeliveryStates().get(msg1.msgId) === "failed",
+        );
+
+        // Attempts 4, 5, 6 continue with exponential backoff (4s, 8s, 16s) without dropping!
+        fakeNow += 4_000;
+        await waitFor(() => aliceRelay.putEnvelopeCalls === 4);
+        fakeNow += 8_000;
+        await waitFor(() => aliceRelay.putEnvelopeCalls === 5);
+        fakeNow += 16_000;
+        await waitFor(() => aliceRelay.putEnvelopeCalls === 6);
+
+        expect(alice.engine.getChatDeliveryStates().get(msg1.msgId)).toBe(
+          "failed",
+        );
+        expect(
+          alice.deliveryChanges
+            .filter((e) => e.msgId === msg1.msgId)
+            .map((e) => e.status),
+        ).toEqual(["pending", "failed"]);
+        expect(
+          relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId),
+        ).toBe(0);
+
+        // Manual retryChatMessage(msgId) succeeds immediately (even though nextRetryAt is +32s away!)
+        await alice.engine.retryChatMessage(msg1.msgId);
+        expect(alice.engine.getChatDeliveryStates().get(msg1.msgId)).toBe(
+          "relayed",
+        );
+        expect(aliceRelay.putEnvelopeCalls).toBe(7);
+        expect(
+          alice.deliveryChanges
+            .filter((e) => e.msgId === msg1.msgId)
+            .map((e) => e.status),
+        ).toEqual(["pending", "failed", "pending", "relayed"]);
+        expect(
+          relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId),
+        ).toBe(1);
+
+        // Verify WebSocket reconnect immediately resets backoff and flushes failed outbox entries!
+        aliceRelay.failNextEnvelopePuts(3);
+        msg2 = await alice.engine.sendChatMessage(
+          "Healed immediately on WebSocket reconnect",
+        );
+        await waitFor(() => aliceRelay.putEnvelopeCalls === 8);
+        fakeNow += 1_000;
+        await waitFor(() => aliceRelay.putEnvelopeCalls === 9);
+        fakeNow += 2_000;
+        await waitFor(
+          () =>
+            aliceRelay.putEnvelopeCalls === 10 &&
+            alice.engine.getChatDeliveryStates().get(msg2.msgId) === "failed",
+        );
+
+        // Do NOT advance fakeNow — nextRetryAt is still +4s in the future!
+        hub.shutdownCenterServer();
+        hub.restartCenterServer();
+        await alice.signaling.connect();
+
+        await waitFor(
+          () =>
+            alice.engine.getChatDeliveryStates().get(msg2.msgId) === "relayed",
+        );
+        expect(
+          relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId),
+        ).toBe(2);
+
+        // Verify >24h max-age stops automatic retries and marks "failed", while explicit retryChatMessage still works
+        const callsBeforeAge = aliceRelay.putEnvelopeCalls;
+        aliceRelay.failNextEnvelopePuts(1);
+        msgAged = await alice.engine.sendChatMessage(
+          "Aged past 24h automatic retry window",
+        );
+        await waitFor(() => aliceRelay.putEnvelopeCalls === callsBeforeAge + 1);
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        expect(alice.engine.getChatDeliveryStates().get(msgAged.msgId)).toBe(
+          "pending",
+        );
+
+        const callsAfterFirstFail = aliceRelay.putEnvelopeCalls;
+        fakeNow += 25 * 60 * 60 * 1000;
+        await waitFor(
+          () =>
+            alice.engine.getChatDeliveryStates().get(msgAged.msgId) ===
+            "failed",
+        );
+        // Auto-flush marked it failed due to age without issuing another putEnvelope call
+        expect(aliceRelay.putEnvelopeCalls).toBe(callsAfterFirstFail);
+
+        // Explicit user retryChatMessage still re-enqueues and delivers it!
+        await alice.engine.retryChatMessage(msgAged.msgId);
+        expect(alice.engine.getChatDeliveryStates().get(msgAged.msgId)).toBe(
+          "relayed",
+        );
+        expect(
+          relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId),
+        ).toBe(3);
+      } finally {
+        await alice.engine.stop();
+      }
+
+      // Verify initialPendingRelayMsgIds retries ONLY unconfirmed messages and marks others "relayed"
+      const alice2KeyPair = generateEd25519KeyPair();
+      const alice2Cert = issuePeerIdentityCert({
+        serverKeyId: ca.serverKeyId,
+        serverSignPrivKey: ca.keyPair.privateKeyBytes,
+        userId: msg1.authorCert.payload.userId,
+        username: "alice",
+        displayName: "ALICE",
+        peerId: "peer_02alice_reload",
+        peerSignPubKey: alice2KeyPair.publicKeyBase64Url,
+        clientKind: "web",
+        nowMs: Date.now() - 5_000,
+        ttlMs: 3_600_000,
+      });
+      const unsentMsg = signChatMessage({
+        roomId: roomKeys.roomId,
+        lamport: 10,
+        body: "Unsent local message recovered from persistent outbox",
+        authorCert: alice2Cert,
+        peerSignPrivKey: alice2KeyPair.privateKeyBytes,
+      });
+
+      const alice2Relay = relayHub.createClient();
+      const alice2DeliveryChanges: Array<{
+        msgId: string;
+        status: ChatDeliveryStatus;
+      }> = [];
+      const alice2Engine = createRoomPeerEngine({
+        localPeerId: "peer_02alice_reload",
+        localCert: alice2Cert,
+        localSignKeyPair: alice2KeyPair,
+        serverSignPubKey: ca.keyPair.publicKeyBase64Url,
+        roomKeys,
+        iceServers: [],
+        signaling: hub.createClient("peer_02alice_reload"),
+        transportFactory: network.createFactory().factory,
+        chunkStorage: new InMemoryChunkStorage(),
+        relayClient: alice2Relay,
+        initialMessages: [msg1, msg2, msgAged, unsentMsg],
+        initialPendingRelayMsgIds: [unsentMsg.msgId],
+        syncIntervalMs: 0,
+        events: {
+          onChatDeliveryChange: (msgId, status) => {
+            alice2DeliveryChanges.push({ msgId, status });
+          },
+        },
+      });
+
+      try {
+        const preStartStates = alice2Engine.getChatDeliveryStates();
+        expect(preStartStates.get(msg1.msgId)).toBe("relayed");
+        expect(preStartStates.get(msg2.msgId)).toBe("relayed");
+        expect(preStartStates.get(msgAged.msgId)).toBe("relayed");
+        expect(preStartStates.get(unsentMsg.msgId)).toBe("pending");
+
+        await alice2Engine.start();
+        await waitFor(
+          () =>
+            alice2Engine.getChatDeliveryStates().get(unsentMsg.msgId) ===
+            "relayed",
+        );
+        expect(alice2Relay.putEnvelopeCalls).toBe(1);
+        expect(alice2DeliveryChanges).toEqual([
+          { msgId: unsentMsg.msgId, status: "relayed" },
+        ]);
+        expect(
+          relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId),
+        ).toBe(4);
+      } finally {
+        await alice2Engine.stop();
+      }
+
+      // Verify p2p_only status when relay is unavailable/disabled
+      const p2pOnlyRig = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_03p2ponly_01",
+        username: "dave",
+        syncIntervalMs: 0,
+      });
+      try {
+        await p2pOnlyRig.engine.start();
+        const p2pMsg = await p2pOnlyRig.engine.sendChatMessage("P2P only note");
+        expect(p2pOnlyRig.engine.getChatDeliveryStates().get(p2pMsg.msgId)).toBe(
+          "p2p_only",
+        );
+        expect(p2pOnlyRig.deliveryChanges).toEqual([
+          { msgId: p2pMsg.msgId, status: "p2p_only" },
+        ]);
+      } finally {
+        await p2pOnlyRig.engine.stop();
+      }
+
+      // Verify scheduled retryTimer retries in ~1s even when anti-entropy syncIntervalMs is 60s
+      const fastRetryRelay = relayHub.createClient();
+      fastRetryRelay.failNextEnvelopePuts(1);
+      const fastRetryRig = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_04fastretry1",
+        username: "erin",
+        relayClient: fastRetryRelay,
+        syncIntervalMs: 60_000,
+      });
+      try {
+        await fastRetryRig.engine.start();
+        const fastMsg = await fastRetryRig.engine.sendChatMessage(
+          "Retried via 1s backoff timer before 60s anti-entropy",
+        );
+        await waitFor(() => fastRetryRelay.putEnvelopeCalls === 1);
+        expect(
+          fastRetryRig.engine.getChatDeliveryStates().get(fastMsg.msgId),
+        ).toBe("pending");
+        await waitFor(
+          () =>
+            fastRetryRig.engine.getChatDeliveryStates().get(fastMsg.msgId) ===
+            "relayed",
+          2_500,
+        );
+        expect(fastRetryRelay.putEnvelopeCalls).toBe(2);
+      } finally {
+        await fastRetryRig.engine.stop();
+      }
+    }
+
+    // 14b. flushPendingRelayKeepalive() synchronously dispatches keepalive PUT before stop()
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+      const relayHub = new MockBlindRelayHub();
+      const roomKeys = deriveRoomKeys(
+        "issue29-keepalive-pagehide-flush",
+        FAST_KDF,
+      );
+      const inspectRelayKeys = deriveRelayKeys(roomKeys.roomAppKey);
+
+      const aliceRelay = relayHub.createClient();
+      aliceRelay.failNextEnvelopePuts(1);
+
+      const alice = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01alice_keep",
+        username: "alice",
+        relayClient: aliceRelay,
+        syncIntervalMs: 60_000,
+      });
+
+      let keepaliveMsg!: ChatMessageEnvelope;
+      try {
+        await alice.engine.start();
+        keepaliveMsg = await alice.engine.sendChatMessage(
+          "Last-second message flushed on pagehide via keepalive",
+        );
+        await waitFor(() => aliceRelay.putEnvelopeCalls === 1);
+        expect(
+          relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId),
+        ).toBe(0);
+        expect(aliceRelay.keepalivePutCount).toBe(0);
+
+        // Must execute synchronously BEFORE stop() wipes relayKeys!
+        alice.engine.flushPendingRelayKeepalive();
+        expect(aliceRelay.keepalivePutCount).toBe(1);
+      } finally {
+        await alice.engine.stop();
+      }
+
+      // Calling flushPendingRelayKeepalive after stop() is a safe no-op
+      alice.engine.flushPendingRelayKeepalive();
+      expect(aliceRelay.keepalivePutCount).toBe(1);
+
+      await waitFor(
+        () => relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId) === 1,
+      );
+
+      // Late-joining Bob pulls and decrypts the keepalive-uploaded message cleanly
+      const bob = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02bob_keep01",
+        username: "bob",
+        relayClient: relayHub.createClient(),
+        syncIntervalMs: 0,
+      });
+      try {
+        await bob.engine.start();
+        await waitFor(() => bob.engine.getMessages().length === 1);
+        expect(bob.engine.getMessages()[0]?.msgId).toBe(keepaliveMsg.msgId);
+        expect(bob.engine.getMessages()[0]?.body).toBe(
+          "Last-second message flushed on pagehide via keepalive",
+        );
+      } finally {
+        await bob.engine.stop();
+      }
+    }
+
+    // 14c. Atomic onRelayBatchPulled + relayCursor binding and cursorReset: true recovery
+    {
+      const hub = new MockSignalingHub();
+      const network = new MockPeerTransportNetwork();
+      const relayHub = new MockBlindRelayHub();
+      const roomKeys = deriveRoomKeys(
+        "issue29-atomic-batch-and-cursor-reset",
+        FAST_KDF,
+      );
+      const inspectRelayKeys = deriveRelayKeys(roomKeys.roomAppKey);
+
+      const alice = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_01alice_atom",
+        username: "alice",
+        relayClient: relayHub.createClient(),
+        syncIntervalMs: 0,
+      });
+
+      const fileBytes = makeDeterministicPayload(SWARM_CHUNK_SIZE + 512);
+      let msgA!: ChatMessageEnvelope;
+      let msgB!: ChatMessageEnvelope;
+      let fileA!: FileManifest;
+
+      try {
+        await alice.engine.start();
+        msgA = await alice.engine.sendChatMessage("Atomic batch message #1");
+        msgB = await alice.engine.sendChatMessage("Atomic batch message #2");
+        fileA = await alice.engine.shareFile({
+          fileName: "atomic-spec.bin",
+          fileSize: fileBytes.byteLength,
+          readChunk: makeSliceReader(fileBytes),
+        });
+        await waitFor(
+          () =>
+            alice.engine.getTransferProgress(fileA.fileId)?.relayCacheState ===
+              "cached" &&
+            relayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId) === 3,
+        );
+      } finally {
+        await alice.engine.stop();
+      }
+
+      let failFirstBatch = true;
+      let batchCallbackAttempts = 0;
+      const recordedBatches: Array<{
+        msgIds: string[];
+        fileIds: string[];
+        nextCursor: number;
+        cursorReset: boolean;
+      }> = [];
+
+      const bobRelay = relayHub.createClient();
+      const bob = createTestPeerRig({
+        ca,
+        hub,
+        network,
+        roomKeys,
+        peerId: "peer_02bob_atomic",
+        username: "bob",
+        relayClient: bobRelay,
+        syncIntervalMs: 0,
+        extraEvents: {
+          onRelayBatchPulled: async (batch) => {
+            batchCallbackAttempts += 1;
+            recordedBatches.push({
+              msgIds: batch.messages.map((m) => m.msgId),
+              fileIds: batch.files.map((f) => f.fileId),
+              nextCursor: batch.nextCursor,
+              cursorReset: batch.cursorReset,
+            });
+            if (failFirstBatch) {
+              failFirstBatch = false;
+              throw new Error("Simulated IndexedDB transaction failure");
+            }
+          },
+        },
+      });
+
+      try {
+        await bob.engine.start();
+        await waitFor(() => batchCallbackAttempts === 1);
+        // Allow outer pull catch/finally to settle
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+        // Failed persistence MUST NOT commit messages/files or advance relayCursor!
+        expect(bob.engine.getMessages()).toHaveLength(0);
+        expect(bob.engine.getFiles()).toHaveLength(0);
+        expect(bob.receivedChat).toHaveLength(0);
+        expect(bob.announcedFiles).toHaveLength(0);
+        expect(bobRelay.recordedListAfterSeqs).toEqual([0]);
+
+        // Reconnect triggers Pull #2 -> succeeds, commits exact batch, and advances cursor to 3!
+        hub.shutdownCenterServer();
+        hub.restartCenterServer();
+        await bob.signaling.connect();
+
+        await waitFor(
+          () =>
+            bob.engine.getMessages().length === 2 &&
+            bob.engine.getFiles().length === 1,
+        );
+        expect(bobRelay.recordedListAfterSeqs).toEqual([0, 0]);
+        expect(recordedBatches[1]).toEqual({
+          msgIds: [msgA.msgId, msgB.msgId],
+          fileIds: [fileA.fileId],
+          nextCursor: 3,
+          cursorReset: false,
+        });
+        expect(bob.engine.getMessages().map((m) => m.msgId)).toEqual([
+          msgA.msgId,
+          msgB.msgId,
+        ]);
+        expect(bob.engine.getFiles().map((f) => f.fileId)).toEqual([
+          fileA.fileId,
+        ]);
+
+        // Pull #3 uses the advanced cursor (3)!
+        hub.shutdownCenterServer();
+        hub.restartCenterServer();
+        await bob.signaling.connect();
+        await waitFor(() => bobRelay.listEnvelopeCalls === 3);
+        expect(bobRelay.recordedListAfterSeqs).toEqual([0, 0, 3]);
+      } finally {
+        await bob.engine.stop();
+      }
+
+      // cursorReset: true recovery when initialRelayCursor (50) is ahead of a reset server (highestSeq = 2)
+      const resetAliceHub = new MockSignalingHub();
+      const resetCarolHub = new MockSignalingHub();
+      const resetNet = new MockPeerTransportNetwork();
+      const resetRelayHub = new MockBlindRelayHub();
+
+      const aliceReset = createTestPeerRig({
+        ca,
+        hub: resetAliceHub,
+        network: resetNet,
+        roomKeys,
+        peerId: "peer_01alice_rst1",
+        username: "alice",
+        relayClient: resetRelayHub.createClient(),
+        syncIntervalMs: 0,
+      });
+
+      let resetMsg1!: ChatMessageEnvelope;
+      let resetMsg2!: ChatMessageEnvelope;
+      let resetMsg3!: ChatMessageEnvelope;
+
+      await aliceReset.engine.start();
+      resetMsg1 = await aliceReset.engine.sendChatMessage(
+        "Post-restart message #1",
+      );
+      resetMsg2 = await aliceReset.engine.sendChatMessage(
+        "Post-restart message #2",
+      );
+      await waitFor(
+        () =>
+          resetRelayHub.getStoredEnvelopeCount(inspectRelayKeys.relayBoxId) ===
+          2,
+      );
+
+      const carolRelay = resetRelayHub.createClient();
+      const carolBatches: Array<{
+        msgIds: string[];
+        nextCursor: number;
+        cursorReset: boolean;
+      }> = [];
+      const carol = createTestPeerRig({
+        ca,
+        hub: resetCarolHub,
+        network: resetNet,
+        roomKeys,
+        peerId: "peer_03carol_rst1",
+        username: "carol",
+        relayClient: carolRelay,
+        initialRelayCursor: 50,
+        syncIntervalMs: 0,
+        extraEvents: {
+          onRelayBatchPulled: (batch) => {
+            carolBatches.push({
+              msgIds: batch.messages.map((m) => m.msgId),
+              nextCursor: batch.nextCursor,
+              cursorReset: batch.cursorReset,
+            });
+          },
+        },
+      });
+
+      try {
+        await carol.engine.start();
+        await waitFor(() => carol.engine.getMessages().length === 2);
+
+        expect(carol.engine.getVerifiedPeers()).toHaveLength(0);
+        expect(carolRelay.recordedListAfterSeqs[0]).toBe(50);
+        expect(carolBatches[0]).toEqual({
+          msgIds: [resetMsg1.msgId, resetMsg2.msgId],
+          nextCursor: 2,
+          cursorReset: true,
+        });
+
+        // Alice uploads a 3rd message (seq 3); Carol polls strictly via blind relay from cursor 2 (not 50!)
+        resetMsg3 = await aliceReset.engine.sendChatMessage(
+          "Post-restart message #3",
+        );
+        await waitFor(
+          () =>
+            resetRelayHub.getStoredEnvelopeCount(
+              inspectRelayKeys.relayBoxId,
+            ) === 3,
+        );
+        await aliceReset.engine.stop();
+
+        resetCarolHub.shutdownCenterServer();
+        resetCarolHub.restartCenterServer();
+        await carol.signaling.connect();
+
+        await waitFor(() => carolBatches.length === 2);
+        expect(carolRelay.recordedListAfterSeqs).toEqual([50, 2]);
+        expect(carolBatches[1]).toEqual({
+          msgIds: [resetMsg3.msgId],
+          nextCursor: 3,
+          cursorReset: false,
+        });
+        expect(carol.engine.getMessages().map((m) => m.msgId)).toEqual([
+          resetMsg1.msgId,
+          resetMsg2.msgId,
+          resetMsg3.msgId,
+        ]);
+      } finally {
+        await aliceReset.engine.stop();
+        await carol.engine.stop();
+      }
+
+      // Empty-box cursorReset: true resets persisted cursor from 25 -> 0
+      const emptyHub = new MockSignalingHub();
+      const emptyNet = new MockPeerTransportNetwork();
+      const emptyRelayHub = new MockBlindRelayHub();
+      const daveRelay = emptyRelayHub.createClient();
+      const daveBatches: Array<{
+        msgCount: number;
+        fileCount: number;
+        nextCursor: number;
+        cursorReset: boolean;
+      }> = [];
+      const dave = createTestPeerRig({
+        ca,
+        hub: emptyHub,
+        network: emptyNet,
+        roomKeys,
+        peerId: "peer_04dave_empty",
+        username: "dave",
+        relayClient: daveRelay,
+        initialRelayCursor: 25,
+        syncIntervalMs: 0,
+        extraEvents: {
+          onRelayBatchPulled: (batch) => {
+            daveBatches.push({
+              msgCount: batch.messages.length,
+              fileCount: batch.files.length,
+              nextCursor: batch.nextCursor,
+              cursorReset: batch.cursorReset,
+            });
+          },
+        },
+      });
+      try {
+        await dave.engine.start();
+        await waitFor(() => daveBatches.length === 1);
+        expect(daveBatches[0]).toEqual({
+          msgCount: 0,
+          fileCount: 0,
+          nextCursor: 0,
+          cursorReset: true,
+        });
+
+        emptyHub.shutdownCenterServer();
+        emptyHub.restartCenterServer();
+        await dave.signaling.connect();
+        await waitFor(() => daveRelay.listEnvelopeCalls === 2);
+        expect(daveRelay.recordedListAfterSeqs).toEqual([25, 0]);
+      } finally {
+        await dave.engine.stop();
       }
     }
   });

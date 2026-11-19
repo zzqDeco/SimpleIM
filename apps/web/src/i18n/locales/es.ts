@@ -81,6 +81,10 @@ export const es = {
   "room.send": "Enviar",
   "room.shortcutSend": "Enter enviar",
   "room.shortcutNewline": "Shift+Enter nueva línea",
+  "room.msg.delivery.pending": "Enviando…",
+  "room.msg.delivery.relayed": "✓ En caché",
+  "room.msg.delivery.p2pOnly": "P2P",
+  "room.msg.delivery.failed": "Reintentar",
 
   "room.sidebarAria": "Miembros y archivos compartidos",
   "room.peers.heading": "Miembros",

@@ -439,6 +439,7 @@ export class CliApiClient {
           })),
           nextCursor: res.nextCursor,
           hasMore: res.hasMore,
+          ...(res.cursorReset ? { cursorReset: true } : {}),
         };
       },
       putChunk: async ({ boxId, fileTag, chunkBlobId, payload }) => {

@@ -81,6 +81,10 @@ export const zhTW = {
   "room.send": "傳送",
   "room.shortcutSend": "Enter 傳送",
   "room.shortcutNewline": "Shift+Enter 換行",
+  "room.msg.delivery.pending": "傳送中…",
+  "room.msg.delivery.relayed": "✓ 已暫存",
+  "room.msg.delivery.p2pOnly": "P2P",
+  "room.msg.delivery.failed": "待重試",
 
   "room.sidebarAria": "房間成員與共享檔案",
   "room.peers.heading": "在線成員",

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, type ReactElement } from "react";
 import type { ChatMessageEnvelope } from "@simpleim/contracts";
+import type { ChatDeliveryStatus } from "@simpleim/peer-core";
 import { Byline, StatusIcon, Subline } from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import { deriveMessageViewModel } from "../../state/message-vm.ts";
@@ -7,16 +8,20 @@ import { SafeMarkdown } from "../../utils/markdown.tsx";
 
 export interface MessageTranscriptProps {
   readonly messages: readonly ChatMessageEnvelope[];
+  readonly deliveryStates?: ReadonlyMap<string, ChatDeliveryStatus>;
   readonly localPeerId: string;
   readonly currentUserId: string;
   readonly onReply: (msg: ChatMessageEnvelope) => void;
+  readonly onRetryMessage?: (msgId: string) => void;
 }
 
 export function MessageTranscript({
   messages,
+  deliveryStates,
   localPeerId,
   currentUserId,
   onReply,
+  onRetryMessage,
 }: MessageTranscriptProps): ReactElement {
   const { t } = useI18n();
   const streamEndRef = useRef<HTMLDivElement | null>(null);
@@ -27,9 +32,15 @@ export function MessageTranscript({
       byId.set(msg.msgId, msg);
     }
     return messages.map((msg) =>
-      deriveMessageViewModel(msg, localPeerId, byId, currentUserId),
+      deriveMessageViewModel(
+        msg,
+        localPeerId,
+        byId,
+        currentUserId,
+        deliveryStates,
+      ),
     );
-  }, [currentUserId, localPeerId, messages]);
+  }, [currentUserId, deliveryStates, localPeerId, messages]);
 
   useEffect(() => {
     streamEndRef.current?.scrollIntoView({ block: "end" });
@@ -49,6 +60,7 @@ export function MessageTranscript({
           <article
             key={vm.msgId}
             className={`msg-entry ${vm.isSelf ? "msg-entry-self" : "msg-entry-peer"}`}
+            data-delivery-status={vm.deliveryStatus ?? undefined}
           >
             <div className="msg-header">
               <div className="msg-author-line">
@@ -77,6 +89,25 @@ export function MessageTranscript({
               </div>
 
               <div className="msg-tools">
+                {vm.isSelf && vm.deliveryLabelKey ? (
+                  vm.deliveryStatus === "failed" && onRetryMessage ? (
+                    <button
+                      type="button"
+                      className="msg-delivery-tag msg-delivery-failed"
+                      data-testid="msg-retry-button"
+                      onClick={() => onRetryMessage(vm.msgId)}
+                    >
+                      {t(vm.deliveryLabelKey)}
+                    </button>
+                  ) : (
+                    <span
+                      className={`msg-delivery-tag msg-delivery-${vm.deliveryStatus}`}
+                      data-testid="msg-delivery-status"
+                    >
+                      {t(vm.deliveryLabelKey)}
+                    </span>
+                  )
+                ) : null}
                 <time dateTime={vm.createdAtIso}>{vm.formattedTime}</time>
                 <button
                   type="button"

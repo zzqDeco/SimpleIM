@@ -15,6 +15,7 @@ import {
 } from "@simpleim/crypto";
 import {
   createRoomPeerEngine,
+  type ChatDeliveryStatus,
   type RoomPeerEngine,
   type SwarmTransferProgress,
   type VerifiedPeerInfo,
@@ -63,6 +64,11 @@ interface ManagedRoomRecord {
   messages: ChatMessageEnvelope[];
   files: FileManifest[];
   transfers: Map<string, SwarmTransferProgress>;
+  deliveryStates: Map<string, ChatDeliveryStatus>;
+  pendingRelayMsgIds: Set<string>;
+  relayCursor: number;
+  persistedRelayBatchMsgIds: Set<string>;
+  persistedRelayBatchFileIds: Set<string>;
   peers: VerifiedPeerInfo[];
   centerConnected: boolean;
   activeRuntime: ActiveRoomEngineInstance | null;
@@ -159,6 +165,7 @@ export interface RoomSessionController {
   readonly centerConnected: boolean;
   readonly peers: readonly VerifiedPeerInfo[];
   readonly messages: readonly ChatMessageEnvelope[];
+  readonly deliveryStates: ReadonlyMap<string, ChatDeliveryStatus>;
   readonly files: readonly FileManifest[];
   readonly transfers: ReadonlyMap<string, SwarmTransferProgress>;
   readonly securityEvent: SecurityEvent | null;
@@ -177,6 +184,7 @@ export interface RoomSessionController {
     body: string,
     replyToMsgId: string | null,
   ) => Promise<void>;
+  readonly retryChatMessage: (msgId: string) => Promise<void>;
   readonly shareFiles: (selectedFiles: File[]) => Promise<void>;
   readonly downloadFile: (fileId: string) => Promise<void>;
   readonly cancelDownload: (fileId: string) => Promise<void>;
@@ -194,6 +202,7 @@ interface UiWorkspaceSnapshot {
   readonly centerConnected: boolean;
   readonly peers: readonly VerifiedPeerInfo[];
   readonly messages: readonly ChatMessageEnvelope[];
+  readonly deliveryStates: ReadonlyMap<string, ChatDeliveryStatus>;
   readonly files: readonly FileManifest[];
   readonly transfers: ReadonlyMap<string, SwarmTransferProgress>;
 }
@@ -208,6 +217,7 @@ const EMPTY_UI_SNAPSHOT: UiWorkspaceSnapshot = {
   centerConnected: false,
   peers: [],
   messages: [],
+  deliveryStates: new Map(),
   files: [],
   transfers: new Map(),
 };
@@ -332,6 +342,7 @@ export function useRoomSession({
       centerConnected: selectedEntry.centerConnected,
       peers: [...selectedEntry.peers],
       messages: [...selectedEntry.messages],
+      deliveryStates: new Map(selectedEntry.deliveryStates),
       files: [...selectedEntry.files],
       transfers: new Map(selectedEntry.transfers),
     });
@@ -530,6 +541,8 @@ export function useRoomSession({
             maxSignalPayloadBytes: identity.meta.limits.maxSignalPayloadBytes,
             initialMessages: entry.messages,
             initialFiles: entry.files,
+            initialPendingRelayMsgIds: Array.from(entry.pendingRelayMsgIds),
+            initialRelayCursor: entry.relayCursor,
             signaling: signalingPort,
             transportFactory,
             chunkStorage,
@@ -580,10 +593,105 @@ export function useRoomSession({
                   );
                 }
               },
+              onChatDeliveryChange: (msgId, status) => {
+                if (!isEntryLive(expectedGen, roomId, entry)) {
+                  return;
+                }
+                entry.deliveryStates.set(msgId, status);
+                if (status === "relayed") {
+                  if (entry.pendingRelayMsgIds.delete(msgId)) {
+                    void vault
+                      .commitRoomState({
+                        userId: currentUser.id,
+                        metadata: entry.metadata,
+                        roomKeys: entry.roomKeys,
+                        removePendingRelayMsgIds: [msgId],
+                      })
+                      .catch(() => {});
+                  }
+                } else if (status === "pending" || status === "failed") {
+                  entry.pendingRelayMsgIds.add(msgId);
+                }
+                publishSnapshot(currentUser.id);
+              },
+              onRelayBatchPulled: async (batch) => {
+                if (!isEntryLive(expectedGen, roomId, entry)) {
+                  return;
+                }
+                const nextMessages =
+                  batch.messages.length > 0
+                    ? mergeOrderedMessages(entry.messages, batch.messages)
+                    : entry.messages;
+                const nextFiles =
+                  batch.files.length > 0
+                    ? mergeOrderedFiles(entry.files, batch.files)
+                    : entry.files;
+
+                let latestMsgTs = entry.metadata.lastActiveAt;
+                for (const m of batch.messages) {
+                  if (m.createdAt > latestMsgTs) {
+                    latestMsgTs = m.createdAt;
+                  }
+                }
+                const isSelected = selectedRoomIdRef.current === roomId;
+                const nextMetadata: VaultRoomMetadata = {
+                  ...entry.metadata,
+                  lastActiveAt: latestMsgTs,
+                  lastReadAt:
+                    isSelected && batch.messages.length > 0
+                      ? Math.max(
+                          entry.metadata.lastReadAt,
+                          latestMsgTs,
+                          Date.now(),
+                        )
+                      : entry.metadata.lastReadAt,
+                };
+
+                const committed = await vault.commitRoomState({
+                  userId: currentUser.id,
+                  metadata: nextMetadata,
+                  roomKeys: entry.roomKeys,
+                  ...(batch.messages.length > 0
+                    ? { messages: nextMessages }
+                    : {}),
+                  ...(batch.files.length > 0 ? { files: nextFiles } : {}),
+                  ...(batch.messages.length > 0
+                    ? {
+                        removePendingRelayMsgIds: batch.messages.map(
+                          (m) => m.msgId,
+                        ),
+                      }
+                    : {}),
+                  relayCursor: batch.nextCursor,
+                  cursorReset: batch.cursorReset,
+                });
+
+                if (!isEntryLive(expectedGen, roomId, entry)) {
+                  return;
+                }
+                entry.metadata = committed.metadata;
+                if (committed.messages) {
+                  entry.messages = committed.messages;
+                }
+                if (committed.files) {
+                  entry.files = committed.files;
+                }
+                entry.pendingRelayMsgIds = new Set(committed.pendingRelayMsgIds);
+                entry.relayCursor = committed.relayCursor;
+                for (const m of batch.messages) {
+                  entry.persistedRelayBatchMsgIds.add(m.msgId);
+                }
+                for (const f of batch.files) {
+                  entry.persistedRelayBatchFileIds.add(f.fileId);
+                }
+                publishSnapshot(currentUser.id);
+              },
               onChatMessage: (msg) => {
                 if (!isEntryLive(expectedGen, roomId, entry) || !activeEngine) {
                   return;
                 }
+                const alreadyCommittedByRelay =
+                  entry.persistedRelayBatchMsgIds.delete(msg.msgId);
                 entry.messages = mergeOrderedMessages(entry.messages, [
                   ...activeEngine.getMessages(),
                   msg,
@@ -604,18 +712,24 @@ export function useRoomSession({
                       )
                     : entry.metadata.lastReadAt,
                 };
-                void vault
-                  .saveRoomMessages(currentUser.id, roomId, entry.messages)
-                  .catch(() => {});
-                void vault
-                  .saveRoom(currentUser.id, entry.metadata, entry.roomKeys)
-                  .catch(() => {});
+                if (!alreadyCommittedByRelay) {
+                  void vault
+                    .commitRoomState({
+                      userId: currentUser.id,
+                      metadata: entry.metadata,
+                      roomKeys: entry.roomKeys,
+                      messages: entry.messages,
+                    })
+                    .catch(() => {});
+                }
                 publishSnapshot(currentUser.id);
               },
               onFileAnnounced: (manifest) => {
                 if (!isEntryLive(expectedGen, roomId, entry) || !activeEngine) {
                   return;
                 }
+                const alreadyCommittedByRelay =
+                  entry.persistedRelayBatchFileIds.delete(manifest.fileId);
                 entry.files = mergeOrderedFiles(entry.files, [
                   ...activeEngine.getFiles(),
                   manifest,
@@ -624,9 +738,16 @@ export function useRoomSession({
                 if (prog) {
                   entry.transfers.set(manifest.fileId, { ...prog });
                 }
-                void vault
-                  .saveRoomFiles(currentUser.id, roomId, entry.files)
-                  .catch(() => {});
+                if (!alreadyCommittedByRelay) {
+                  void vault
+                    .commitRoomState({
+                      userId: currentUser.id,
+                      metadata: entry.metadata,
+                      roomKeys: entry.roomKeys,
+                      files: entry.files,
+                    })
+                    .catch(() => {});
+                }
                 publishSnapshot(currentUser.id);
               },
               onTransferProgress: (progress) => {
@@ -705,6 +826,7 @@ export function useRoomSession({
           entry.peers = activeEngine.getVerifiedPeers();
           entry.messages = verifiedMessages;
           entry.files = verifiedFiles;
+          entry.deliveryStates = new Map(activeEngine.getChatDeliveryStates());
           for (const f of verifiedFiles) {
             const prog = activeEngine.getTransferProgress(f.fileId);
             if (prog) {
@@ -712,14 +834,19 @@ export function useRoomSession({
             }
           }
 
-          if (messagesChanged && isEntryLive(expectedGen, roomId, entry)) {
+          if (
+            (messagesChanged || filesChanged) &&
+            isEntryLive(expectedGen, roomId, entry)
+          ) {
             void vault
-              .saveRoomMessages(currentUser.id, roomId, entry.messages)
-              .catch(() => {});
-          }
-          if (filesChanged && isEntryLive(expectedGen, roomId, entry)) {
-            void vault
-              .saveRoomFiles(currentUser.id, roomId, entry.files)
+              .commitRoomState({
+                userId: currentUser.id,
+                metadata: entry.metadata,
+                roomKeys: entry.roomKeys,
+                ...(messagesChanged ? { messages: entry.messages } : {}),
+                ...(filesChanged ? { files: entry.files } : {}),
+                mergeWithExisting: false,
+              })
               .catch(() => {});
           }
           publishSnapshot(currentUser.id);
@@ -883,12 +1010,21 @@ export function useRoomSession({
 
         roomsRef.current.clear();
         for (const h of hydratedRooms) {
+          const initialDeliveryStates = new Map<string, ChatDeliveryStatus>();
+          for (const pendingId of h.pendingRelayMsgIds) {
+            initialDeliveryStates.set(pendingId, "pending");
+          }
           roomsRef.current.set(h.metadata.roomId, {
             metadata: h.metadata,
             roomKeys: h.roomKeys,
             messages: h.messages,
             files: h.files,
             transfers: new Map(),
+            deliveryStates: initialDeliveryStates,
+            pendingRelayMsgIds: new Set(h.pendingRelayMsgIds),
+            relayCursor: h.relayCursor,
+            persistedRelayBatchMsgIds: new Set(),
+            persistedRelayBatchFileIds: new Set(),
             peers: [],
             centerConnected: false,
             activeRuntime: null,
@@ -954,9 +1090,18 @@ export function useRoomSession({
     vault,
   ]);
 
-  // On tab close / page reload, close live WebRTC & WebSocket and zeroize RAM keys WITHOUT deleting RoomVault
+  // On tab close / page reload, flush any pending chat outbox via keepalive before closing sockets & zeroizing RAM keys
   useEffect(() => {
     const handlePageHide = (): void => {
+      for (const entry of roomsRef.current.values()) {
+        if (!entry.disposed && entry.activeRuntime) {
+          try {
+            entry.activeRuntime.engine.flushPendingRelayKeepalive();
+          } catch {
+            // Best-effort keepalive flush during pagehide
+          }
+        }
+      }
       void disconnectAllPreservingVault();
     };
     window.addEventListener("pagehide", handlePageHide);
@@ -1138,6 +1283,11 @@ export function useRoomSession({
               messages: [],
               files: [],
               transfers: new Map(),
+              deliveryStates: new Map(),
+              pendingRelayMsgIds: new Set(),
+              relayCursor: 0,
+              persistedRelayBatchMsgIds: new Set(),
+              persistedRelayBatchFileIds: new Set(),
               peers: [],
               centerConnected: false,
               activeRuntime: null,
@@ -1389,6 +1539,13 @@ export function useRoomSession({
         ...rt.engine.getMessages(),
         sent,
       ]);
+      entry.deliveryStates = new Map(rt.engine.getChatDeliveryStates());
+      const sentDelivery = entry.deliveryStates.get(sent.msgId);
+      const needsRelayOutbox =
+        sentDelivery === "pending" || sentDelivery === "failed";
+      if (needsRelayOutbox) {
+        entry.pendingRelayMsgIds.add(sent.msgId);
+      }
       const nowMs = Math.max(Date.now(), sent.createdAt);
       entry.metadata = {
         ...entry.metadata,
@@ -1400,12 +1557,39 @@ export function useRoomSession({
       if (!isEntryLive(myGen, roomId, entry)) {
         return;
       }
-      await Promise.all([
-        vault.saveRoomMessages(user.id, roomId, entry.messages),
-        vault.saveRoom(user.id, entry.metadata, entry.roomKeys),
-      ]);
+      const committed = await vault.commitRoomState({
+        userId: user.id,
+        metadata: entry.metadata,
+        roomKeys: entry.roomKeys,
+        messages: entry.messages,
+        ...(needsRelayOutbox ? { addPendingRelayMsgIds: [sent.msgId] } : {}),
+      });
+      if (isEntryLive(myGen, roomId, entry) && committed.messages) {
+        entry.messages = committed.messages;
+        entry.metadata = committed.metadata;
+        entry.pendingRelayMsgIds = new Set(committed.pendingRelayMsgIds);
+        publishSnapshot(user.id);
+      }
     },
     [isEntryLive, publishSnapshot, user, vault],
+  );
+
+  const retryChatMessage = useCallback(
+    async (msgId: string): Promise<void> => {
+      const myGen = workspaceGenRef.current;
+      const selId = selectedRoomIdRef.current;
+      const entry = selId ? roomsRef.current.get(selId) : undefined;
+      const rt = entry?.activeRuntime;
+      if (!user || !entry || !rt || !isEntryLive(myGen, entry.metadata.roomId, entry)) {
+        return;
+      }
+      await rt.engine.retryChatMessage(msgId);
+      if (isEntryLive(myGen, entry.metadata.roomId, entry)) {
+        entry.deliveryStates = new Map(rt.engine.getChatDeliveryStates());
+        publishSnapshot(user.id);
+      }
+    },
+    [isEntryLive, publishSnapshot, user],
   );
 
   const shareFiles = useCallback(
@@ -1464,10 +1648,12 @@ export function useRoomSession({
         if (!isEntryLive(myGen, roomId, entry)) {
           return;
         }
-        await Promise.all([
-          vault.saveRoomFiles(user.id, roomId, entry.files),
-          vault.saveRoom(user.id, entry.metadata, entry.roomKeys),
-        ]);
+        await vault.commitRoomState({
+          userId: user.id,
+          metadata: entry.metadata,
+          roomKeys: entry.roomKeys,
+          files: entry.files,
+        });
       }
     },
     [isEntryLive, publishSnapshot, user, vault],
@@ -1553,6 +1739,7 @@ export function useRoomSession({
     centerConnected: snapshot.centerConnected,
     peers: snapshot.peers,
     messages: snapshot.messages,
+    deliveryStates: snapshot.deliveryStates,
     files: snapshot.files,
     transfers: snapshot.transfers,
     securityEvent,
@@ -1565,6 +1752,7 @@ export function useRoomSession({
     disconnectAllPreservingVault,
     wipeLocalVault,
     sendMessage,
+    retryChatMessage,
     shareFiles,
     downloadFile,
     cancelDownload,

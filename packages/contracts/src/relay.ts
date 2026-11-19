@@ -14,7 +14,8 @@ import {
 
 export const DEFAULT_RELAY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export const DEFAULT_RELAY_MAX_FILE_BYTES = 100 * 1024 * 1024; // 100 MiB
-export const DEFAULT_RELAY_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
+export const DEFAULT_RELAY_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB (file chunk pool)
+export const DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES = 128 * 1024 * 1024; // 128 MiB (isolated envelope pool)
 
 export const RELAY_NONCE_BYTES = 24;
 export const RELAY_TAG_BYTES = 16;
@@ -40,6 +41,7 @@ export interface RelayMetaConfig {
   ttlMs: number;
   maxFileBytes: number;
   maxTotalBytes: number;
+  maxEnvelopeTotalBytes?: number;
 }
 
 export type RelayEnvelopeInnerPayload =
@@ -77,6 +79,7 @@ export interface RelayListEnvelopesResponse {
   items: RelayListedEnvelopeItem[];
   nextCursor: number;
   hasMore: boolean;
+  cursorReset?: boolean;
 }
 
 export interface RelayPutChunkResponse {
@@ -163,7 +166,8 @@ export function isValidRelayListEnvelopesResponse(
     typeof value.nextCursor !== "number" ||
     !Number.isSafeInteger(value.nextCursor) ||
     value.nextCursor < 0 ||
-    typeof value.hasMore !== "boolean"
+    typeof value.hasMore !== "boolean" ||
+    (value.cursorReset !== undefined && typeof value.cursorReset !== "boolean")
   ) {
     return false;
   }

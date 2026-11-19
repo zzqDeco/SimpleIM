@@ -1175,6 +1175,7 @@ describe("Interactive join Slash Commands", () => {
         },
       ],
       getMessages: () => [],
+      getChatDeliveryStates: () => new Map(),
       getFiles: () => announcedFiles,
       getTransferProgress: () => undefined,
       sendChatMessage: async (body: string): Promise<ChatMessageEnvelope> => {
@@ -1187,6 +1188,8 @@ describe("Interactive join Slash Commands", () => {
           peerSignPrivKey: peerKeys.privateKeyBytes,
         });
       },
+      retryChatMessage: async () => {},
+      flushPendingRelayKeepalive: () => {},
       shareFile: async (input) => {
         const manifest = await createSignedFileManifestFromChunks({
           roomId,
@@ -2107,6 +2110,8 @@ describe("CliApiClient BlindRelayClient", () => {
           url.pathname === `/api/v1/relay/${boxId}/envelopes` &&
           init?.method === "GET"
         ) {
+          const afterSeqParam = Number(url.searchParams.get("afterSeq") ?? "0");
+          const cursorReset = afterSeqParam > 3;
           return Response.json({
             ok: true,
             items: [
@@ -2119,6 +2124,7 @@ describe("CliApiClient BlindRelayClient", () => {
             ],
             nextCursor: 3,
             hasMore: false,
+            ...(cursorReset ? { cursorReset: true } : {}),
           });
         }
         if (
@@ -2162,6 +2168,12 @@ describe("CliApiClient BlindRelayClient", () => {
 
     const listed = await relay.listEnvelopes({ boxId, afterSeq: 0 });
     expect(listed.items[0]?.payload).toEqual(envBytes);
+    expect(listed.cursorReset).toBeUndefined();
+
+    const listedReset = await relay.listEnvelopes({ boxId, afterSeq: 99 });
+    expect(listedReset.cursorReset).toBe(true);
+    expect(listedReset.nextCursor).toBe(3);
+    expect(listedReset.items[0]?.payload).toEqual(envBytes);
 
     const putCh = await relay.putChunk({
       boxId,

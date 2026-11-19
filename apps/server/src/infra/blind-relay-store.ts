@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
+  DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES,
   DEFAULT_RELAY_MAX_TOTAL_BYTES,
   isValidRelayBoxId,
   MAX_RELAY_CHUNK_CIPHERTEXT_BYTES,
@@ -33,7 +34,7 @@ import { SystemClock } from "./logger.ts";
 export const DEFAULT_RELAY_SWEEP_INTERVAL_MS = 60_000;
 const MAX_IDLE_BOX_SEQ_ENTRIES = 50_000;
 
-interface EnvelopeIndexEntry {
+export interface EnvelopeIndexEntry {
   readonly kind: "envelope";
   readonly lruKey: string;
   readonly boxId: string;
@@ -44,7 +45,7 @@ interface EnvelopeIndexEntry {
   lastAccessedAt: number;
 }
 
-interface ChunkIndexEntry {
+export interface ChunkIndexEntry {
   readonly kind: "chunk";
   readonly lruKey: string;
   readonly boxId: string;
@@ -55,16 +56,18 @@ interface ChunkIndexEntry {
   lastAccessedAt: number;
 }
 
-type RelayIndexEntry = EnvelopeIndexEntry | ChunkIndexEntry;
+export type RelayIndexEntry = EnvelopeIndexEntry | ChunkIndexEntry;
 
 export interface BlindRelayStoreBaseOptions {
   readonly maxTotalBytes?: number;
+  readonly maxEnvelopeTotalBytes?: number;
   readonly clock?: ClockPort;
   readonly sweepIntervalMs?: number;
 }
 
 abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
-  protected readonly maxTotalBytes: number;
+  protected readonly maxChunkTotalBytes: number;
+  protected readonly maxEnvelopeTotalBytes: number;
   protected readonly clock: ClockPort;
   protected readonly envelopesByBox = new Map<
     string,
@@ -75,17 +78,25 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
     Map<string, ChunkIndexEntry>
   >();
   protected readonly fileBytesByBoxAndTag = new Map<string, number>();
+  protected readonly reservedFileBytesByBoxAndTag = new Map<string, number>();
   protected readonly boxNextSeq = new Map<string, number>();
-  protected readonly lruMap = new Map<string, RelayIndexEntry>();
+  protected readonly envelopeLruMap = new Map<string, EnvelopeIndexEntry>();
+  protected readonly chunkLruMap = new Map<string, ChunkIndexEntry>();
   protected readonly expiryMap = new Map<string, RelayIndexEntry>();
 
-  protected totalBytes = 0;
+  protected envelopeTotalBytes = 0;
+  protected chunkTotalBytes = 0;
+  protected reservedEnvelopeBytes = 0;
+  protected reservedChunkBytes = 0;
   protected lastInsertedExpiresAt = 0;
   protected expiryStrictlySorted = true;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options?: BlindRelayStoreBaseOptions) {
-    this.maxTotalBytes = options?.maxTotalBytes ?? DEFAULT_RELAY_MAX_TOTAL_BYTES;
+    this.maxChunkTotalBytes =
+      options?.maxTotalBytes ?? DEFAULT_RELAY_MAX_TOTAL_BYTES;
+    this.maxEnvelopeTotalBytes =
+      options?.maxEnvelopeTotalBytes ?? DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES;
     this.clock = options?.clock ?? new SystemClock();
     const sweepIntervalMs =
       options?.sweepIntervalMs ?? DEFAULT_RELAY_SWEEP_INTERVAL_MS;
@@ -102,11 +113,39 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
   }
 
   getTotalBytes(): number {
-    return this.totalBytes;
+    return this.envelopeTotalBytes + this.chunkTotalBytes;
   }
 
   getEntryCount(): number {
-    return this.lruMap.size;
+    return this.envelopeLruMap.size + this.chunkLruMap.size;
+  }
+
+  getEnvelopeTotalBytes(): number {
+    return this.envelopeTotalBytes;
+  }
+
+  getChunkTotalBytes(): number {
+    return this.chunkTotalBytes;
+  }
+
+  getReservedEnvelopeBytes(): number {
+    return this.reservedEnvelopeBytes;
+  }
+
+  getReservedChunkBytes(): number {
+    return this.reservedChunkBytes;
+  }
+
+  getFileBytes(boxId: string, fileTag: string): number {
+    return this.fileBytesByBoxAndTag.get(`${boxId}:${fileTag}`) ?? 0;
+  }
+
+  getReservedFileBytes(boxId: string, fileTag: string): number {
+    return this.reservedFileBytesByBoxAndTag.get(`${boxId}:${fileTag}`) ?? 0;
+  }
+
+  getNextSeq(boxId: string): number {
+    return this.peekNextSeq(boxId);
   }
 
   putEnvelope(params: {
@@ -134,15 +173,38 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
 
     this.sweepExpired(params.nowMs);
 
-    if (params.payload.byteLength > this.maxTotalBytes) {
+    const reservedBytes = params.payload.byteLength;
+    if (reservedBytes > this.maxEnvelopeTotalBytes) {
       throw new DomainError(
         "payload_too_large",
-        "Relay envelope exceeds total cache capacity",
+        "Relay envelope exceeds envelope cache capacity",
         413,
       );
     }
 
-    this.evictLruToFit(params.payload.byteLength);
+    this.evictEnvelopeLruToFit(reservedBytes);
+    if (
+      this.envelopeTotalBytes + this.reservedEnvelopeBytes + reservedBytes >
+      this.maxEnvelopeTotalBytes
+    ) {
+      throw new DomainError(
+        "payload_too_large",
+        "Relay envelope exceeds envelope cache capacity",
+        413,
+      );
+    }
+
+    this.reservedEnvelopeBytes += reservedBytes;
+    let reservationReleased = false;
+    const releaseReservation = (): void => {
+      if (!reservationReleased) {
+        reservationReleased = true;
+        this.reservedEnvelopeBytes = Math.max(
+          0,
+          this.reservedEnvelopeBytes - reservedBytes,
+        );
+      }
+    };
 
     const seq = this.peekNextSeq(params.boxId);
     const entry: EnvelopeIndexEntry = {
@@ -151,14 +213,20 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
       boxId: params.boxId,
       blobId: params.blobId,
       seq,
-      byteLength: params.payload.byteLength,
+      byteLength: reservedBytes,
       expiresAt: params.nowMs + params.ttlMs,
       lastAccessedAt: params.nowMs,
     };
 
-    this.writeEnvelopePayload(entry, params.payload);
-    this.commitNextSeq(params.boxId, seq + 1);
-    this.insertEntry(entry);
+    try {
+      this.writeEnvelopePayload(entry, params.payload);
+      this.commitNextSeq(params.boxId, seq + 1);
+      releaseReservation();
+      this.insertEntry(entry);
+    } catch (err) {
+      releaseReservation();
+      throw err;
+    }
 
     return {
       seq: entry.seq,
@@ -173,9 +241,17 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
     limit: number;
     nowMs: number;
   }): ListRelayEnvelopesResult {
+    const highestIssuedSeq = (this.boxNextSeq.get(params.boxId) ?? 1) - 1;
+    const cursorReset = params.afterSeq > highestIssuedSeq;
+    const effectiveAfterSeq = cursorReset ? 0 : params.afterSeq;
+
     const boxMap = this.envelopesByBox.get(params.boxId);
     if (!boxMap || boxMap.size === 0) {
-      return { items: [], hasMore: false };
+      return {
+        items: [],
+        hasMore: false,
+        ...(cursorReset ? { cursorReset: true } : {}),
+      };
     }
 
     const items: StoredRelayEnvelope[] = [];
@@ -186,7 +262,7 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
         this.removeEntry(entry);
         continue;
       }
-      if (entry.seq <= params.afterSeq) {
+      if (entry.seq <= effectiveAfterSeq) {
         continue;
       }
       if (items.length < params.limit) {
@@ -211,7 +287,11 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
       }
     }
 
-    return { items, hasMore };
+    return {
+      items,
+      hasMore,
+      ...(cursorReset ? { cursorReset: true } : {}),
+    };
   }
 
   putChunk(params: {
@@ -238,9 +318,15 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
 
     this.sweepExpired(params.nowMs);
 
+    const reservedBytes = params.payload.byteLength;
     const fileKey = `${params.boxId}:${params.fileTag}`;
     const currentFileBytes = this.fileBytesByBoxAndTag.get(fileKey) ?? 0;
-    if (currentFileBytes + params.payload.byteLength > params.maxFileBytes) {
+    const currentReservedFileBytes =
+      this.reservedFileBytesByBoxAndTag.get(fileKey) ?? 0;
+    if (
+      currentFileBytes + currentReservedFileBytes + reservedBytes >
+      params.maxFileBytes
+    ) {
       throw new DomainError(
         "payload_too_large",
         "Relay file quota exceeded",
@@ -248,7 +334,7 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
       );
     }
 
-    if (params.payload.byteLength > this.maxTotalBytes) {
+    if (reservedBytes > this.maxChunkTotalBytes) {
       throw new DomainError(
         "payload_too_large",
         "Relay chunk exceeds total cache capacity",
@@ -256,7 +342,40 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
       );
     }
 
-    this.evictLruToFit(params.payload.byteLength);
+    this.evictChunkLruToFit(reservedBytes);
+    if (
+      this.chunkTotalBytes + this.reservedChunkBytes + reservedBytes >
+      this.maxChunkTotalBytes
+    ) {
+      throw new DomainError(
+        "payload_too_large",
+        "Relay chunk exceeds total cache capacity",
+        413,
+      );
+    }
+
+    this.reservedChunkBytes += reservedBytes;
+    this.reservedFileBytesByBoxAndTag.set(
+      fileKey,
+      (this.reservedFileBytesByBoxAndTag.get(fileKey) ?? 0) + reservedBytes,
+    );
+    let reservationReleased = false;
+    const releaseReservation = (): void => {
+      if (!reservationReleased) {
+        reservationReleased = true;
+        this.reservedChunkBytes = Math.max(
+          0,
+          this.reservedChunkBytes - reservedBytes,
+        );
+        const remainingFileReserved =
+          (this.reservedFileBytesByBoxAndTag.get(fileKey) ?? 0) - reservedBytes;
+        if (remainingFileReserved <= 0) {
+          this.reservedFileBytesByBoxAndTag.delete(fileKey);
+        } else {
+          this.reservedFileBytesByBoxAndTag.set(fileKey, remainingFileReserved);
+        }
+      }
+    };
 
     const entry: ChunkIndexEntry = {
       kind: "chunk",
@@ -264,13 +383,19 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
       boxId: params.boxId,
       fileTag: params.fileTag,
       chunkBlobId: params.chunkBlobId,
-      byteLength: params.payload.byteLength,
+      byteLength: reservedBytes,
       expiresAt: params.nowMs + params.ttlMs,
       lastAccessedAt: params.nowMs,
     };
 
-    this.writeChunkPayload(entry, params.payload);
-    this.insertEntry(entry);
+    try {
+      this.writeChunkPayload(entry, params.payload);
+      releaseReservation();
+      this.insertEntry(entry);
+    } catch (err) {
+      releaseReservation();
+      throw err;
+    }
 
     return {
       created: true,
@@ -332,12 +457,27 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
     }
   }
 
-  protected evictLruToFit(newBytes: number): void {
+  protected evictEnvelopeLruToFit(newBytes: number): void {
     while (
-      this.totalBytes + newBytes > this.maxTotalBytes &&
-      this.lruMap.size > 0
+      this.envelopeTotalBytes + this.reservedEnvelopeBytes + newBytes >
+        this.maxEnvelopeTotalBytes &&
+      this.envelopeLruMap.size > 0
     ) {
-      const oldest = this.lruMap.values().next().value;
+      const oldest = this.envelopeLruMap.values().next().value;
+      if (!oldest) {
+        break;
+      }
+      this.removeEntry(oldest);
+    }
+  }
+
+  protected evictChunkLruToFit(newBytes: number): void {
+    while (
+      this.chunkTotalBytes + this.reservedChunkBytes + newBytes >
+        this.maxChunkTotalBytes &&
+      this.chunkLruMap.size > 0
+    ) {
+      const oldest = this.chunkLruMap.values().next().value;
       if (!oldest) {
         break;
       }
@@ -353,6 +493,8 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
         this.envelopesByBox.set(entry.boxId, boxMap);
       }
       boxMap.set(entry.blobId, entry);
+      this.envelopeLruMap.set(entry.lruKey, entry);
+      this.envelopeTotalBytes += entry.byteLength;
     } else {
       let boxMap = this.chunksByBox.get(entry.boxId);
       if (!boxMap) {
@@ -365,26 +507,29 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
         fileKey,
         (this.fileBytesByBoxAndTag.get(fileKey) ?? 0) + entry.byteLength,
       );
+      this.chunkLruMap.set(entry.lruKey, entry);
+      this.chunkTotalBytes += entry.byteLength;
     }
 
-    this.lruMap.set(entry.lruKey, entry);
     if (entry.expiresAt < this.lastInsertedExpiresAt) {
       this.expiryStrictlySorted = false;
     } else {
       this.lastInsertedExpiresAt = entry.expiresAt;
     }
     this.expiryMap.set(entry.lruKey, entry);
-    this.totalBytes += entry.byteLength;
   }
 
   protected removeEntry(entry: RelayIndexEntry): void {
-    if (!this.lruMap.delete(entry.lruKey)) {
-      return;
-    }
-    this.expiryMap.delete(entry.lruKey);
-    this.totalBytes = Math.max(0, this.totalBytes - entry.byteLength);
-
     if (entry.kind === "envelope") {
+      if (!this.envelopeLruMap.delete(entry.lruKey)) {
+        return;
+      }
+      this.expiryMap.delete(entry.lruKey);
+      this.envelopeTotalBytes = Math.max(
+        0,
+        this.envelopeTotalBytes - entry.byteLength,
+      );
+
       const boxMap = this.envelopesByBox.get(entry.boxId);
       let boxEmpty = true;
       if (boxMap) {
@@ -397,6 +542,15 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
       }
       this.deleteEnvelopePayload(entry, boxEmpty);
     } else {
+      if (!this.chunkLruMap.delete(entry.lruKey)) {
+        return;
+      }
+      this.expiryMap.delete(entry.lruKey);
+      this.chunkTotalBytes = Math.max(
+        0,
+        this.chunkTotalBytes - entry.byteLength,
+      );
+
       const boxMap = this.chunksByBox.get(entry.boxId);
       let boxEmpty = true;
       if (boxMap) {
@@ -420,12 +574,21 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
   }
 
   protected touchLru(entry: RelayIndexEntry, nowMs: number): void {
-    if (!this.lruMap.has(entry.lruKey)) {
-      return;
+    if (entry.kind === "envelope") {
+      if (!this.envelopeLruMap.has(entry.lruKey)) {
+        return;
+      }
+      entry.lastAccessedAt = nowMs;
+      this.envelopeLruMap.delete(entry.lruKey);
+      this.envelopeLruMap.set(entry.lruKey, entry);
+    } else {
+      if (!this.chunkLruMap.has(entry.lruKey)) {
+        return;
+      }
+      entry.lastAccessedAt = nowMs;
+      this.chunkLruMap.delete(entry.lruKey);
+      this.chunkLruMap.set(entry.lruKey, entry);
     }
-    entry.lastAccessedAt = nowMs;
-    this.lruMap.delete(entry.lruKey);
-    this.lruMap.set(entry.lruKey, entry);
     this.onEntryTouched(entry, nowMs);
   }
 
@@ -741,13 +904,22 @@ export class FsBlindRelayStore extends AbstractBlindRelayStore {
       );
     }
 
-    // Populate lruMap ordered by lastAccessedAt ASC.
-    const sortedByAccess = [...allEntries].sort(
+    // Populate envelopeLruMap ordered by lastAccessedAt ASC.
+    const envelopesSortedByAccess = Array.from(loadedEnvelopes.values()).sort(
       (a, b) => a.lastAccessedAt - b.lastAccessedAt,
     );
-    for (const entry of sortedByAccess) {
-      this.lruMap.set(entry.lruKey, entry);
-      this.totalBytes += entry.byteLength;
+    for (const entry of envelopesSortedByAccess) {
+      this.envelopeLruMap.set(entry.lruKey, entry);
+      this.envelopeTotalBytes += entry.byteLength;
+    }
+
+    // Populate chunkLruMap ordered by lastAccessedAt ASC.
+    const chunksSortedByAccess = Array.from(loadedChunks.values()).sort(
+      (a, b) => a.lastAccessedAt - b.lastAccessedAt,
+    );
+    for (const entry of chunksSortedByAccess) {
+      this.chunkLruMap.set(entry.lruKey, entry);
+      this.chunkTotalBytes += entry.byteLength;
     }
 
     // Populate expiryMap ordered by expiresAt ASC.
@@ -761,8 +933,9 @@ export class FsBlindRelayStore extends AbstractBlindRelayStore {
       this.lastInsertedExpiresAt = entry.expiresAt;
     }
 
-    // Trim cache if persisted bytes exceed current configured maxTotalBytes.
-    this.evictLruToFit(0);
+    // Trim each pool independently if persisted bytes exceed configured caps.
+    this.evictEnvelopeLruToFit(0);
+    this.evictChunkLruToFit(0);
   }
 
   private purgeTmpFilesRecursively(dirPath: string): void {
@@ -831,8 +1004,6 @@ export class FsBlindRelayStore extends AbstractBlindRelayStore {
             continue;
           }
 
-          this.seedNextSeq(boxId, seq + 1);
-
           const st = safeStat(fullPath);
           if (
             !st ||
@@ -844,6 +1015,8 @@ export class FsBlindRelayStore extends AbstractBlindRelayStore {
             safeUnlink(fullPath);
             continue;
           }
+
+          this.seedNextSeq(boxId, seq + 1);
 
           const entry: EnvelopeIndexEntry = {
             kind: "envelope",

@@ -81,6 +81,10 @@ export const ko = {
   "room.send": "전송",
   "room.shortcutSend": "Enter 전송",
   "room.shortcutNewline": "Shift+Enter 줄바꿈",
+  "room.msg.delivery.pending": "전송 중…",
+  "room.msg.delivery.relayed": "✓ 임시보관됨",
+  "room.msg.delivery.p2pOnly": "P2P",
+  "room.msg.delivery.failed": "재시도",
 
   "room.sidebarAria": "방 참여자 및 공유 파일",
   "room.peers.heading": "참여자",
