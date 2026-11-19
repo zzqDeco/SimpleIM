@@ -60,9 +60,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate production Docker Compose specs (default & turn profile)
+      - name: Validate production Docker Compose specs (default, acme-http & turn profiles) and shell scripts
         run: |
+          bash -n ops/deploy.sh ops/backup.sh ops/bootstrap.sh ops/sync-tls-cert.sh
           docker compose -f deploy/compose.production.yaml --env-file deploy/.env.example config -q
+          docker compose -f deploy/compose.production.yaml -f deploy/compose.acme-http.yaml --env-file deploy/.env.example config -q
           docker compose -f deploy/compose.production.yaml --env-file deploy/.env.example --profile turn config -q
 
       - name: Validate Caddyfile syntax across domain ACME, IP ACME, and certificate-file TLS modes

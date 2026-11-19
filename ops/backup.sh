@@ -23,18 +23,25 @@ fi
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 DEST_DIR="$BACKUP_DIR/$STAMP"
+CONTAINER_SNAP="/data/.simpleim-online-backup-${STAMP}-$$.sqlite"
 mkdir -p "$DEST_DIR"
 chmod 0700 "$DEST_DIR"
 
+cleanup_container_snap() {
+  docker exec simpleim-server-1 rm -f "$CONTAINER_SNAP" >/dev/null 2>&1 || true
+}
 cleanup_failed() {
+  cleanup_container_snap
   rm -rf -- "$DEST_DIR"
 }
 trap cleanup_failed ERR
+trap cleanup_container_snap EXIT
 
-docker exec simpleim-server-1 bun -e '
+# Stage VACUUM INTO on persistent /data volume instead of the 16 MiB /tmp tmpfs
+docker exec -e CONTAINER_SNAP="$CONTAINER_SNAP" simpleim-server-1 bun -e '
 import { Database } from "bun:sqlite";
 import { rmSync } from "node:fs";
-const snap = "/tmp/simpleim-online-backup.sqlite";
+const snap = process.env.CONTAINER_SNAP!;
 rmSync(snap, { force: true });
 const db = new Database("/data/simpleim.sqlite", { readonly: true });
 db.exec(`VACUUM INTO "${snap}";`);
@@ -47,8 +54,8 @@ if (check.integrity_check !== "ok") {
 verify.close();
 '
 
-docker exec simpleim-server-1 cat /tmp/simpleim-online-backup.sqlite > "$DEST_DIR/simpleim.sqlite"
-docker exec simpleim-server-1 rm -f /tmp/simpleim-online-backup.sqlite
+docker exec simpleim-server-1 cat "$CONTAINER_SNAP" > "$DEST_DIR/simpleim.sqlite"
+cleanup_container_snap
 chmod 0600 "$DEST_DIR/simpleim.sqlite"
 
 if [[ -f "$SIMPLEIM_ROOT/current/release-manifest.json" ]]; then

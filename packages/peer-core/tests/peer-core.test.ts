@@ -4542,4 +4542,147 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
     },
     20_000,
   );
+
+  test(
+    "15f. Codex review PR #25 Fix: poisoning evictions stay permanently excluded past the 3s auto-retry window in both offerer and responder directions",
+    async () => {
+      const ca = createTestServerCA();
+      const roomKeys = deriveRoomKeys(
+        "codex-review-pr25-eviction-persistence",
+        FAST_KDF,
+      );
+      const payloadBytes = makeDeterministicPayload(6 * SWARM_CHUNK_SIZE);
+
+      async function verifyEvictionPersists(params: {
+        receiverPeerId: string;
+        maliciousPeerId: string;
+        honestPeerId: string;
+      }): Promise<void> {
+        const hub = new MockSignalingHub();
+        const network = new MockPeerTransportNetwork();
+
+        const honestSeeder = createTestPeerRig({
+          ca,
+          hub,
+          network,
+          roomKeys,
+          peerId: params.honestPeerId,
+          username: "alice",
+          syncIntervalMs: 0,
+          transportConfig: () => ({ swarmFlushDelayMs: 6 }),
+        });
+        const maliciousSeeder = createTestPeerRig({
+          ca,
+          hub,
+          network,
+          roomKeys,
+          peerId: params.maliciousPeerId,
+          username: "mallory",
+          syncIntervalMs: 0,
+        });
+        const receiver = createTestPeerRig({
+          ca,
+          hub,
+          network,
+          roomKeys,
+          peerId: params.receiverPeerId,
+          username: "bob",
+          syncIntervalMs: 0,
+          maxInFlightPerPeer: 6,
+        });
+
+        try {
+          await Promise.all([
+            honestSeeder.engine.start(),
+            maliciousSeeder.engine.start(),
+            receiver.engine.start(),
+          ]);
+          await waitFor(
+            () =>
+              honestSeeder.engine.getVerifiedPeers().length === 2 &&
+              maliciousSeeder.engine.getVerifiedPeers().length === 2 &&
+              receiver.engine.getVerifiedPeers().length === 2,
+          );
+
+          const manifest = await honestSeeder.engine.shareFile({
+            fileName: "eviction-persist.bin",
+            fileSize: payloadBytes.byteLength,
+            readChunk: makeSliceReader(payloadBytes),
+          });
+          await waitFor(
+            () =>
+              maliciousSeeder.announcedFiles.length === 1 &&
+              receiver.announcedFiles.length === 1,
+          );
+          await maliciousSeeder.engine.downloadFile(manifest.fileId);
+          await waitFor(() => maliciousSeeder.completedFiles.length === 1);
+
+          const malloryToBob = maliciousSeeder.connections.find(
+            (c) => c.remotePeerId === receiver.peerId,
+          )!;
+          malloryToBob.swarmChannel.setBinaryOutgoingInterceptor((raw) => {
+            const decoded = decodeSwarmFrame(raw);
+            if (decoded.frameType === SwarmFrameType.CHUNK) {
+              const poisoned = decoded.payload.slice();
+              poisoned[0] = (poisoned[0]! ^ 0xff) & 0xff;
+              return encodeSwarmFrame({
+                frameType: SwarmFrameType.CHUNK,
+                fileId: decoded.fileId,
+                chunkIndex: decoded.chunkIndex,
+                payload: poisoned,
+              });
+            }
+            return raw;
+          });
+
+          await receiver.engine.downloadFile(manifest.fileId);
+          await waitFor(() => receiver.completedFiles.length === 1, 5_000);
+          expect(
+            receiver.engine.getVerifiedPeers().map((p) => p.peerId),
+          ).toEqual([honestSeeder.peerId]);
+
+          const connCountAtEviction = receiver.connections.filter(
+            (c) => c.remotePeerId === maliciousSeeder.peerId,
+          ).length;
+
+          // Wait past the 3s INITIAL_MESH_RETRY_MS auto-reconnect window:
+          // - When receiver is offerer: receiver must NOT schedule a retry offer.
+          // - When Mallory is offerer: Mallory retries after 3s, and receiver must drop her offer.
+          await new Promise<void>((r) => setTimeout(r, 3_350));
+
+          expect(
+            receiver.engine.getVerifiedPeers().map((p) => p.peerId),
+          ).toEqual([honestSeeder.peerId]);
+          expect(
+            receiver.connections.filter(
+              (c) => c.remotePeerId === maliciousSeeder.peerId,
+            ).length,
+          ).toBe(connCountAtEviction);
+        } finally {
+          await Promise.all([
+            honestSeeder.engine.stop(),
+            maliciousSeeder.engine.stop(),
+            receiver.engine.stop(),
+          ]);
+        }
+      }
+
+      // Run both directions in parallel so total wall time stays ~3.5s
+      await Promise.all([
+        // Direction 1: Receiver is offerer (peer_01 < peer_03)
+        verifyEvictionPersists({
+          receiverPeerId: "peer_01recv_offer",
+          honestPeerId: "peer_02honest_mid",
+          maliciousPeerId: "peer_03evil_respd",
+        }),
+        // Direction 2: Receiver is responder (peer_03 > peer_01)
+        verifyEvictionPersists({
+          maliciousPeerId: "peer_01evil_offer",
+          honestPeerId: "peer_02honest_mid",
+          receiverPeerId: "peer_03recv_respd",
+        }),
+      ]);
+    },
+    15_000,
+  );
 });

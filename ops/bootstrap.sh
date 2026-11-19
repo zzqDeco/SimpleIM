@@ -41,8 +41,14 @@ if [[ ! -f "$ENV_FILE" ]]; then
   TURN_SECRET=$(openssl rand -hex 32)
   if [[ "$TLS_SYNC_FROM_TEAMIE" == "true" ]]; then
     TLS_CFG="./tls/certificate-files.caddy"
+    ACME_HTTP_CHALLENGE="false"
   else
     TLS_CFG="./tls/acme-ip.caddy"
+    if [[ "$PUBLIC_HTTPS_PORT" == "443" ]]; then
+      ACME_HTTP_CHALLENGE="false"
+    else
+      ACME_HTTP_CHALLENGE="true"
+    fi
   fi
 
   cat > "$ENV_FILE" <<EOF
@@ -53,6 +59,7 @@ TLS_SERVER_NAME=${PUBLIC_HOST_IP}
 TLS_CONFIG_FILE=${TLS_CFG}
 TLS_CERT_DIR=${BASE_DIR}/tls
 TLS_SYNC_FROM_TEAMIE=${TLS_SYNC_FROM_TEAMIE}
+ENABLE_ACME_HTTP_CHALLENGE=${ACME_HTTP_CHALLENGE}
 ALLOWED_ORIGINS=https://${PUBLIC_HOST_IP}:${PUBLIC_HTTPS_PORT}
 SERVER_KEY_ID=srvk_2026_01
 SERVER_IDENTITY_PRIVATE_KEY=${SIGN_SEED}

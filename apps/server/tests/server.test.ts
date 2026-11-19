@@ -41,6 +41,7 @@ import {
 } from "../src/infra/blind-relay-store.ts";
 import {
   createSimpleImServer,
+  parseStunUrlsEnv,
   type SimpleImServerInstance,
 } from "../src/main.ts";
 
@@ -2709,5 +2710,31 @@ describe("SimpleIM Server Integration Suite", () => {
       expect(line).not.toContain(blobB);
       expect(line).not.toContain(blobC);
     }
+  });
+
+  test("15. parseStunUrlsEnv preserves built-in default STUN servers when unset/blank and disables STUN only on explicit sentinel", async () => {
+    expect(parseStunUrlsEnv(undefined)).toBeUndefined();
+    expect(parseStunUrlsEnv("")).toBeUndefined();
+    expect(parseStunUrlsEnv("   ")).toBeUndefined();
+    expect(parseStunUrlsEnv("none")).toEqual([]);
+    expect(parseStunUrlsEnv("OFF")).toEqual([]);
+    expect(parseStunUrlsEnv("disabled")).toEqual([]);
+    expect(parseStunUrlsEnv("stun:a.example:3478, stun:b.example:3478")).toEqual(
+      ["stun:a.example:3478", "stun:b.example:3478"],
+    );
+
+    const blankEnvSrv = startTestServer({ stunUrls: parseStunUrlsEnv("") });
+    const blankMeta = (await (
+      await fetch(`${blankEnvSrv.url}/api/v1/meta`)
+    ).json()) as MetaResponse;
+    expect(blankMeta.iceServers.length).toBeGreaterThan(0);
+
+    const disabledEnvSrv = startTestServer({
+      stunUrls: parseStunUrlsEnv("none"),
+    });
+    const disabledMeta = (await (
+      await fetch(`${disabledEnvSrv.url}/api/v1/meta`)
+    ).json()) as MetaResponse;
+    expect(disabledMeta.iceServers).toEqual([]);
   });
 });

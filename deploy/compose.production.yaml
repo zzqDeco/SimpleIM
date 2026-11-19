@@ -29,7 +29,7 @@ services:
       - "${PUBLIC_HTTPS_PORT:-8444}:${CADDY_HTTPS_PORT:-8444}/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ${TLS_CONFIG_FILE:-./tls/acme-domain.caddy}:/etc/caddy/issuer.caddy:ro
+      - ${TLS_CONFIG_FILE:-./tls/certificate-files.caddy}:/etc/caddy/issuer.caddy:ro
       - ${TLS_CERT_DIR:-./tls}:/etc/caddy/tls:ro
       - caddy_data:/data
       - caddy_config:/config
