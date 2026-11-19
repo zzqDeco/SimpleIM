@@ -87,6 +87,7 @@ interface PeerSession {
   verified: boolean;
   closed: boolean;
   authRejected: boolean;
+  evicted: boolean;
   offerAccepted: boolean;
   acceptedOfferSdp: string | null;
   answerAccepted: boolean;
@@ -121,6 +122,7 @@ export class MeshSessionManager {
   private readonly retryTimers = new Map<string, TimerHandle>();
   private readonly retryAttempts = new Map<string, number>();
   private readonly authBlockedPeers = new Set<string>();
+  private readonly evictedPeers = new Set<string>();
   private readonly earlyIceByPeer = new Map<string, BufferedIceItem[]>();
   private stopped = false;
 
@@ -187,7 +189,11 @@ export class MeshSessionManager {
 
   private connectKnownPeer(remotePeerId: string): void {
     if (this.stopped) return;
-    if (remotePeerId === this.localPeerId || !isValidPeerId(remotePeerId)) {
+    if (
+      remotePeerId === this.localPeerId ||
+      !isValidPeerId(remotePeerId) ||
+      this.evictedPeers.has(remotePeerId)
+    ) {
       return;
     }
     this.clearRetryTimer(remotePeerId);
@@ -234,7 +240,11 @@ export class MeshSessionManager {
 
   onSignalDeliver(fromPeerId: string, envelope: EncryptedEnvelope): void {
     if (this.stopped) return;
-    if (fromPeerId === this.localPeerId || !isValidPeerId(fromPeerId)) {
+    if (
+      fromPeerId === this.localPeerId ||
+      !isValidPeerId(fromPeerId) ||
+      this.evictedPeers.has(fromPeerId)
+    ) {
       return;
     }
 
@@ -371,8 +381,13 @@ export class MeshSessionManager {
   }
 
   evictPeer(remotePeerId: string, _reason: string): void {
+    this.evictedPeers.add(remotePeerId);
+    this.clearRetryTimer(remotePeerId);
+    this.retryAttempts.delete(remotePeerId);
+    this.earlyIceByPeer.delete(remotePeerId);
     const session = this.sessions.get(remotePeerId);
     if (session) {
+      session.evicted = true;
       this.closeSession(session);
     }
   }
@@ -384,6 +399,7 @@ export class MeshSessionManager {
     this.retryAttempts.clear();
     this.signalingPeerIds.clear();
     this.authBlockedPeers.clear();
+    this.evictedPeers.clear();
     const active = Array.from(this.sessions.values());
     this.sessions.clear();
     for (const session of active) {
@@ -432,6 +448,7 @@ export class MeshSessionManager {
     if (
       this.stopped ||
       this.authBlockedPeers.has(remotePeerId) ||
+      this.evictedPeers.has(remotePeerId) ||
       !this.signalingPeerIds.has(remotePeerId) ||
       this.localPeerId >= remotePeerId ||
       this.retryTimers.has(remotePeerId)
@@ -449,6 +466,7 @@ export class MeshSessionManager {
       if (
         this.stopped ||
         this.authBlockedPeers.has(remotePeerId) ||
+        this.evictedPeers.has(remotePeerId) ||
         !this.signalingPeerIds.has(remotePeerId)
       ) {
         return;
@@ -499,6 +517,7 @@ export class MeshSessionManager {
       verified: false,
       closed: false,
       authRejected: false,
+      evicted: false,
       offerAccepted: false,
       acceptedOfferSdp: null,
       answerAccepted: false,
@@ -663,7 +682,7 @@ export class MeshSessionManager {
     offerSdp: string,
   ): Promise<void> {
     // Enforce deterministic glare-free rule: responder must have localPeerId > fromPeerId
-    if (this.localPeerId < fromPeerId) {
+    if (this.localPeerId < fromPeerId || this.evictedPeers.has(fromPeerId)) {
       return;
     }
 
@@ -1115,7 +1134,11 @@ export class MeshSessionManager {
         );
       }
 
-      if (!session.authRejected) {
+      if (
+        !session.authRejected &&
+        !session.evicted &&
+        !this.evictedPeers.has(session.remotePeerId)
+      ) {
         this.schedulePeerRetryIfEligible(session.remotePeerId);
       }
     }

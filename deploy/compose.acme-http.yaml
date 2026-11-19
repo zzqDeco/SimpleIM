@@ -1,0 +1,8 @@
+# Optional Compose override for standalone hosts using automatic ACME HTTP-01
+# certificate issuance while serving HTTPS on a non-443 port (e.g. :8444).
+# Enabled automatically by ops/deploy.sh when ENABLE_ACME_HTTP_CHALLENGE=true.
+# Do NOT enable on shared hosts where port 80 is owned by another reverse proxy.
+services:
+  caddy:
+    ports:
+      - "80:80"

@@ -44,15 +44,15 @@ docker_login_if_needed() {
   chmod 0700 "$DOCKER_CONFIG"
   if [[ "$registry" == *.aliyuncs.com ]]; then
     local user pass
-    user=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1] or "{}"); print(d.get("acr",{}).get("username",""))' "$AUTH_JSON")
-    pass=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1] or "{}"); print(d.get("acr",{}).get("password",""))' "$AUTH_JSON")
+    user=$(printf '%s' "$AUTH_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("acr",{}).get("username",""))')
+    pass=$(printf '%s' "$AUTH_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("acr",{}).get("password",""))')
     if [[ -n "$user" && -n "$pass" ]]; then
       printf '%s' "$pass" | docker login "$registry" --username "$user" --password-stdin >/dev/null 2>&1
     fi
   elif [[ "$registry" == "ghcr.io" ]]; then
     local user pass
-    user=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1] or "{}"); print(d.get("ghcr",{}).get("username",""))' "$AUTH_JSON")
-    pass=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1] or "{}"); print(d.get("ghcr",{}).get("password",""))' "$AUTH_JSON")
+    user=$(printf '%s' "$AUTH_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("ghcr",{}).get("username",""))')
+    pass=$(printf '%s' "$AUTH_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read() or "{}"); print(d.get("ghcr",{}).get("password",""))')
     if [[ -n "$user" && -n "$pass" ]]; then
       printf '%s' "$pass" | docker login ghcr.io --username "$user" --password-stdin >/dev/null 2>&1
     fi
@@ -128,6 +128,15 @@ probe_and_verify_stack() {
     for turn_attempt in $(seq 1 15); do
       turn_state=$(docker inspect -f '{{.State.Status}}:{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$turn_cid" 2>/dev/null || true)
       if [[ "$turn_state" == "running:healthy" ]] && ss -tln | awk '{print $4}' | grep -Eq '(^|:)3478$'; then
+        turn_ok=1
+        break
+      fi
+      # Legacy releases prior to coturn Docker healthchecks report running:none;
+      # verify the container is stably running and actively listening on TCP+UDP :3478.
+      if [[ "$turn_state" == "running:none" ]] &&
+        [[ "$(docker inspect -f '{{.State.Restarting}}' "$turn_cid" 2>/dev/null || true)" == "false" ]] &&
+        ss -tln | awk '{print $4}' | grep -Eq '(^|:)3478$' &&
+        ss -uln | awk '{print $4}' | grep -Eq '(^|:)3478$'; then
         turn_ok=1
         break
       fi
@@ -207,19 +216,35 @@ assert body.get("version") == sys.argv[1] and body.get("sha") == sys.argv[2], f"
 
 rollout_release_dir() {
   local rel_dir="$1"
-  eval "$(python3 "$rel_dir/ops/manifest.py" verify --manifest "$rel_dir/release-manifest.json" --print-env)"
-
   validate_env_file
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
 
+  # Evaluate release manifest AFTER sourcing production.env so immutable release
+  # image references always take precedence over template image defaults.
+  eval "$(python3 "$rel_dir/ops/manifest.py" verify --manifest "$rel_dir/release-manifest.json" --print-env)"
+
   local port="${PUBLIC_HTTPS_PORT:-8444}"
   local tls_name="${TLS_SERVER_NAME:?TLS_SERVER_NAME required in production.env}"
+  local tls_cfg="${TLS_CONFIG_FILE:-./tls/certificate-files.caddy}"
   local enable_coturn="${ENABLE_COTURN:-false}"
+  local enable_acme_http="${ENABLE_ACME_HTTP_CHALLENGE:-false}"
+
+  local tls_cfg_name
+  tls_cfg_name=$(basename "$tls_cfg")
+  if [[ "$tls_cfg_name" == "acme-domain.caddy" || "$tls_cfg_name" == "acme-ip.caddy" ]]; then
+    if [[ "$port" != "443" && "$enable_acme_http" != "true" ]]; then
+      echo "ERROR: Automatic ACME ($tls_cfg) requires PUBLIC_HTTPS_PORT=443 (TLS-ALPN-01) or ENABLE_ACME_HTTP_CHALLENGE=true (HTTP-01 on :80). On shared hosts using port ${port}, use TLS_CONFIG_FILE=./tls/certificate-files.caddy." >&2
+      return 1
+    fi
+  fi
 
   verify_port_safe "$port"
+  if [[ "$enable_acme_http" == "true" ]]; then
+    verify_port_safe 80
+  fi
   if [[ "$enable_coturn" == "true" ]]; then
     verify_coturn_port_safe
   fi
@@ -267,6 +292,9 @@ EOF
     --env-file "$SCRATCH/images.env"
     -f "$rel_dir/deploy/compose.production.yaml"
   )
+  if [[ "$enable_acme_http" == "true" && -f "$rel_dir/deploy/compose.acme-http.yaml" ]]; then
+    compose_args+=(-f "$rel_dir/deploy/compose.acme-http.yaml")
+  fi
   if [[ "$enable_coturn" == "true" ]]; then
     compose_args+=(--profile turn)
   fi
@@ -291,7 +319,9 @@ if [[ "$MODE" == "apply" ]]; then
   PREV_DIR=""
   if [[ -L "$BASE_DIR/current" ]]; then
     PREV_DIR=$(readlink -f "$BASE_DIR/current" || true)
-    if [[ -n "$PREV_DIR" && -f "$PREV_DIR/ops/backup.sh" ]]; then
+    if [[ -f "$TARGET_DIR/ops/backup.sh" ]]; then
+      SIMPLEIM_DEPLOY_LOCK_HELD=1 SIMPLEIM_ROOT="$BASE_DIR" bash "$TARGET_DIR/ops/backup.sh"
+    elif [[ -n "$PREV_DIR" && -f "$PREV_DIR/ops/backup.sh" ]]; then
       SIMPLEIM_DEPLOY_LOCK_HELD=1 SIMPLEIM_ROOT="$BASE_DIR" bash "$PREV_DIR/ops/backup.sh"
     fi
   fi

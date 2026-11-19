@@ -21,6 +21,28 @@ function parseCsvEnv(raw: string | undefined): string[] {
     .filter((item) => item.length > 0);
 }
 
+/**
+ * Parses STUN_URLS while preserving AuthService's default STUN fallback whenever
+ * the variable is unset or blank (e.g. Docker Compose `${STUN_URLS:-}`).
+ * Set STUN_URLS=none (or off/disabled) to explicitly disable STUN servers.
+ */
+export function parseStunUrlsEnv(
+  raw: string | undefined,
+): string[] | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+  const lower = trimmed.toLowerCase();
+  if (lower === "none" || lower === "off" || lower === "disabled") {
+    return [];
+  }
+  return parseCsvEnv(trimmed);
+}
+
 function parsePortEnv(raw: string | undefined, fallback: number): number {
   if (!raw) {
     return fallback;
@@ -110,10 +132,7 @@ if (import.meta.main) {
     process.env.SERVER_IDENTITY_PRIVATE_KEY?.trim() || undefined;
   const serverKeyId = process.env.SERVER_KEY_ID?.trim() || "srvk_2026_01";
   const allowedOrigins = parseCsvEnv(process.env.ALLOWED_ORIGINS);
-  const stunUrls =
-    process.env.STUN_URLS !== undefined
-      ? parseCsvEnv(process.env.STUN_URLS)
-      : undefined;
+  const stunUrls = parseStunUrlsEnv(process.env.STUN_URLS);
   const coturnUrls = parseCsvEnv(process.env.COTURN_URLS);
   const coturnSharedSecret =
     process.env.COTURN_SHARED_SECRET?.trim() || undefined;
