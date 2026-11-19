@@ -311,6 +311,11 @@ export class HttpAuthClient {
         }
         return { seq: res.seq, expiresAt: res.expiresAt };
       },
+      getEnvelope: async ({ boxId, blobId }) => {
+        return this.requestBinaryGet(
+          `/api/v1/relay/${encodeURIComponent(boxId)}/envelopes/${encodeURIComponent(blobId)}`,
+        );
+      },
       listEnvelopes: async ({ boxId, afterSeq, limit }) => {
         const qs = new URLSearchParams({
           afterSeq: String(Math.max(0, Math.floor(afterSeq))),

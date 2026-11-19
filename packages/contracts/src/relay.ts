@@ -25,6 +25,21 @@ export const MAX_RELAY_CHUNK_CIPHERTEXT_BYTES =
   SWARM_CHUNK_SIZE + RELAY_AEAD_OVERHEAD_BYTES; // 65,576 B
 export const MAX_RELAY_LIST_LIMIT = 100;
 
+export function computeRelayFileWireBytes(
+  fileSize: number,
+  totalChunks: number,
+): number {
+  if (
+    !Number.isFinite(fileSize) ||
+    fileSize <= 0 ||
+    !Number.isFinite(totalChunks) ||
+    totalChunks <= 0
+  ) {
+    return 0;
+  }
+  return fileSize + totalChunks * RELAY_AEAD_OVERHEAD_BYTES;
+}
+
 const RELAY_BOX_ID_RE = /^[0-9a-f]{64}$/;
 const RELAY_BLOB_ID_RE = /^[0-9a-f]{32}$/;
 

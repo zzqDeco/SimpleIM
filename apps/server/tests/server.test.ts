@@ -2541,11 +2541,173 @@ describe("SimpleIM Server Integration Suite", () => {
           newBlobId,
         ]);
 
+        // Direct cursor-independent GET /api/v1/relay/:boxId/envelopes/:blobId returns raw ciphertext
+        const directEnvRes = await fetch(
+          `${srv3.url}/api/v1/relay/${boxId}/envelopes/${newBlobId}`,
+          { headers },
+        );
+        expect(directEnvRes.status).toBe(200);
+        expect(directEnvRes.headers.get("cache-control")).toBe("no-store");
+        expect(directEnvRes.headers.get("content-type")).toBe(
+          "application/octet-stream",
+        );
+        expect(new Uint8Array(await directEnvRes.arrayBuffer())).toEqual(
+          new Uint8Array(newPayload),
+        );
+
+        // Missing envelope returns 404
+        const missingEnvRes = await fetch(
+          `${srv3.url}/api/v1/relay/${boxId}/envelopes/${"0".repeat(32)}`,
+          { headers },
+        );
+        expect(missingEnvRes.status).toBe(404);
+
         await srv3.stop(true);
         srv3.sqliteDb.close(false);
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }
+    }
+  });
+
+  test("14. GET /api/v1/relay/:boxId/envelopes/:blobId touches LRU, enforces TTL/validation, and redacts IDs in boundary logs", async () => {
+    let now = 1_765_000_000_000;
+    const clock = { nowMs: () => now };
+    const capturedLogs: string[] = [];
+
+    const srv = startTestServer(
+      {
+        clock,
+        relay: {
+          enabled: true,
+          ttlMs: 10_000,
+          maxFileBytes: 1_048_576,
+          maxTotalBytes: 1_048_576,
+          maxEnvelopeTotalBytes: 250, // fits 2x100B envelopes; 3rd evicts LRU
+          sweepIntervalMs: 0,
+        },
+      },
+      capturedLogs,
+    );
+
+    const reg = await fetch(`${srv.url}/api/v1/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: "relay_getenv_user",
+        password: "relay-getenv-password-123",
+        clientKind: "cli",
+      }),
+    });
+    expect(reg.status).toBe(201);
+    const auth = (await reg.json()) as CliAuthResponse;
+    const headers = { Authorization: `Bearer ${auth.sessionToken}` };
+
+    const boxId = "9".repeat(64);
+    const blobA = "a".repeat(32);
+    const blobB = "b".repeat(32);
+    const blobC = "c".repeat(32);
+    const payloadA = randomBytes(100);
+    const payloadB = randomBytes(100);
+    const payloadC = randomBytes(100);
+
+    // Unauthenticated GET rejected with 401
+    expect(
+      (await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${blobA}`))
+        .status,
+    ).toBe(401);
+
+    // Invalid blobId rejected with 400
+    expect(
+      (
+        await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/not-hex`, {
+          headers,
+        })
+      ).status,
+    ).toBe(400);
+
+    // Store A (t=0) and B (t=1000)
+    expect(
+      (
+        await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${blobA}`, {
+          method: "PUT",
+          headers,
+          body: new Uint8Array(payloadA),
+        })
+      ).status,
+    ).toBe(201);
+    now += 1_000;
+    expect(
+      (
+        await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${blobB}`, {
+          method: "PUT",
+          headers,
+          body: new Uint8Array(payloadB),
+        })
+      ).status,
+    ).toBe(201);
+
+    // Touch A via direct GET at t=2000 so B becomes LRU
+    now += 1_000;
+    const getARes = await fetch(
+      `${srv.url}/api/v1/relay/${boxId}/envelopes/${blobA}`,
+      { headers },
+    );
+    expect(getARes.status).toBe(200);
+    expect(new Uint8Array(await getARes.arrayBuffer())).toEqual(
+      new Uint8Array(payloadA),
+    );
+
+    // Insert C at t=3000 -> evicts LRU (B), preserving A and C
+    now += 1_000;
+    expect(
+      (
+        await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${blobC}`, {
+          method: "PUT",
+          headers,
+          body: new Uint8Array(payloadC),
+        })
+      ).status,
+    ).toBe(201);
+
+    expect(
+      (
+        await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${blobB}`, {
+          headers,
+        })
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${blobA}`, {
+          headers,
+        })
+      ).status,
+    ).toBe(200);
+
+    // Advance past TTL -> direct GET returns 404
+    now += 15_000;
+    expect(
+      (
+        await fetch(`${srv.url}/api/v1/relay/${boxId}/envelopes/${blobA}`, {
+          headers,
+        })
+      ).status,
+    ).toBe(404);
+
+    // Verify boundary logs redact boxId and blobId completely
+    const getLogs = capturedLogs
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.event === "relay.envelope.get");
+    expect(getLogs.length).toBeGreaterThanOrEqual(2);
+    for (const entry of getLogs) {
+      expect(entry.path).toBe("/api/v1/relay/:boxId/envelopes");
+    }
+    for (const line of capturedLogs) {
+      expect(line).not.toContain(boxId);
+      expect(line).not.toContain(blobA);
+      expect(line).not.toContain(blobB);
+      expect(line).not.toContain(blobC);
     }
   });
 });

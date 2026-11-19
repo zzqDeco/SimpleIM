@@ -52,6 +52,11 @@ export interface BlindRelayStorePort {
     nowMs: number;
     ttlMs: number;
   }): PutRelayEnvelopeResult;
+  getEnvelope(params: {
+    boxId: string;
+    blobId: string;
+    nowMs: number;
+  }): Uint8Array | null;
   listEnvelopes(params: {
     boxId: string;
     afterSeq: number;

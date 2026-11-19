@@ -332,6 +332,36 @@ export class HttpHandler {
 
         if (
           method === "GET" &&
+          segments.length === 7 &&
+          segments[5] === "envelopes"
+        ) {
+          const { auth } = this.requireAuthenticated(
+            req,
+            url,
+            originHeader,
+            false,
+          );
+          loggedUserId = auth.user.id;
+          const envelopeBytes = this.relayService.getEnvelope({
+            userId: auth.user.id,
+            clientIp,
+            boxId: segments[4] ?? "",
+            blobId: segments[6] ?? "",
+          });
+          const res = this.binaryResponse(200, envelopeBytes, corsHeaders);
+          this.logBoundary("info", "relay.envelope.get", {
+            corrId,
+            method,
+            path: logPath,
+            status: 200,
+            userId: loggedUserId,
+            durationMs: this.clock.nowMs() - startMs,
+          });
+          return res;
+        }
+
+        if (
+          method === "GET" &&
           segments.length === 6 &&
           segments[5] === "envelopes"
         ) {

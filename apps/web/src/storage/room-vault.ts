@@ -64,6 +64,7 @@ export interface HydratedVaultRoom {
   readonly messages: ChatMessageEnvelope[];
   readonly files: FileManifest[];
   readonly pendingRelayMsgIds: string[];
+  readonly hasPersistedOutbox: boolean;
   readonly relayCursor: number;
 }
 
@@ -86,6 +87,7 @@ export interface CommittedRoomStateResult {
   readonly messages?: ChatMessageEnvelope[];
   readonly files?: FileManifest[];
   readonly pendingRelayMsgIds: string[];
+  readonly hasPersistedOutbox: boolean;
   readonly relayCursor: number;
 }
 
@@ -978,6 +980,7 @@ export class RoomVault {
           }
         }
 
+        const hasPersistedOutbox = Array.isArray(rawRoom.pendingRelayMsgIds);
         const pendingRelayMsgIds = sanitizePendingRelayMsgIds(
           rawRoom.pendingRelayMsgIds,
         );
@@ -989,6 +992,7 @@ export class RoomVault {
           messages,
           files,
           pendingRelayMsgIds,
+          hasPersistedOutbox,
           relayCursor,
         });
       } catch {
@@ -1056,6 +1060,15 @@ export class RoomVault {
               : metadata.lastReadAt,
         };
 
+        const hadPersistedOutbox =
+          existingRoom !== null &&
+          Array.isArray(existingRoom.pendingRelayMsgIds);
+        const hasPendingMutation =
+          replacePending !== undefined ||
+          (addPending !== undefined && addPending.length > 0);
+        const shouldPersistOutbox =
+          existingRoom === null || hadPersistedOutbox || hasPendingMutation;
+
         const pendingSet = new Set<string>(
           replacePending !== undefined
             ? sanitizePendingRelayMsgIds(replacePending)
@@ -1071,9 +1084,9 @@ export class RoomVault {
             pendingSet.delete(id);
           }
         }
-        const pendingRelayMsgIds = Array.from(pendingSet).slice(
-          -MAX_VAULT_MESSAGES_PER_ROOM,
-        );
+        const pendingRelayMsgIds = shouldPersistOutbox
+          ? Array.from(pendingSet).slice(-MAX_VAULT_MESSAGES_PER_ROOM)
+          : [];
 
         const existingCursor = sanitizeRelayCursor(existingRoom?.relayCursor);
         let relayCursor = existingCursor;
@@ -1117,7 +1130,7 @@ export class RoomVault {
           joinedAt: mergedMetadata.joinedAt,
           lastActiveAt: mergedMetadata.lastActiveAt,
           lastReadAt: mergedMetadata.lastReadAt,
-          pendingRelayMsgIds,
+          ...(shouldPersistOutbox ? { pendingRelayMsgIds } : {}),
           relayCursor,
         };
 
@@ -1142,6 +1155,7 @@ export class RoomVault {
           ...(finalMessages !== undefined ? { messages: finalMessages } : {}),
           ...(finalFiles !== undefined ? { files: finalFiles } : {}),
           pendingRelayMsgIds,
+          hasPersistedOutbox: shouldPersistOutbox,
           relayCursor,
         };
       }),

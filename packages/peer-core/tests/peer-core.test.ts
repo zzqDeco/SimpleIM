@@ -3,6 +3,8 @@ import {
   decodeSwarmFrame,
   encodeSwarmFrame,
   MAX_CHAT_LAMPORT,
+  MAX_SYNC_MESSAGES,
+  RELAY_AEAD_OVERHEAD_BYTES,
   SWARM_CHUNK_SIZE,
   SWARM_HASH_PAGE_CHUNKS,
   SWARM_HEADER_BYTES,
@@ -16,12 +18,14 @@ import {
   bytesToBase64Url,
   computeChannelBindingTranscript,
   createHelloProveFrame,
+  createSignedFileManifestFromChunks,
   deriveRelayChunkBlobId,
   deriveRelayFileTag,
   deriveRelayKeys,
   deriveRoomKeys,
   generateEd25519KeyPair,
   issuePeerIdentityCert,
+  openPostAuthControlFrame,
   sealPostAuthControlFrame,
   sealRelayChunkBinary,
   signChatMessage,
@@ -3901,4 +3905,641 @@ describe("@simpleim/peer-core — RoomPeerEngine", () => {
       }
     }
   });
+
+  test(
+    "15a. Codex review Fix 1: persisted-cursor reload downloads >32 MiB paged files via direct getEnvelope and scan fallback",
+    async () => {
+      const ca = createTestServerCA();
+      const roomKeys = deriveRoomKeys(
+        "codex-review-fix1-paged-reload",
+        FAST_KDF,
+      );
+      const relayHub = new MockBlindRelayHub({
+        maxFileBytes: 64 * 1024 * 1024,
+      });
+      const seederHub = new MockSignalingHub();
+      const seederNet = new MockPeerTransportNetwork();
+      const totalChunks = SWARM_HASH_PAGE_CHUNKS + 4; // 516 chunks -> 2 hash pages
+      const pagedSize = totalChunks * SWARM_CHUNK_SIZE;
+      const makeVirtualPagedChunk = (chunkIndex: number): Uint8Array => {
+        const buf = new Uint8Array(SWARM_CHUNK_SIZE);
+        buf.fill((chunkIndex * 31 + 7) & 0xff);
+        buf[0] = chunkIndex & 0xff;
+        buf[1] = (chunkIndex >>> 8) & 0xff;
+        return buf;
+      };
+
+      const seeder = createTestPeerRig({
+        ca,
+        hub: seederHub,
+        network: seederNet,
+        roomKeys,
+        peerId: "peer_15a_seeder01",
+        username: "alice",
+        relayClient: relayHub.createClient(),
+        syncIntervalMs: 0,
+      });
+
+      let pagedManifest!: FileManifest;
+      try {
+        await seeder.engine.start();
+        pagedManifest = await seeder.engine.shareFile({
+          fileName: "paged-reload.bin",
+          fileSize: pagedSize,
+          readChunk: async (chunkIndex) => makeVirtualPagedChunk(chunkIndex),
+        });
+        expect(pagedManifest.hashPageHashes?.length).toBe(2);
+        await waitFor(
+          () =>
+            seeder.engine.getTransferProgress(pagedManifest.fileId)
+              ?.relayCacheState === "cached",
+          10_000,
+        );
+      } finally {
+        await seeder.engine.stop();
+      }
+
+      // First receiver session pulls hash_page + manifest envelopes and records persisted cursor
+      const firstRecHub = new MockSignalingHub();
+      const firstRecNet = new MockPeerTransportNetwork();
+      let persistedCursor = 0;
+      const rec1 = createTestPeerRig({
+        ca,
+        hub: firstRecHub,
+        network: firstRecNet,
+        roomKeys,
+        peerId: "peer_15a_recv0001",
+        username: "bob",
+        relayClient: relayHub.createClient(),
+        syncIntervalMs: 0,
+        extraEvents: {
+          onRelayBatchPulled: (batch) => {
+            persistedCursor = batch.nextCursor;
+          },
+        },
+      });
+      try {
+        await rec1.engine.start();
+        await waitFor(() => rec1.announcedFiles.length === 1);
+        expect(persistedCursor).toBeGreaterThanOrEqual(3);
+      } finally {
+        await rec1.engine.stop();
+      }
+
+      // Simulated browser reload #1 (direct getEnvelope supported): starts with persisted manifest + cursor
+      const reloadHub1 = new MockSignalingHub();
+      const reloadNet1 = new MockPeerTransportNetwork();
+      const reloadRelay1 = relayHub.createClient();
+      const reload1Batches: number[] = [];
+      const recReload1 = createTestPeerRig({
+        ca,
+        hub: reloadHub1,
+        network: reloadNet1,
+        roomKeys,
+        peerId: "peer_15a_recv0002",
+        username: "bob",
+        relayClient: reloadRelay1,
+        initialFiles: [pagedManifest],
+        initialRelayCursor: persistedCursor,
+        syncIntervalMs: 0,
+        extraEvents: {
+          onRelayBatchPulled: (batch) => {
+            reload1Batches.push(batch.nextCursor);
+          },
+        },
+      });
+      try {
+        await recReload1.engine.start();
+        await waitFor(() => reloadRelay1.listEnvelopeCalls >= 1);
+        await recReload1.engine.downloadFile(pagedManifest.fileId);
+        await waitFor(() => recReload1.completedFiles.length === 1, 10_000);
+        expect(reloadRelay1.getEnvelopeCalls).toBeGreaterThanOrEqual(2);
+        expect(reload1Batches).toEqual([]);
+        const assembled1 = recReload1.storage.getFinalizedBytes(
+          pagedManifest.fileId,
+        );
+        expect(assembled1?.byteLength).toBe(pagedSize);
+        expect(assembled1?.subarray(0, 4)).toEqual(
+          makeVirtualPagedChunk(0).subarray(0, 4),
+        );
+        expect(
+          assembled1?.subarray(
+            (totalChunks - 1) * SWARM_CHUNK_SIZE,
+            (totalChunks - 1) * SWARM_CHUNK_SIZE + 4,
+          ),
+        ).toEqual(makeVirtualPagedChunk(totalChunks - 1).subarray(0, 4));
+      } finally {
+        await recReload1.engine.stop();
+      }
+
+      // Simulated browser reload #2 (getEnvelope omitted -> cursor-independent scan fallback)
+      const reloadHub2 = new MockSignalingHub();
+      const reloadNet2 = new MockPeerTransportNetwork();
+      const reloadRelay2 = relayHub.createClient({ disableGetEnvelope: true });
+      const reload2Batches: number[] = [];
+      const recReload2 = createTestPeerRig({
+        ca,
+        hub: reloadHub2,
+        network: reloadNet2,
+        roomKeys,
+        peerId: "peer_15a_recv0003",
+        username: "bob",
+        relayClient: reloadRelay2,
+        initialFiles: [pagedManifest],
+        initialRelayCursor: persistedCursor,
+        syncIntervalMs: 0,
+        extraEvents: {
+          onRelayBatchPulled: (batch) => {
+            reload2Batches.push(batch.nextCursor);
+          },
+        },
+      });
+      try {
+        await recReload2.engine.start();
+        await waitFor(() => reloadRelay2.listEnvelopeCalls >= 1);
+        await recReload2.engine.downloadFile(pagedManifest.fileId);
+        await waitFor(() => recReload2.completedFiles.length === 1, 10_000);
+        expect(reloadRelay2.recordedListAfterSeqs).toContain(0);
+        expect(reload2Batches).toEqual([]);
+        reloadHub2.shutdownCenterServer();
+        reloadHub2.restartCenterServer();
+        await recReload2.signaling.connect();
+        await waitFor(
+          () =>
+            reloadRelay2.recordedListAfterSeqs[
+              reloadRelay2.recordedListAfterSeqs.length - 1
+            ] === persistedCursor &&
+            reloadRelay2.recordedListAfterSeqs.length >= 3,
+        );
+      } finally {
+        await recReload2.engine.stop();
+      }
+    },
+    20_000,
+  );
+
+  test("15b & 15c. Codex review Fixes 4 & 5: AEAD wire-byte quota eligibility and relay-slot release on download retry", async () => {
+    const ca = createTestServerCA();
+    const roomKeys = deriveRoomKeys(
+      "codex-review-fix4-fix5-passphrase",
+      FAST_KDF,
+    );
+
+    // 15b (Fix 4): Relay file eligibility accounts for per-chunk XChaCha20-Poly1305 overhead (40 B/chunk)
+    {
+      const exactTwoChunkBytes = 2 * SWARM_CHUNK_SIZE;
+      const relayHub = new MockBlindRelayHub({
+        maxFileBytes: exactTwoChunkBytes,
+      });
+      const hub = new MockSignalingHub();
+      const net = new MockPeerTransportNetwork();
+      const relayClient = relayHub.createClient();
+      const seeder = createTestPeerRig({
+        ca,
+        hub,
+        network: net,
+        roomKeys,
+        peerId: "peer_15b_seeder01",
+        username: "alice",
+        relayClient,
+        syncIntervalMs: 0,
+      });
+
+      try {
+        await seeder.engine.start();
+
+        const overQuotaBytes = makeDeterministicPayload(exactTwoChunkBytes);
+        const overManifest = await seeder.engine.shareFile({
+          fileName: "over-by-aead-overhead.bin",
+          fileSize: overQuotaBytes.byteLength,
+          readChunk: makeSliceReader(overQuotaBytes),
+        });
+        expect(
+          seeder.engine.getTransferProgress(overManifest.fileId)
+            ?.relayCacheState,
+        ).toBe("too_large");
+        await new Promise<void>((r) => setTimeout(r, 40));
+        expect(relayClient.putChunkCalls).toBe(0);
+
+        const exactFitBytes = makeDeterministicPayload(
+          exactTwoChunkBytes - 2 * RELAY_AEAD_OVERHEAD_BYTES,
+        );
+        const fitManifest = await seeder.engine.shareFile({
+          fileName: "exact-wire-fit.bin",
+          fileSize: exactFitBytes.byteLength,
+          readChunk: makeSliceReader(exactFitBytes),
+        });
+        await waitFor(
+          () =>
+            seeder.engine.getTransferProgress(fitManifest.fileId)
+              ?.relayCacheState === "cached",
+        );
+        expect(relayClient.putChunkCalls).toBe(2);
+      } finally {
+        await seeder.engine.stop();
+      }
+    }
+
+    // 15c (Fix 5): Retrying a failed relay download clears obsolete in-flight relay slots without leaking the 4-slot cap
+    {
+      const relayHub = new MockBlindRelayHub();
+      const seederHub = new MockSignalingHub();
+      const seederNet = new MockPeerTransportNetwork();
+      const fiveChunkBytes = makeDeterministicPayload(5 * SWARM_CHUNK_SIZE);
+
+      const seeder = createTestPeerRig({
+        ca,
+        hub: seederHub,
+        network: seederNet,
+        roomKeys,
+        peerId: "peer_15c_seeder01",
+        username: "alice",
+        relayClient: relayHub.createClient(),
+        syncIntervalMs: 0,
+      });
+
+      let fiveChunkManifest!: FileManifest;
+      try {
+        await seeder.engine.start();
+        fiveChunkManifest = await seeder.engine.shareFile({
+          fileName: "five-chunk-retry.bin",
+          fileSize: fiveChunkBytes.byteLength,
+          readChunk: makeSliceReader(fiveChunkBytes),
+        });
+        await waitFor(
+          () =>
+            seeder.engine.getTransferProgress(fiveChunkManifest.fileId)
+              ?.relayCacheState === "cached",
+        );
+      } finally {
+        await seeder.engine.stop();
+      }
+
+      const recvHub = new MockSignalingHub();
+      const recvNet = new MockPeerTransportNetwork();
+      const baseRelay = relayHub.createClient();
+      const delayedGen1Resolvers: Array<() => void> = [];
+      let getChunkCallNum = 0;
+
+      const gatedRelay: BlindRelayClientPort = {
+        enabled: baseRelay.enabled,
+        maxFileBytes: baseRelay.maxFileBytes,
+        putEnvelope: (p) => baseRelay.putEnvelope(p),
+        getEnvelope: baseRelay.getEnvelope
+          ? (p) => baseRelay.getEnvelope!(p)
+          : undefined,
+        listEnvelopes: (p) => baseRelay.listEnvelopes(p),
+        putChunk: (p) => baseRelay.putChunk(p),
+        getChunk: async (p) => {
+          getChunkCallNum += 1;
+          const myCall = getChunkCallNum;
+          if (myCall >= 2 && myCall <= 4) {
+            await new Promise<void>((resolve) => {
+              delayedGen1Resolvers.push(resolve);
+            });
+          }
+          return baseRelay.getChunk(p);
+        },
+      };
+
+      const receiver = createTestPeerRig({
+        ca,
+        hub: recvHub,
+        network: recvNet,
+        roomKeys,
+        peerId: "peer_15c_recv0001",
+        username: "bob",
+        relayClient: gatedRelay,
+        syncIntervalMs: 0,
+      });
+
+      let failedOnce = false;
+      const origWrite = receiver.storage.writeVerifiedChunk.bind(
+        receiver.storage,
+      );
+      receiver.storage.writeVerifiedChunk = async (
+        fileId,
+        chunkIndex,
+        data,
+      ) => {
+        if (!failedOnce) {
+          failedOnce = true;
+          throw new Error("Transient OPFS write failure");
+        }
+        return origWrite(fileId, chunkIndex, data);
+      };
+
+      try {
+        await receiver.engine.start();
+        await waitFor(() => receiver.announcedFiles.length === 1);
+        await receiver.engine.downloadFile(fiveChunkManifest.fileId);
+
+        await waitFor(
+          () =>
+            receiver.engine.getTransferProgress(fiveChunkManifest.fileId)
+              ?.status === "error" && delayedGen1Resolvers.length === 3,
+        );
+
+        await receiver.engine.downloadFile(fiveChunkManifest.fileId);
+        await waitFor(() => receiver.completedFiles.length === 1, 5_000);
+        expect(
+          receiver.storage.getFinalizedBytes(fiveChunkManifest.fileId),
+        ).toEqual(fiveChunkBytes);
+
+        while (delayedGen1Resolvers.length > 0) {
+          delayedGen1Resolvers.shift()!();
+        }
+        await new Promise<void>((r) => setTimeout(r, 20));
+      } finally {
+        await receiver.engine.stop();
+      }
+    }
+  });
+
+  test(
+    "15d. Codex review Fix 6: gossip deduplication suppresses older messages outside 2,000-message window without triangle loops",
+    async () => {
+      const ca = createTestServerCA();
+      const roomKeys = deriveRoomKeys(
+        "codex-review-fix6-gossip-dedup",
+        FAST_KDF,
+      );
+      const hub = new MockSignalingHub();
+      const net = new MockPeerTransportNetwork();
+      const baseTs = Date.now() - 10_000;
+      const authorKeys = generateEd25519KeyPair();
+      const authorCert = issuePeerIdentityCert({
+        serverKeyId: ca.serverKeyId,
+        serverSignPrivKey: ca.keyPair.privateKeyBytes,
+        userId: "usr_hist000001",
+        username: "hist",
+        displayName: "Hist",
+        peerId: "peer_15d_hist0001",
+        peerSignPubKey: authorKeys.publicKeyBase64Url,
+        clientKind: "cli",
+        nowMs: baseTs - 60_000,
+        ttlMs: 3_600_000,
+      });
+
+      const retained2000: ChatMessageEnvelope[] = [];
+      for (let i = 0; i < 2_000; i++) {
+        retained2000.push(
+          signChatMessage({
+            roomId: roomKeys.roomId,
+            lamport: 1_001 + i,
+            body: `m${i}`,
+            authorCert,
+            peerSignPrivKey: authorKeys.privateKeyBytes,
+            createdAt: baseTs + i,
+          }),
+        );
+      }
+      const olderEvictedMsg = signChatMessage({
+        roomId: roomKeys.roomId,
+        lamport: 1,
+        body: "ancient-evicted-msg",
+        authorCert,
+        peerSignPrivKey: authorKeys.privateKeyBytes,
+        createdAt: baseTs - 1_000,
+      });
+
+      const peerA = createTestPeerRig({
+        ca,
+        hub,
+        network: net,
+        roomKeys,
+        peerId: "peer_15d_01alice0",
+        username: "alice",
+        initialMessages: retained2000,
+        syncIntervalMs: 0,
+      });
+      const peerB = createTestPeerRig({
+        ca,
+        hub,
+        network: net,
+        roomKeys,
+        peerId: "peer_15d_02bob000",
+        username: "bob",
+        initialMessages: retained2000,
+        syncIntervalMs: 0,
+      });
+      const peerC = createTestPeerRig({
+        ca,
+        hub,
+        network: net,
+        roomKeys,
+        peerId: "peer_15d_03carol0",
+        username: "carol",
+        initialMessages: retained2000,
+        syncIntervalMs: 0,
+      });
+
+      expect(peerB.engine.getMessages().length).toBe(2_000);
+
+      try {
+        await Promise.all([
+          peerA.engine.start(),
+          peerB.engine.start(),
+          peerC.engine.start(),
+        ]);
+        await waitFor(
+          () =>
+            peerA.engine.getVerifiedPeers().length === 2 &&
+            peerB.engine.getVerifiedPeers().length === 2 &&
+            peerC.engine.getVerifiedPeers().length === 2,
+        );
+
+        let forwardedChatFrames = 0;
+        const bToC = peerB.connections.find(
+          (c) => c.remotePeerId === peerC.peerId,
+        )!;
+        bToC.controlChannel.setTextOutgoingInterceptor((raw) => {
+          try {
+            const parsed = JSON.parse(raw) as { type?: string };
+            if (parsed.type === "control.sealed") {
+              const inner = openPostAuthControlFrame(
+                roomKeys.roomAppKey,
+                roomKeys.roomId,
+                parsed as Parameters<typeof openPostAuthControlFrame>[2],
+              );
+              if (inner.type === "chat.message") {
+                forwardedChatFrames += 1;
+              }
+            }
+          } catch {
+            // Ignore non-matching frames
+          }
+          return raw;
+        });
+
+        // Inject valid older message (lamport=1) directly from A -> B
+        const aToB = peerA.connections.find(
+          (c) => c.remotePeerId === peerB.peerId,
+        )!;
+        const sealedOld = sealPostAuthControlFrame(
+          roomKeys.roomAppKey,
+          roomKeys.roomId,
+          { type: "chat.message", message: olderEvictedMsg },
+        );
+        aToB.controlChannel.sendText(JSON.stringify(sealedOld));
+
+        await new Promise<void>((r) => setTimeout(r, 80));
+        expect(peerB.receivedChat.length).toBe(0);
+        expect(peerC.receivedChat.length).toBe(0);
+        expect(forwardedChatFrames).toBe(0);
+        expect(peerB.engine.getMessages().length).toBe(2_000);
+        expect(
+          peerB.engine
+            .getMessages()
+            .some((m) => m.msgId === olderEvictedMsg.msgId),
+        ).toBe(false);
+
+        // Positive control: a newer valid message (lamport=5000) DOES ingest & forward once to C!
+        const newerMsg = signChatMessage({
+          roomId: roomKeys.roomId,
+          lamport: 5_000,
+          body: "newer-valid-msg",
+          authorCert,
+          peerSignPrivKey: authorKeys.privateKeyBytes,
+          createdAt: baseTs + 5_000,
+        });
+        const sealedNew = sealPostAuthControlFrame(
+          roomKeys.roomAppKey,
+          roomKeys.roomId,
+          { type: "chat.message", message: newerMsg },
+        );
+        aToB.controlChannel.sendText(JSON.stringify(sealedNew));
+        await waitFor(
+          () => peerB.receivedChat.length === 1 && peerC.receivedChat.length === 1,
+        );
+        expect(forwardedChatFrames).toBe(1);
+      } finally {
+        await Promise.all([
+          peerA.engine.stop(),
+          peerB.engine.stop(),
+          peerC.engine.stop(),
+        ]);
+      }
+    },
+    20_000,
+  );
+
+  test(
+    "15e. Codex review Fix 7: converged peers with >500 files emit ZERO redundant sync.batch pushes on truncated sync.summary",
+    async () => {
+      const ca = createTestServerCA();
+      const roomKeys = deriveRoomKeys(
+        "codex-review-fix7-truncated-summary",
+        FAST_KDF,
+      );
+      const hub = new MockSignalingHub();
+      const net = new MockPeerTransportNetwork();
+      const fileAuthorKeys = generateEd25519KeyPair();
+      const fileAuthorCert = issuePeerIdentityCert({
+        serverKeyId: ca.serverKeyId,
+        serverSignPrivKey: ca.keyPair.privateKeyBytes,
+        userId: "usr_files00001",
+        username: "files",
+        displayName: "Files",
+        peerId: "peer_15e_files001",
+        peerSignPubKey: fileAuthorKeys.publicKeyBase64Url,
+        clientKind: "cli",
+      });
+
+      const emptyReader = async () => new Uint8Array(0);
+      const filesA: FileManifest[] = [];
+      const filesB: FileManifest[] = [];
+      for (let i = 0; i < MAX_SYNC_MESSAGES; i++) {
+        filesA.push(
+          await createSignedFileManifestFromChunks({
+            roomId: roomKeys.roomId,
+            fileName: `a-${i}.txt`,
+            fileSize: 0,
+            readChunk: emptyReader,
+            senderCert: fileAuthorCert,
+            peerSignPrivKey: fileAuthorKeys.privateKeyBytes,
+          }),
+        );
+        filesB.push(
+          await createSignedFileManifestFromChunks({
+            roomId: roomKeys.roomId,
+            fileName: `b-${i}.txt`,
+            fileSize: 0,
+            readChunk: emptyReader,
+            senderCert: fileAuthorCert,
+            peerSignPrivKey: fileAuthorKeys.privateKeyBytes,
+          }),
+        );
+      }
+
+      const peerA = createTestPeerRig({
+        ca,
+        hub,
+        network: net,
+        roomKeys,
+        peerId: "peer_15e_01alice0",
+        username: "alice",
+        initialFiles: filesA,
+        syncIntervalMs: 50,
+      });
+      const peerB = createTestPeerRig({
+        ca,
+        hub,
+        network: net,
+        roomKeys,
+        peerId: "peer_15e_02bob000",
+        username: "bob",
+        initialFiles: filesB,
+        syncIntervalMs: 50,
+      });
+
+      try {
+        await Promise.all([peerA.engine.start(), peerB.engine.start()]);
+        await waitFor(
+          () =>
+            peerA.engine.getFiles().length === MAX_SYNC_MESSAGES * 2 &&
+            peerB.engine.getFiles().length === MAX_SYNC_MESSAGES * 2,
+          10_000,
+        );
+
+        let postConvergeSummaries = 0;
+        let postConvergeSyncBatches = 0;
+        for (const [rig, remoteId] of [
+          [peerA, peerB.peerId],
+          [peerB, peerA.peerId],
+        ] as const) {
+          const conn = rig.connections.find(
+            (c) => c.remotePeerId === remoteId,
+          )!;
+          conn.controlChannel.setTextOutgoingInterceptor((raw) => {
+            try {
+              const parsed = JSON.parse(raw) as { type?: string };
+              if (parsed.type === "control.sealed") {
+                const inner = openPostAuthControlFrame(
+                  roomKeys.roomAppKey,
+                  roomKeys.roomId,
+                  parsed as Parameters<typeof openPostAuthControlFrame>[2],
+                );
+                if (inner.type === "sync.summary") {
+                  postConvergeSummaries += 1;
+                } else if (inner.type === "sync.batch") {
+                  postConvergeSyncBatches += 1;
+                }
+              }
+            } catch {
+              // Ignore non-control.sealed frames
+            }
+            return raw;
+          });
+        }
+
+        await waitFor(() => postConvergeSummaries >= 4, 3_000);
+        await new Promise<void>((r) => setTimeout(r, 80));
+        expect(postConvergeSyncBatches).toBe(0);
+      } finally {
+        await Promise.all([peerA.engine.stop(), peerB.engine.stop()]);
+      }
+    },
+    20_000,
+  );
 });

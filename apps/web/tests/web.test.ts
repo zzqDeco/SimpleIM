@@ -15,11 +15,13 @@ import {
   deriveRoomKeys,
   generateEd25519KeyPair,
   issuePeerIdentityCert,
+  randomBytes,
   sha256Hex,
   signChatMessage,
+  utf8ToBytes,
   wipeRoomKeys,
 } from "@simpleim/crypto";
-import { SignalingServerError } from "@simpleim/peer-core";
+import { SignalingServerError, type ChatDeliveryStatus } from "@simpleim/peer-core";
 import { HttpApiError, HttpAuthClient } from "../src/api/http-client.ts";
 import { deriveRoomKeysOffThread } from "../src/crypto/kdf-client.ts";
 import {
@@ -41,6 +43,7 @@ import {
   writeStoredLocale,
 } from "../src/i18n/registry.ts";
 import { LOCALE_CODES, type TranslationKey } from "../src/i18n/types.ts";
+import { reconcileCommittedRoomState } from "../src/state/collections.ts";
 import { deriveMessageViewModel } from "../src/state/message-vm.ts";
 import {
   buildSortedRoomSummaries,
@@ -1891,6 +1894,15 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
             { status: 201 },
           );
         }
+        if (url.pathname === `/api/v1/relay/${boxId}/envelopes/${blobId}`) {
+          return new Response(new Uint8Array(64).fill(0x11), { status: 200 });
+        }
+        if (url.pathname.startsWith(`/api/v1/relay/${boxId}/envelopes/`)) {
+          return Response.json(
+            { ok: false, error: { code: "not_found", message: "Not found" } },
+            { status: 404 },
+          );
+        }
         return Response.json({
           ok: true,
           items: [],
@@ -1916,6 +1928,13 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
       keepalive: true,
     });
     expect(seenKeepalive).toEqual([true]);
+
+    expect(await relay.getEnvelope?.({ boxId, blobId })).toEqual(
+      new Uint8Array(64).fill(0x11),
+    );
+    expect(
+      await relay.getEnvelope?.({ boxId, blobId: "0".repeat(32) }),
+    ).toBeNull();
 
     const listed = await relay.listEnvelopes({ boxId, afterSeq: 99 });
     expect(listed.cursorReset).toBe(true);
@@ -2138,5 +2157,230 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(hydratedAfterReset[0]!.pendingRelayMsgIds).toEqual([msg2.msgId]);
 
     wipeRoomKeys(roomKeys);
+  });
+
+  test("Codex review regressions (Fixes 2 & 3): reconcileCommittedRoomState merges concurrent live updates and RoomVault distinguishes legacy rooms from acknowledged empty outboxes", async () => {
+    const userId = "usr_019a00000000700080000000000000bb";
+    const fastKdf = { memoryKiB: 64, iterations: 1 } as const;
+    const roomKeys = deriveRoomKeys(
+      "legacy-and-reconcile-vault-passphrase",
+      fastKdf,
+    );
+    const serverKeys = generateEd25519KeyPair();
+    const peerKeys = generateEd25519KeyPair();
+    const cert = issuePeerIdentityCert({
+      serverKeyId: "srvk_test",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId,
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_019a00000000700080000000000000bb",
+      peerSignPubKey: peerKeys.publicKeyBase64Url,
+      clientKind: "web",
+    });
+
+    const msg1 = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 1,
+      body: "Local sent msg #1",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: 1_765_000_001_000,
+    });
+    const msgLiveP2P = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 2,
+      body: "Live P2P msg arrived during vault await",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: 1_765_000_002_000,
+    });
+    const msgOtherTab = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 3,
+      body: "Message merged from another tab on disk",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: 1_765_000_003_000,
+    });
+    const msgConcurrentSend = signChatMessage({
+      roomId: roomKeys.roomId,
+      lamport: 4,
+      body: "Second local send while first commit awaited",
+      authorCert: cert,
+      peerSignPrivKey: peerKeys.privateKeyBytes,
+      createdAt: 1_765_000_004_000,
+    });
+
+    // Fix 2: reconcileCommittedRoomState merges committed snapshot with concurrent live changes
+    const reconciled = reconcileCommittedRoomState({
+      liveMetadata: {
+        roomId: roomKeys.roomId,
+        roomIdPrefix: roomKeys.roomIdPrefix,
+        alias: "Live Renamed Group",
+        pinned: true,
+        joinedAt: 1_765_000_000_000,
+        lastActiveAt: 1_765_000_004_000,
+        lastReadAt: 1_765_000_004_000,
+      },
+      liveMessages: [msg1, msgLiveP2P, msgConcurrentSend],
+      liveFiles: [],
+      // msg1 became relayed while commit was in flight; msgConcurrentSend was added concurrently
+      livePendingRelayMsgIds: new Set([msgConcurrentSend.msgId]),
+      liveDeliveryStates: new Map<string, ChatDeliveryStatus>([
+        [msg1.msgId, "relayed"],
+        [msgConcurrentSend.msgId, "pending"],
+      ]),
+      liveRelayCursor: 4,
+      committedMetadata: {
+        roomId: roomKeys.roomId,
+        roomIdPrefix: roomKeys.roomIdPrefix,
+        alias: "Stale Pre-Rename Alias",
+        pinned: false,
+        joinedAt: 1_764_999_999_000,
+        lastActiveAt: 1_765_000_003_000,
+        lastReadAt: 1_765_000_001_000,
+      },
+      committedMessages: [msg1, msgOtherTab],
+      committedPendingRelayMsgIds: [msg1.msgId, msgOtherTab.msgId],
+      committedRelayCursor: 6,
+    });
+
+    // Keeps live P2P message, concurrent send, AND other-tab disk message in Lamport order
+    expect(reconciled.messages.map((m) => m.msgId)).toEqual([
+      msg1.msgId,
+      msgLiveP2P.msgId,
+      msgOtherTab.msgId,
+      msgConcurrentSend.msgId,
+    ]);
+    // Preserves live alias/pinned while merging monotonic timestamps
+    expect(reconciled.metadata.alias).toBe("Live Renamed Group");
+    expect(reconciled.metadata.pinned).toBe(true);
+    expect(reconciled.metadata.joinedAt).toBe(1_764_999_999_000);
+    expect(reconciled.metadata.lastActiveAt).toBe(1_765_000_004_000);
+    expect(reconciled.metadata.lastReadAt).toBe(1_765_000_004_000);
+    // Does NOT resurrect already-relayed msg1, keeps msgConcurrentSend, and includes other-tab pending ID
+    expect(Array.from(reconciled.pendingRelayMsgIds).sort()).toEqual(
+      [msgConcurrentSend.msgId, msgOtherTab.msgId].sort(),
+    );
+    expect(reconciled.relayCursor).toBe(6);
+
+    // Fix 3: RoomVault distinguishes legacy rooms (missing pendingRelayMsgIds) from acknowledged empty outbox ([])
+    const backend = new InMemoryVaultBackend();
+    const vault = new RoomVault(backend);
+
+    // Seed a legacy v0.1.9 room record directly into backend WITHOUT pendingRelayMsgIds
+    const deviceKey = await globalThis.crypto.subtle.generateKey(
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"],
+    );
+    await backend.putDeviceKey(userId, deviceKey);
+    const legacyRoomPayload = {
+      v: 1,
+      roomId: roomKeys.roomId,
+      roomIdPrefix: roomKeys.roomIdPrefix,
+      signalingKeyB64: bytesToBase64Url(roomKeys.signalingKey),
+      roomAuthKeyB64: bytesToBase64Url(roomKeys.roomAuthKey),
+      roomAppKeyB64: bytesToBase64Url(roomKeys.roomAppKey),
+      alias: "Legacy v0.1.9 Room",
+      pinned: false,
+      joinedAt: 1_765_000_000_000,
+      lastActiveAt: 1_765_000_001_000,
+      lastReadAt: 1_765_000_001_000,
+      // pendingRelayMsgIds intentionally omitted (legacy v0.1.9 vault schema)
+    };
+    const iv = randomBytes(12);
+    const aad = utf8ToBytes(`simpleim/v1/vault:room:${userId}:${roomKeys.roomId}`);
+    const plain = utf8ToBytes(JSON.stringify(legacyRoomPayload));
+    const cipherBuf = await globalThis.crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv.buffer.slice(iv.byteOffset, iv.byteOffset + iv.byteLength) as ArrayBuffer,
+        additionalData: aad.buffer.slice(
+          aad.byteOffset,
+          aad.byteOffset + aad.byteLength,
+        ) as ArrayBuffer,
+      },
+      deviceKey,
+      plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength) as ArrayBuffer,
+    );
+    await backend.putRoomEntry(userId, roomKeys.roomId, {
+      iv,
+      ciphertext: new Uint8Array(cipherBuf),
+    });
+    await vault.saveRoomMessages(userId, roomKeys.roomId, [msg1]);
+
+    // 1. Legacy room hydrates with hasPersistedOutbox: false
+    const hydratedLegacy = await vault.loadWorkspace(userId);
+    expect(hydratedLegacy).toHaveLength(1);
+    expect(hydratedLegacy[0]!.hasPersistedOutbox).toBe(false);
+    expect(hydratedLegacy[0]!.pendingRelayMsgIds).toEqual([]);
+    expect(hydratedLegacy[0]!.messages.map((m) => m.msgId)).toEqual([msg1.msgId]);
+
+    // 2. Metadata-only saveRoom (e.g. hydration lastReadAt bump or rename/pin) preserves hasPersistedOutbox: false!
+    await vault.saveRoom(
+      userId,
+      {
+        ...hydratedLegacy[0]!.metadata,
+        lastReadAt: 1_765_000_099_000,
+        alias: "Still Legacy After Rename",
+      },
+      roomKeys,
+    );
+    const hydratedAfterSaveRoom = await vault.loadWorkspace(userId);
+    expect(hydratedAfterSaveRoom[0]!.hasPersistedOutbox).toBe(false);
+    expect(hydratedAfterSaveRoom[0]!.metadata.alias).toBe(
+      "Still Legacy After Rename",
+    );
+
+    // 3. Explicit outbox migration (replacePendingRelayMsgIds) transitions hasPersistedOutbox -> true
+    const migrated = await vault.commitRoomState({
+      userId,
+      metadata: hydratedAfterSaveRoom[0]!.metadata,
+      roomKeys,
+      replacePendingRelayMsgIds: [msg1.msgId],
+    });
+    expect(migrated.hasPersistedOutbox).toBe(true);
+    expect(migrated.pendingRelayMsgIds).toEqual([msg1.msgId]);
+
+    // Removing the migrated pending message leaves an acknowledged empty outbox (hasPersistedOutbox: true, [])
+    await vault.commitRoomState({
+      userId,
+      metadata: hydratedAfterSaveRoom[0]!.metadata,
+      roomKeys,
+      removePendingRelayMsgIds: [msg1.msgId],
+    });
+    const hydratedAckedEmpty = await vault.loadWorkspace(userId);
+    expect(hydratedAckedEmpty[0]!.hasPersistedOutbox).toBe(true);
+    expect(hydratedAckedEmpty[0]!.pendingRelayMsgIds).toEqual([]);
+
+    // 4. Brand-new room starts with hasPersistedOutbox: true
+    const newRoomKeys = deriveRoomKeys(
+      "brand-new-v0111-room-passphrase",
+      fastKdf,
+    );
+    await vault.saveRoom(
+      userId,
+      {
+        roomId: newRoomKeys.roomId,
+        roomIdPrefix: newRoomKeys.roomIdPrefix,
+        alias: "Brand New Room",
+        pinned: false,
+        joinedAt: 1_765_000_100_000,
+        lastActiveAt: 1_765_000_100_000,
+        lastReadAt: 1_765_000_100_000,
+      },
+      newRoomKeys,
+    );
+    const hydratedAll = await vault.loadWorkspace(userId);
+    const newHydrated = hydratedAll.find(
+      (r) => r.metadata.roomId === newRoomKeys.roomId,
+    );
+    expect(newHydrated?.hasPersistedOutbox).toBe(true);
+    expect(newHydrated?.pendingRelayMsgIds).toEqual([]);
+
+    wipeRoomKeys(roomKeys);
+    wipeRoomKeys(newRoomKeys);
   });
 });

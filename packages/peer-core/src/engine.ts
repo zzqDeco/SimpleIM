@@ -1,6 +1,7 @@
 import {
   MAX_CHAT_LAMPORT,
   MAX_RELAY_LIST_LIMIT,
+  MAX_SYNC_MESSAGES,
   type ChatMessageEnvelope,
   type FileManifest,
   type PeerIdentityCert,
@@ -128,6 +129,7 @@ export function createRoomPeerEngine(
           client: relayClient,
           relayKeys,
           pullEnvelopes: () => pullFromBlindRelay(),
+          pullHashPagesForFile: (fileId) => pullRelayHashPagesForFile(fileId),
         }
       : undefined,
     initialFiles: options.initialFiles,
@@ -386,12 +388,18 @@ export function createRoomPeerEngine(
           });
         }
 
-        const missingForPeerMsgs = chatSync.computeMessagesPeerLacks(
-          frame.knownMsgIds,
-        );
-        const missingForPeerFiles = swarmScheduler.computeFilesPeerLacks(
-          frame.knownFileIds,
-        );
+        // Only proactively push items absent from the peer's summary when the
+        // summary is non-truncated (< MAX_SYNC_MESSAGES). When a peer advertises
+        // a truncated 500-item window, rely on its explicit sync.request against
+        // its full local inventory to avoid perpetual retransmission loops.
+        const missingForPeerMsgs =
+          frame.knownMsgIds.length < MAX_SYNC_MESSAGES
+            ? chatSync.computeMessagesPeerLacks(frame.knownMsgIds)
+            : [];
+        const missingForPeerFiles =
+          frame.knownFileIds.length < MAX_SYNC_MESSAGES
+            ? swarmScheduler.computeFilesPeerLacks(frame.knownFileIds)
+            : [];
         if (missingForPeerMsgs.length > 0 || missingForPeerFiles.length > 0) {
           sendSyncBatchesToPeer(
             remotePeerId,
@@ -861,6 +869,56 @@ export function createRoomPeerEngine(
       activeRelayPullPromise = pullTask;
     }
     return pullTask;
+  }
+
+  async function pullRelayHashPagesForFile(targetFileId: string): Promise<void> {
+    if (stopped || !relayClient?.enabled) {
+      return;
+    }
+    let scanCursor = 0;
+    try {
+      while (!stopped && relayClient.enabled) {
+        const res = await relayClient.listEnvelopes({
+          boxId: relayKeys.relayBoxId,
+          afterSeq: scanCursor,
+          limit: MAX_RELAY_LIST_LIMIT,
+        });
+        if (stopped) return;
+        for (const item of res.items) {
+          if (stopped) return;
+          try {
+            const inner = openRelayEnvelopeBinary(
+              relayKeys.relayKey,
+              relayKeys.relayBoxId,
+              item.blobId,
+              item.payload,
+            );
+            if (
+              inner.type === "relay.hash_page" &&
+              inner.fileId === targetFileId
+            ) {
+              swarmScheduler.ingestRelayHashPage(
+                inner.fileId,
+                inner.pageIndex,
+                inner.chunkHashes,
+              );
+            }
+          } catch {
+            // Ignore undecryptable/unrelated envelopes during targeted hash-page scan
+          }
+        }
+        if (
+          !res.hasMore ||
+          res.items.length === 0 ||
+          res.nextCursor <= scanCursor
+        ) {
+          break;
+        }
+        scanCursor = res.nextCursor;
+      }
+    } catch {
+      // Ignore transient relay errors; SwarmScheduler evaluates remaining state
+    }
   }
 
   function ensureSignalingListeners(): void {

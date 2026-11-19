@@ -1,4 +1,5 @@
 import {
+  computeRelayFileWireBytes,
   countChunksInBitfield,
   createBitfield,
   decodeSwarmFrame,
@@ -22,6 +23,7 @@ import {
   deriveRelayEnvelopeBlobId,
   deriveRelayFileTag,
   openRelayChunkBinary,
+  openRelayEnvelopeBinary,
   sealRelayChunkBinary,
   sealRelayEnvelopeBinary,
   verifyChunkSha256,
@@ -66,6 +68,7 @@ export interface SwarmRelayContext {
   client: BlindRelayClientPort;
   relayKeys: DerivedRelayKeys;
   pullEnvelopes: () => Promise<void>;
+  pullHashPagesForFile?: (fileId: string) => Promise<void>;
 }
 
 export interface SwarmSchedulerOptions {
@@ -320,7 +323,11 @@ export class SwarmScheduler {
     const relayEnabled = Boolean(this.relay?.client.enabled);
     let shouldUploadToRelay = false;
     if (relayEnabled && this.relay) {
-      if (manifest.fileSize > this.relay.client.maxFileBytes) {
+      const requiredWireBytes = computeRelayFileWireBytes(
+        manifest.fileSize,
+        manifest.totalChunks,
+      );
+      if (requiredWireBytes > this.relay.client.maxFileBytes) {
         entry.relayCacheState = "too_large";
         entry.relayCachedChunks = 0;
         entry.relayExpiresAt = undefined;
@@ -806,6 +813,8 @@ export class SwarmScheduler {
 
     const gen = (entry.downloadGen += 1);
     entry.activeDownloadGen = gen;
+    this.clearInFlightP2PRequestsForFile(entry);
+    this.clearRelayInFlightChunks(entry);
     entry.relayFailedChunks.clear();
     entry.relayPullAttemptedGen = null;
     entry.relayPullInFlight = false;
@@ -964,26 +973,7 @@ export class SwarmScheduler {
     entry.lastSpeedBytesPerSec = 0;
     entry.downloadStartedAt = null;
 
-    // Cancel all in-flight requests for this file across all peers
-    for (const [chunkIndex, peerSet] of entry.chunkInFlightPeers.entries()) {
-      for (const peerId of peerSet) {
-        const peer = this.peers.get(peerId);
-        if (!peer) continue;
-        const reqKey = `${fileId}:${chunkIndex}`;
-        const req = peer.inFlightRequests.get(reqKey);
-        if (req) {
-          clearTimeout(req.timer);
-          peer.inFlightRequests.delete(reqKey);
-        }
-        this.sendSwarmFrameToPeer(peer, {
-          frameType: SwarmFrameType.CANCEL,
-          fileId,
-          chunkIndex,
-          payload: new Uint8Array(0),
-        });
-      }
-    }
-    entry.chunkInFlightPeers.clear();
+    this.clearInFlightP2PRequestsForFile(entry);
 
     // Remove queued outbound chunks for deleted local data
     for (const peer of this.peers.values()) {
@@ -1657,6 +1647,8 @@ export class SwarmScheduler {
         entry.activeDownloadGen = null;
         entry.status = "error";
         entry.errorMessage = errorObj.message;
+        this.clearInFlightP2PRequestsForFile(entry);
+        this.clearRelayInFlightChunks(entry);
         this.emitProgress(entry);
         this.events?.onError?.(errorObj);
       }
@@ -1711,9 +1703,12 @@ export class SwarmScheduler {
           entry.activeDownloadGen = null;
           entry.status = "error";
           entry.errorMessage = errorObj.message;
+          this.clearInFlightP2PRequestsForFile(entry);
+          this.clearRelayInFlightChunks(entry);
           this.emitProgress(entry);
           this.events?.onError?.(errorObj);
         }
+        this.scheduleDownloads();
         return;
       }
       if (
@@ -2069,7 +2064,14 @@ export class SwarmScheduler {
   ): void {
     const relay = this.relay;
     if (!relay || !relay.client.enabled) return;
-    if (entry.manifest.fileSize > relay.client.maxFileBytes) return;
+    if (
+      computeRelayFileWireBytes(
+        entry.manifest.fileSize,
+        entry.manifest.totalChunks,
+      ) > relay.client.maxFileBytes
+    ) {
+      return;
+    }
     if (entry.status !== "downloading" || entry.finalizing) return;
 
     if (this.hasUnrecoverableRelayFailure(entry)) {
@@ -2148,7 +2150,69 @@ export class SwarmScheduler {
     const relay = this.relay;
     try {
       if (relay && relay.client.enabled && !this.stopped) {
-        await relay.pullEnvelopes();
+        const pageDigests = entry.manifest.hashPageHashes;
+        const { client, relayKeys } = relay;
+        if (
+          pageDigests &&
+          pageDigests.length > 0 &&
+          typeof client.getEnvelope === "function"
+        ) {
+          const fileId = entry.manifest.fileId;
+          for (let pageIndex = 0; pageIndex < pageDigests.length; pageIndex++) {
+            if (this.stopped || entry.downloadGen !== gen) {
+              return;
+            }
+            if (entry.verifiedHashPages.has(pageIndex)) {
+              continue;
+            }
+            const pageBlobId = deriveRelayEnvelopeBlobId(
+              relayKeys.relayIdKey,
+              "hash_page",
+              `${fileId}:${pageIndex}`,
+            );
+            try {
+              const wireBytes = await client.getEnvelope({
+                boxId: relayKeys.relayBoxId,
+                blobId: pageBlobId,
+              });
+              if (this.stopped || entry.downloadGen !== gen) {
+                return;
+              }
+              if (wireBytes !== null) {
+                const inner = openRelayEnvelopeBinary(
+                  relayKeys.relayKey,
+                  relayKeys.relayBoxId,
+                  pageBlobId,
+                  wireBytes,
+                );
+                if (
+                  inner.type === "relay.hash_page" &&
+                  inner.fileId === fileId &&
+                  inner.pageIndex === pageIndex
+                ) {
+                  this.applyVerifiedRelayHashPage(
+                    entry,
+                    pageIndex,
+                    inner.chunkHashes,
+                  );
+                }
+              }
+            } catch {
+              // Ignore per-page fetch/decrypt errors; fallback scan below may still recover
+            }
+          }
+        }
+
+        const stillMissingPages =
+          pageDigests !== undefined &&
+          entry.verifiedHashPages.size < pageDigests.length;
+        if (stillMissingPages && !this.stopped && entry.downloadGen === gen) {
+          if (relay.pullHashPagesForFile) {
+            await relay.pullHashPagesForFile(entry.manifest.fileId);
+          } else {
+            await relay.pullEnvelopes();
+          }
+        }
       }
     } catch {
       // Ignore transient pull error; scheduleDownloads will evaluate remaining state
@@ -2268,6 +2332,29 @@ export class SwarmScheduler {
         this.totalRelayInFlightChunks - 1,
       );
     }
+  }
+
+  private clearInFlightP2PRequestsForFile(entry: SwarmFileEntry): void {
+    const fileId = entry.manifest.fileId;
+    for (const [chunkIndex, peerSet] of entry.chunkInFlightPeers.entries()) {
+      for (const peerId of peerSet) {
+        const peer = this.peers.get(peerId);
+        if (!peer) continue;
+        const reqKey = `${fileId}:${chunkIndex}`;
+        const req = peer.inFlightRequests.get(reqKey);
+        if (req) {
+          clearTimeout(req.timer);
+          peer.inFlightRequests.delete(reqKey);
+        }
+        this.sendSwarmFrameToPeer(peer, {
+          frameType: SwarmFrameType.CANCEL,
+          fileId,
+          chunkIndex,
+          payload: new Uint8Array(0),
+        });
+      }
+    }
+    entry.chunkInFlightPeers.clear();
   }
 
   private clearRelayInFlightChunks(entry: SwarmFileEntry): void {
