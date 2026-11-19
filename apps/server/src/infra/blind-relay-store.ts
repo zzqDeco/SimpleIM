@@ -235,6 +235,28 @@ abstract class AbstractBlindRelayStore implements BlindRelayStorePort {
     };
   }
 
+  getEnvelope(params: {
+    boxId: string;
+    blobId: string;
+    nowMs: number;
+  }): Uint8Array | null {
+    const entry = this.envelopesByBox.get(params.boxId)?.get(params.blobId);
+    if (!entry) {
+      return null;
+    }
+    if (entry.expiresAt <= params.nowMs) {
+      this.removeEntry(entry);
+      return null;
+    }
+    const payload = this.readEnvelopePayload(entry);
+    if (payload === null) {
+      this.removeEntry(entry);
+      return null;
+    }
+    this.touchLru(entry, params.nowMs);
+    return payload;
+  }
+
   listEnvelopes(params: {
     boxId: string;
     afterSeq: number;

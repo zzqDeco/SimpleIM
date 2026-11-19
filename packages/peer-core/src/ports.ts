@@ -169,6 +169,10 @@ export interface BlindRelayClientPort {
     payload: Uint8Array;
     keepalive?: boolean;
   }): Promise<{ seq: number; expiresAt: number }>;
+  getEnvelope?(params: {
+    boxId: string;
+    blobId: string;
+  }): Promise<Uint8Array | null>;
   listEnvelopes(params: {
     boxId: string;
     afterSeq: number;

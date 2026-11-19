@@ -16,6 +16,7 @@ import {
 import type { RoomPeerEngineEvents } from "./ports.ts";
 
 const MAX_STORED_MESSAGES = 2_000;
+const MAX_SEEN_MSG_IDS = 10_000;
 
 export interface ChatSyncManagerOptions {
   roomId: string;
@@ -49,6 +50,7 @@ export class ChatSyncManager {
   private lamport = 0;
   private readonly messages: ChatMessageEnvelope[] = [];
   private readonly messagesById = new Map<string, ChatMessageEnvelope>();
+  private readonly seenMsgIds = new Set<string>();
 
   constructor(options: ChatSyncManagerOptions) {
     this.roomId = options.roomId;
@@ -65,6 +67,30 @@ export class ChatSyncManager {
     }
   }
 
+  private recordSeenMsgId(msgId: string): void {
+    if (this.seenMsgIds.has(msgId)) {
+      return;
+    }
+    this.seenMsgIds.add(msgId);
+    if (this.seenMsgIds.size > MAX_SEEN_MSG_IDS) {
+      const oldest = this.seenMsgIds.values().next().value;
+      if (oldest !== undefined) {
+        this.seenMsgIds.delete(oldest);
+      }
+    }
+  }
+
+  private fallsBelowRetentionBoundary(message: ChatMessageEnvelope): boolean {
+    if (this.messages.length < MAX_STORED_MESSAGES) {
+      return false;
+    }
+    const oldestRetained = this.messages[0];
+    return (
+      oldestRetained !== undefined &&
+      compareChatMessages(message, oldestRetained) <= 0
+    );
+  }
+
   updateLocalCert(nextCert: PeerIdentityCert): void {
     this.localCert = nextCert;
   }
@@ -73,12 +99,17 @@ export class ChatSyncManager {
     if (
       message.lamport > MAX_CHAT_LAMPORT ||
       this.messagesById.has(message.msgId) ||
+      this.seenMsgIds.has(message.msgId) ||
       !verifyChatMessage(message, this.serverSignPubKey, this.roomId)
     ) {
       return;
     }
+    this.recordSeenMsgId(message.msgId);
     if (message.lamport > this.lamport) {
       this.lamport = message.lamport;
+    }
+    if (this.fallsBelowRetentionBoundary(message)) {
+      return;
     }
     this.insertSorted(message);
   }
@@ -127,18 +158,28 @@ export class ChatSyncManager {
     isHistoricalSync: boolean,
   ): boolean {
     if (
+      this.messagesById.has(message.msgId) ||
+      this.seenMsgIds.has(message.msgId)
+    ) {
+      return false;
+    }
+    if (
       message.lamport > MAX_CHAT_LAMPORT ||
       !verifyChatMessage(message, this.serverSignPubKey, this.roomId)
     ) {
       return false;
     }
-    if (this.messagesById.has(message.msgId)) {
-      return false;
-    }
 
+    this.recordSeenMsgId(message.msgId);
     if (message.lamport > this.lamport) {
       this.lamport = message.lamport;
     }
+    // Suppress messages that fall strictly below our retained 2,000-message window
+    // so they are never immediately evicted and re-gossiped in a triangle loop.
+    if (this.fallsBelowRetentionBoundary(message)) {
+      return false;
+    }
+
     this.insertSorted(message);
     this.events?.onChatMessage?.(message, isHistoricalSync);
     return true;
@@ -165,7 +206,11 @@ export class ChatSyncManager {
     const seen = new Set<string>();
     for (const id of peerKnownMsgIds) {
       if (want.length >= MAX_SYNC_MESSAGES) break;
-      if (!seen.has(id) && !this.messagesById.has(id)) {
+      if (
+        !seen.has(id) &&
+        !this.messagesById.has(id) &&
+        !this.seenMsgIds.has(id)
+      ) {
         seen.add(id);
         want.push(id);
       }
@@ -204,6 +249,7 @@ export class ChatSyncManager {
   }
 
   private insertSorted(message: ChatMessageEnvelope): void {
+    this.recordSeenMsgId(message.msgId);
     this.messagesById.set(message.msgId, message);
 
     // Binary search insertion point since messages arrive mostly in causal order

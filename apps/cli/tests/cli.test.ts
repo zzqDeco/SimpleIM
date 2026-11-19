@@ -2107,6 +2107,12 @@ describe("CliApiClient BlindRelayClient", () => {
           );
         }
         if (
+          url.pathname === `/api/v1/relay/${boxId}/envelopes/${blobId}` &&
+          init?.method === "GET"
+        ) {
+          return new Response(envBytes, { status: 200 });
+        }
+        if (
           url.pathname === `/api/v1/relay/${boxId}/envelopes` &&
           init?.method === "GET"
         ) {
@@ -2165,6 +2171,11 @@ describe("CliApiClient BlindRelayClient", () => {
       payload: envBytes,
     });
     expect(putEnv).toEqual({ seq: 3, expiresAt: 1_900_000_000_000 });
+
+    expect(await relay.getEnvelope?.({ boxId, blobId })).toEqual(envBytes);
+    expect(
+      await relay.getEnvelope?.({ boxId, blobId: "0".repeat(32) }),
+    ).toBeNull();
 
     const listed = await relay.listEnvelopes({ boxId, afterSeq: 0 });
     expect(listed.items[0]?.payload).toEqual(envBytes);

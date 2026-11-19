@@ -907,17 +907,23 @@ export interface MockBlindRelayHubOptions {
 export interface MockBlindRelayClientOptions {
   enabled?: boolean;
   maxFileBytes?: number;
+  disableGetEnvelope?: boolean;
 }
 
 export class MockBlindRelayClient implements BlindRelayClientPort {
   enabled: boolean;
   readonly maxFileBytes: number;
   putEnvelopeCalls = 0;
+  getEnvelopeCalls = 0;
   keepalivePutCount = 0;
   listEnvelopeCalls = 0;
   putChunkCalls = 0;
   getChunkCalls = 0;
   readonly recordedListAfterSeqs: number[] = [];
+  getEnvelope?: (params: {
+    boxId: string;
+    blobId: string;
+  }) => Promise<Uint8Array | null>;
 
   private readonly hub: MockBlindRelayHub;
   private remainingEnvelopePutFailures = 0;
@@ -926,6 +932,13 @@ export class MockBlindRelayClient implements BlindRelayClientPort {
     this.hub = hub;
     this.enabled = options?.enabled ?? true;
     this.maxFileBytes = options?.maxFileBytes ?? hub.maxFileBytes;
+    if (!options?.disableGetEnvelope) {
+      this.getEnvelope = async (params) => {
+        this.getEnvelopeCalls += 1;
+        await Promise.resolve();
+        return this.hub.getEnvelope(params);
+      };
+    }
   }
 
   failNextEnvelopePuts(count: number): void {
@@ -1086,6 +1099,23 @@ export class MockBlindRelayHub {
       expiresAt,
     });
     return { seq, expiresAt };
+  }
+
+  getEnvelope(params: {
+    boxId: string;
+    blobId: string;
+  }): Uint8Array | null {
+    if (!this.isOnline) {
+      throw new Error("Blind relay server is offline");
+    }
+    if (!isValidRelayBoxId(params.boxId) || !isValidRelayBlobId(params.blobId)) {
+      throw new Error("Invalid relay boxId or blobId");
+    }
+    const box = this.boxes.get(params.boxId);
+    if (!box) return null;
+    this.purgeExpired(box);
+    const rec = box.envelopesByBlobId.get(params.blobId);
+    return rec ? rec.payload.slice() : null;
   }
 
   listEnvelopes(params: {

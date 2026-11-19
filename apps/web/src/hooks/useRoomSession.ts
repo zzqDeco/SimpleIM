@@ -23,7 +23,11 @@ import {
 import { HttpApiError, type HttpAuthClient } from "../api/http-client.ts";
 import { deriveRoomKeysOffThread } from "../crypto/kdf-client.ts";
 import { toAppFailure, type AppFailure } from "../i18n/error-catalog.ts";
-import { mergeOrderedFiles, mergeOrderedMessages } from "../state/collections.ts";
+import {
+  mergeOrderedFiles,
+  mergeOrderedMessages,
+  reconcileCommittedRoomState,
+} from "../state/collections.ts";
 import {
   buildSortedRoomSummaries,
   compareRoomOrder,
@@ -39,6 +43,8 @@ import {
   OpfsChunkStorageAdapter,
 } from "../storage/opfs-chunk-storage.ts";
 import {
+  MAX_VAULT_FILES_PER_ROOM,
+  MAX_VAULT_MESSAGES_PER_ROOM,
   RoomVault,
   type VaultRoomMetadata,
 } from "../storage/room-vault.ts";
@@ -66,6 +72,7 @@ interface ManagedRoomRecord {
   transfers: Map<string, SwarmTransferProgress>;
   deliveryStates: Map<string, ChatDeliveryStatus>;
   pendingRelayMsgIds: Set<string>;
+  hasPersistedOutbox: boolean;
   relayCursor: number;
   persistedRelayBatchMsgIds: Set<string>;
   persistedRelayBatchFileIds: Set<string>;
@@ -541,7 +548,13 @@ export function useRoomSession({
             maxSignalPayloadBytes: identity.meta.limits.maxSignalPayloadBytes,
             initialMessages: entry.messages,
             initialFiles: entry.files,
-            initialPendingRelayMsgIds: Array.from(entry.pendingRelayMsgIds),
+            ...(entry.hasPersistedOutbox
+              ? {
+                  initialPendingRelayMsgIds: Array.from(
+                    entry.pendingRelayMsgIds,
+                  ),
+                }
+              : {}),
             initialRelayCursor: entry.relayCursor,
             signaling: signalingPort,
             transportFactory,
@@ -647,6 +660,9 @@ export function useRoomSession({
                       : entry.metadata.lastReadAt,
                 };
 
+                const preCommitFileIds = new Set(
+                  entry.files.map((f) => f.fileId),
+                );
                 const committed = await vault.commitRoomState({
                   userId: currentUser.id,
                   metadata: nextMetadata,
@@ -669,15 +685,32 @@ export function useRoomSession({
                 if (!isEntryLive(expectedGen, roomId, entry)) {
                   return;
                 }
-                entry.metadata = committed.metadata;
-                if (committed.messages) {
-                  entry.messages = committed.messages;
+                const reconciled = reconcileCommittedRoomState({
+                  liveMetadata: entry.metadata,
+                  liveMessages: entry.messages,
+                  liveFiles: entry.files,
+                  livePendingRelayMsgIds: entry.pendingRelayMsgIds,
+                  liveDeliveryStates: entry.deliveryStates,
+                  liveRelayCursor: entry.relayCursor,
+                  committedMetadata: committed.metadata,
+                  committedMessages: committed.messages,
+                  committedFiles: committed.files,
+                  committedPendingRelayMsgIds: committed.pendingRelayMsgIds,
+                  committedRelayCursor: committed.relayCursor,
+                  preCommitFileIds,
+                  removedPendingRelayMsgIds: batch.messages.map((m) => m.msgId),
+                  cursorReset: batch.cursorReset,
+                  maxMessages: MAX_VAULT_MESSAGES_PER_ROOM,
+                  maxFiles: MAX_VAULT_FILES_PER_ROOM,
+                });
+                entry.metadata = reconciled.metadata;
+                entry.messages = reconciled.messages;
+                entry.files = reconciled.files;
+                entry.pendingRelayMsgIds = reconciled.pendingRelayMsgIds;
+                entry.relayCursor = reconciled.relayCursor;
+                if (committed.hasPersistedOutbox) {
+                  entry.hasPersistedOutbox = true;
                 }
-                if (committed.files) {
-                  entry.files = committed.files;
-                }
-                entry.pendingRelayMsgIds = new Set(committed.pendingRelayMsgIds);
-                entry.relayCursor = committed.relayCursor;
                 for (const m of batch.messages) {
                   entry.persistedRelayBatchMsgIds.add(m.msgId);
                 }
@@ -801,6 +834,29 @@ export function useRoomSession({
             localPeerId: identity.peerId,
           };
           entry.activeRuntime = runtimeInstance;
+
+          if (!entry.hasPersistedOutbox && relayClient.enabled) {
+            const initialStates = activeEngine.getChatDeliveryStates();
+            const migratedPendingIds: string[] = [];
+            for (const [msgId, status] of initialStates) {
+              if (status === "pending" || status === "failed") {
+                migratedPendingIds.push(msgId);
+              }
+            }
+            entry.hasPersistedOutbox = true;
+            entry.pendingRelayMsgIds = new Set(migratedPendingIds);
+            entry.deliveryStates = new Map(initialStates);
+            // Queue outbox migration ahead of start() so subsequent relay acks
+            // remove from the migrated outbox in FIFO order rather than overwriting it.
+            void vault
+              .commitRoomState({
+                userId: currentUser.id,
+                metadata: entry.metadata,
+                roomKeys: entry.roomKeys,
+                replacePendingRelayMsgIds: migratedPendingIds,
+              })
+              .catch(() => {});
+          }
 
           await activeEngine.start();
 
@@ -1022,6 +1078,7 @@ export function useRoomSession({
             transfers: new Map(),
             deliveryStates: initialDeliveryStates,
             pendingRelayMsgIds: new Set(h.pendingRelayMsgIds),
+            hasPersistedOutbox: h.hasPersistedOutbox,
             relayCursor: h.relayCursor,
             persistedRelayBatchMsgIds: new Set(),
             persistedRelayBatchFileIds: new Set(),
@@ -1285,6 +1342,7 @@ export function useRoomSession({
               transfers: new Map(),
               deliveryStates: new Map(),
               pendingRelayMsgIds: new Set(),
+              hasPersistedOutbox: true,
               relayCursor: 0,
               persistedRelayBatchMsgIds: new Set(),
               persistedRelayBatchFileIds: new Set(),
@@ -1564,10 +1622,28 @@ export function useRoomSession({
         messages: entry.messages,
         ...(needsRelayOutbox ? { addPendingRelayMsgIds: [sent.msgId] } : {}),
       });
-      if (isEntryLive(myGen, roomId, entry) && committed.messages) {
-        entry.messages = committed.messages;
-        entry.metadata = committed.metadata;
-        entry.pendingRelayMsgIds = new Set(committed.pendingRelayMsgIds);
+      if (isEntryLive(myGen, roomId, entry)) {
+        const reconciled = reconcileCommittedRoomState({
+          liveMetadata: entry.metadata,
+          liveMessages: entry.messages,
+          liveFiles: entry.files,
+          livePendingRelayMsgIds: entry.pendingRelayMsgIds,
+          liveDeliveryStates: entry.deliveryStates,
+          liveRelayCursor: entry.relayCursor,
+          committedMetadata: committed.metadata,
+          committedMessages: committed.messages,
+          committedFiles: committed.files,
+          committedPendingRelayMsgIds: committed.pendingRelayMsgIds,
+          committedRelayCursor: committed.relayCursor,
+          maxMessages: MAX_VAULT_MESSAGES_PER_ROOM,
+          maxFiles: MAX_VAULT_FILES_PER_ROOM,
+        });
+        entry.messages = reconciled.messages;
+        entry.metadata = reconciled.metadata;
+        entry.pendingRelayMsgIds = reconciled.pendingRelayMsgIds;
+        if (committed.hasPersistedOutbox) {
+          entry.hasPersistedOutbox = true;
+        }
         publishSnapshot(user.id);
       }
     },

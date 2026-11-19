@@ -133,6 +133,38 @@ export class RelayService {
     };
   }
 
+  getEnvelope(params: {
+    userId: string;
+    clientIp: string;
+    boxId: string;
+    blobId: string;
+  }): Uint8Array {
+    this.assertEnabled();
+    const nowMs = this.clock.nowMs();
+    this.consumeEnvelopeBudget(params.userId, params.clientIp, nowMs);
+
+    if (!isValidRelayBoxId(params.boxId)) {
+      throw new DomainError("invalid_arguments", "Invalid relay boxId", 400);
+    }
+    if (!isValidRelayBlobId(params.blobId)) {
+      throw new DomainError("invalid_arguments", "Invalid relay blobId", 400);
+    }
+
+    const bytes = this.store.getEnvelope({
+      boxId: params.boxId,
+      blobId: params.blobId,
+      nowMs,
+    });
+    if (!bytes) {
+      throw new DomainError(
+        "not_found",
+        "Relay envelope not found or expired",
+        404,
+      );
+    }
+    return bytes;
+  }
+
   listEnvelopes(params: {
     userId: string;
     clientIp: string;
