@@ -5,6 +5,7 @@ import type {
   UserProfile,
 } from "@simpleim/contracts";
 import type {
+  ChatDeliveryStatus,
   SwarmTransferProgress,
   VerifiedPeerInfo,
 } from "@simpleim/peer-core";
@@ -38,6 +39,7 @@ export interface RoomScreenProps {
   readonly centerConnected: boolean;
   readonly peers: readonly VerifiedPeerInfo[];
   readonly messages: readonly ChatMessageEnvelope[];
+  readonly deliveryStates: ReadonlyMap<string, ChatDeliveryStatus>;
   readonly files: readonly FileManifest[];
   readonly transfers: ReadonlyMap<string, SwarmTransferProgress>;
   readonly joinPhase: JoinPhase;
@@ -56,6 +58,7 @@ export interface RoomScreenProps {
     body: string,
     replyToMsgId: string | null,
   ) => Promise<void>;
+  readonly onRetryMessage: (msgId: string) => Promise<void>;
   readonly onShareFiles: (files: File[]) => Promise<void>;
   readonly onDownloadFile: (fileId: string) => Promise<void>;
   readonly onCancelDownload: (fileId: string) => Promise<void>;
@@ -77,6 +80,7 @@ export function RoomScreen({
   centerConnected,
   peers,
   messages,
+  deliveryStates,
   files,
   transfers,
   joinPhase,
@@ -89,6 +93,7 @@ export function RoomScreen({
   securityEvent,
   onDismissSecurityEvent,
   onSendMessage,
+  onRetryMessage,
   onShareFiles,
   onDownloadFile,
   onCancelDownload,
@@ -204,9 +209,13 @@ export function RoomScreen({
 
           <MessageTranscript
             messages={messages}
+            deliveryStates={deliveryStates}
             localPeerId={localPeerId}
             currentUserId={user.id}
             onReply={composer.selectReplyTarget}
+            onRetryMessage={(msgId) => {
+              void onRetryMessage(msgId).catch(composer.reportActionError);
+            }}
           />
 
           <PromptComposer

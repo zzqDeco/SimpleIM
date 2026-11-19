@@ -46,11 +46,47 @@ export interface VaultRoomMetadata {
   readonly lastReadAt: number;
 }
 
+export interface VaultWebLocksLike {
+  request<T>(
+    name: string,
+    options: { mode?: "exclusive" | "shared" },
+    callback: (lock: object | null) => Promise<T> | T,
+  ): Promise<T>;
+}
+
+export interface RoomVaultOptions {
+  readonly locksProvider?: () => VaultWebLocksLike | undefined;
+}
+
 export interface HydratedVaultRoom {
   readonly metadata: VaultRoomMetadata;
   readonly roomKeys: DerivedRoomKeys;
   readonly messages: ChatMessageEnvelope[];
   readonly files: FileManifest[];
+  readonly pendingRelayMsgIds: string[];
+  readonly relayCursor: number;
+}
+
+export interface CommitRoomStateParams {
+  readonly userId: string;
+  readonly metadata: VaultRoomMetadata;
+  readonly roomKeys: DerivedRoomKeys;
+  readonly messages?: readonly ChatMessageEnvelope[];
+  readonly files?: readonly FileManifest[];
+  readonly addPendingRelayMsgIds?: readonly string[];
+  readonly removePendingRelayMsgIds?: readonly string[];
+  readonly replacePendingRelayMsgIds?: readonly string[];
+  readonly relayCursor?: number;
+  readonly cursorReset?: boolean;
+  readonly mergeWithExisting?: boolean;
+}
+
+export interface CommittedRoomStateResult {
+  readonly metadata: VaultRoomMetadata;
+  readonly messages?: ChatMessageEnvelope[];
+  readonly files?: FileManifest[];
+  readonly pendingRelayMsgIds: string[];
+  readonly relayCursor: number;
 }
 
 interface SerializedVaultRoomPayload {
@@ -65,6 +101,14 @@ interface SerializedVaultRoomPayload {
   joinedAt: number;
   lastActiveAt: number;
   lastReadAt: number;
+  pendingRelayMsgIds?: string[];
+  relayCursor?: number;
+}
+
+export interface RoomBundleRecords {
+  readonly room?: EncryptedBlobRecord;
+  readonly messages?: EncryptedBlobRecord;
+  readonly files?: EncryptedBlobRecord;
 }
 
 export interface VaultStorageBackend {
@@ -73,6 +117,10 @@ export interface VaultStorageBackend {
   listRoomEntries(
     userId: string,
   ): Promise<Array<{ roomId: string; record: EncryptedBlobRecord }>>;
+  getRoomEntry(
+    userId: string,
+    roomId: string,
+  ): Promise<EncryptedBlobRecord | null>;
   putRoomEntry(
     userId: string,
     roomId: string,
@@ -96,6 +144,11 @@ export interface VaultStorageBackend {
     roomId: string,
     record: EncryptedBlobRecord,
   ): Promise<void>;
+  commitRoomBundle(
+    userId: string,
+    roomId: string,
+    records: RoomBundleRecords,
+  ): Promise<void>;
   deleteRoomAll(userId: string, roomId: string): Promise<void>;
   deleteUserAll(userId: string): Promise<void>;
 }
@@ -116,6 +169,12 @@ export class InMemoryVaultBackend implements VaultStorageBackend {
   private readonly rooms = new Map<string, EncryptedBlobRecord>();
   private readonly messages = new Map<string, EncryptedBlobRecord>();
   private readonly files = new Map<string, EncryptedBlobRecord>();
+  public bundleCommitCount = 0;
+  public onBeforeCommitBundle?: (
+    userId: string,
+    roomId: string,
+    records: RoomBundleRecords,
+  ) => Promise<void> | void;
 
   async getDeviceKey(userId: string): Promise<CryptoKey | null> {
     return this.deviceKeys.get(userId) ?? null;
@@ -142,6 +201,16 @@ export class InMemoryVaultBackend implements VaultStorageBackend {
       }
     }
     return out;
+  }
+
+  async getRoomEntry(
+    userId: string,
+    roomId: string,
+  ): Promise<EncryptedBlobRecord | null> {
+    const rec = this.rooms.get(compositeKey(userId, roomId));
+    return rec
+      ? { iv: rec.iv.slice(), ciphertext: rec.ciphertext.slice() }
+      : null;
   }
 
   async putRoomEntry(
@@ -195,6 +264,36 @@ export class InMemoryVaultBackend implements VaultStorageBackend {
       iv: record.iv.slice(),
       ciphertext: record.ciphertext.slice(),
     });
+  }
+
+  async commitRoomBundle(
+    userId: string,
+    roomId: string,
+    records: RoomBundleRecords,
+  ): Promise<void> {
+    if (this.onBeforeCommitBundle) {
+      await this.onBeforeCommitBundle(userId, roomId, records);
+    }
+    const k = compositeKey(userId, roomId);
+    if (records.room) {
+      this.rooms.set(k, {
+        iv: records.room.iv.slice(),
+        ciphertext: records.room.ciphertext.slice(),
+      });
+    }
+    if (records.messages) {
+      this.messages.set(k, {
+        iv: records.messages.iv.slice(),
+        ciphertext: records.messages.ciphertext.slice(),
+      });
+    }
+    if (records.files) {
+      this.files.set(k, {
+        iv: records.files.iv.slice(),
+        ciphertext: records.files.ciphertext.slice(),
+      });
+    }
+    this.bundleCommitCount += 1;
   }
 
   async deleteRoomAll(userId: string, roomId: string): Promise<void> {
@@ -344,6 +443,13 @@ export class IndexedDbVaultBackend implements VaultStorageBackend {
     return out;
   }
 
+  async getRoomEntry(
+    userId: string,
+    roomId: string,
+  ): Promise<EncryptedBlobRecord | null> {
+    return this.getScopedEntry(STORE_ROOMS, userId, roomId);
+  }
+
   async putRoomEntry(
     userId: string,
     roomId: string,
@@ -380,6 +486,52 @@ export class IndexedDbVaultBackend implements VaultStorageBackend {
     record: EncryptedBlobRecord,
   ): Promise<void> {
     await this.putScopedEntry(STORE_ROOM_FILES, userId, roomId, record);
+  }
+
+  async commitRoomBundle(
+    userId: string,
+    roomId: string,
+    records: RoomBundleRecords,
+  ): Promise<void> {
+    const stores: string[] = [];
+    if (records.room) stores.push(STORE_ROOMS);
+    if (records.messages) stores.push(STORE_ROOM_MESSAGES);
+    if (records.files) stores.push(STORE_ROOM_FILES);
+    if (stores.length === 0) {
+      return;
+    }
+
+    const db = await this.openDb();
+    const tx = db.transaction(stores, "readwrite");
+    const key = compositeKey(userId, roomId);
+    if (records.room) {
+      tx.objectStore(STORE_ROOMS).put({
+        key,
+        userId,
+        roomId,
+        iv: records.room.iv,
+        ciphertext: records.room.ciphertext,
+      } satisfies StoredIdbRecord);
+    }
+    if (records.messages) {
+      tx.objectStore(STORE_ROOM_MESSAGES).put({
+        key,
+        userId,
+        roomId,
+        iv: records.messages.iv,
+        ciphertext: records.messages.ciphertext,
+      } satisfies StoredIdbRecord);
+    }
+    if (records.files) {
+      tx.objectStore(STORE_ROOM_FILES).put({
+        key,
+        userId,
+        roomId,
+        iv: records.files.iv,
+        ciphertext: records.files.ciphertext,
+      } satisfies StoredIdbRecord);
+    }
+    await idbTxComplete(tx);
   }
 
   async deleteRoomAll(userId: string, roomId: string): Promise<void> {
@@ -488,12 +640,35 @@ function hasValidNonZeroRoomKeys(roomKeys: DerivedRoomKeys): boolean {
   );
 }
 
+function sanitizePendingRelayMsgIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item === "string" && item.length > 0 && !seen.has(item)) {
+      seen.add(item);
+      out.push(item);
+      if (out.length >= MAX_VAULT_MESSAGES_PER_ROOM) {
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+function sanitizeRelayCursor(raw: unknown): number {
+  return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0
+    ? raw
+    : 0;
+}
+
 export class RoomVault {
   private readonly backend: VaultStorageBackend;
+  private readonly locksProvider: () => VaultWebLocksLike | undefined;
   private readonly keyCache = new Map<string, Promise<CryptoKey>>();
   private writeChain: Promise<void> = Promise.resolve();
 
-  constructor(backend?: VaultStorageBackend) {
+  constructor(backend?: VaultStorageBackend, options?: RoomVaultOptions) {
     if (backend) {
       this.backend = backend;
     } else if (typeof indexedDB !== "undefined") {
@@ -501,6 +676,38 @@ export class RoomVault {
     } else {
       this.backend = new InMemoryVaultBackend();
     }
+    this.locksProvider =
+      options?.locksProvider ??
+      (() =>
+        typeof navigator !== "undefined" &&
+        "locks" in navigator &&
+        navigator.locks &&
+        typeof navigator.locks.request === "function"
+          ? (navigator.locks as unknown as VaultWebLocksLike)
+          : undefined);
+  }
+
+  private async withVaultLock<T>(
+    lockName: string,
+    op: () => Promise<T>,
+  ): Promise<T> {
+    const locks = this.locksProvider();
+    if (!locks) {
+      return op();
+    }
+    return locks.request(lockName, { mode: "exclusive" }, () => op());
+  }
+
+  private withRoomLock<T>(
+    userId: string,
+    roomId: string,
+    op: () => Promise<T>,
+  ): Promise<T> {
+    return this.withVaultLock(`simpleim-vault:room:${userId}:${roomId}`, op);
+  }
+
+  private withUserLock<T>(userId: string, op: () => Promise<T>): Promise<T> {
+    return this.withVaultLock(`simpleim-vault:user:${userId}`, op);
   }
 
   private getOrCreateDeviceKey(userId: string): Promise<CryptoKey> {
@@ -571,14 +778,84 @@ export class RoomVault {
     return JSON.parse(bytesToUtf8(new Uint8Array(plainBuf)));
   }
 
-  private enqueueWrite(op: () => Promise<void>): Promise<void> {
+  private enqueueWrite<T>(op: () => Promise<T>): Promise<T> {
     const next = this.writeChain.then(op, op);
-    this.writeChain = next.catch(() => {});
+    this.writeChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
     return next;
   }
 
   async flush(): Promise<void> {
     await this.writeChain;
+  }
+
+  private async readExistingRoomPayload(
+    userId: string,
+    roomId: string,
+  ): Promise<Partial<SerializedVaultRoomPayload> | null> {
+    const existingRecord = await this.backend.getRoomEntry(userId, roomId);
+    if (!existingRecord) return null;
+    try {
+      const raw = (await this.decryptJson(
+        userId,
+        roomId,
+        "room",
+        existingRecord,
+      )) as Partial<SerializedVaultRoomPayload>;
+      return raw && raw.v === 1 && raw.roomId === roomId ? raw : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async readExistingMessages(
+    userId: string,
+    roomId: string,
+  ): Promise<ChatMessageEnvelope[]> {
+    const existingRecord = await this.backend.getMessagesEntry(userId, roomId);
+    if (!existingRecord) return [];
+    try {
+      const rawMsgs = await this.decryptJson(
+        userId,
+        roomId,
+        "messages",
+        existingRecord,
+      );
+      if (!Array.isArray(rawMsgs)) return [];
+      const valid = rawMsgs.filter(
+        (m): m is ChatMessageEnvelope =>
+          isValidChatMessageEnvelope(m) && m.roomId === roomId,
+      );
+      return mergeOrderedMessages([], valid).slice(-MAX_VAULT_MESSAGES_PER_ROOM);
+    } catch {
+      return [];
+    }
+  }
+
+  private async readExistingFiles(
+    userId: string,
+    roomId: string,
+  ): Promise<FileManifest[]> {
+    const existingRecord = await this.backend.getFilesEntry(userId, roomId);
+    if (!existingRecord) return [];
+    try {
+      const rawFiles = await this.decryptJson(
+        userId,
+        roomId,
+        "files",
+        existingRecord,
+      );
+      if (!Array.isArray(rawFiles)) return [];
+      const valid = rawFiles.filter(
+        (f): f is FileManifest =>
+          isValidFileManifest(f) && f.roomId === roomId,
+      );
+      return mergeOrderedFiles([], valid).slice(-MAX_VAULT_FILES_PER_ROOM);
+    } catch {
+      return [];
+    }
   }
 
   async loadWorkspace(userId: string): Promise<HydratedVaultRoom[]> {
@@ -701,7 +978,19 @@ export class RoomVault {
           }
         }
 
-        hydrated.push({ metadata, roomKeys, messages, files });
+        const pendingRelayMsgIds = sanitizePendingRelayMsgIds(
+          rawRoom.pendingRelayMsgIds,
+        );
+        const relayCursor = sanitizeRelayCursor(rawRoom.relayCursor);
+
+        hydrated.push({
+          metadata,
+          roomKeys,
+          messages,
+          files,
+          pendingRelayMsgIds,
+          relayCursor,
+        });
       } catch {
         // Reject tampered room ciphertext
       }
@@ -710,11 +999,10 @@ export class RoomVault {
     return hydrated;
   }
 
-  saveRoom(
-    userId: string,
-    metadata: VaultRoomMetadata,
-    roomKeys: DerivedRoomKeys,
-  ): Promise<void> {
+  commitRoomState(
+    params: CommitRoomStateParams,
+  ): Promise<CommittedRoomStateResult> {
+    const { userId, metadata, roomKeys } = params;
     if (
       !hasValidNonZeroRoomKeys(roomKeys) ||
       roomKeys.roomId !== metadata.roomId
@@ -723,28 +1011,153 @@ export class RoomVault {
         new Error("Refusing to persist wiped or invalid room keys"),
       );
     }
-    const payload: SerializedVaultRoomPayload = {
-      v: 1,
-      roomId: metadata.roomId,
-      roomIdPrefix: metadata.roomIdPrefix,
-      signalingKeyB64: bytesToBase64Url(roomKeys.signalingKey),
-      roomAuthKeyB64: bytesToBase64Url(roomKeys.roomAuthKey),
-      roomAppKeyB64: bytesToBase64Url(roomKeys.roomAppKey),
-      alias: sanitizeRoomAlias(metadata.alias),
-      pinned: metadata.pinned,
-      joinedAt: metadata.joinedAt,
-      lastActiveAt: metadata.lastActiveAt,
-      lastReadAt: metadata.lastReadAt,
-    };
-    return this.enqueueWrite(async () => {
-      const encrypted = await this.encryptJson(
-        userId,
-        metadata.roomId,
-        "room",
-        payload,
-      );
-      await this.backend.putRoomEntry(userId, metadata.roomId, encrypted);
-    });
+
+    const roomId = metadata.roomId;
+    // Snapshot key bytes synchronously before entering the write queue so later
+    // wipeRoomKeys() during teardown cannot corrupt an in-flight commit.
+    const signalingKeyB64 = bytesToBase64Url(roomKeys.signalingKey);
+    const roomAuthKeyB64 = bytesToBase64Url(roomKeys.roomAuthKey);
+    const roomAppKeyB64 = bytesToBase64Url(roomKeys.roomAppKey);
+    const incomingMessages =
+      params.messages !== undefined ? [...params.messages] : undefined;
+    const incomingFiles =
+      params.files !== undefined ? [...params.files] : undefined;
+    const addPending = params.addPendingRelayMsgIds
+      ? [...params.addPendingRelayMsgIds]
+      : undefined;
+    const removePending = params.removePendingRelayMsgIds
+      ? [...params.removePendingRelayMsgIds]
+      : undefined;
+    const replacePending = params.replacePendingRelayMsgIds
+      ? [...params.replacePendingRelayMsgIds]
+      : undefined;
+    const mergeWithExisting = params.mergeWithExisting ?? true;
+
+    return this.enqueueWrite(() =>
+      this.withRoomLock(userId, roomId, async () => {
+        const existingRoom = await this.readExistingRoomPayload(userId, roomId);
+
+        const mergedMetadata: VaultRoomMetadata = {
+          roomId,
+          roomIdPrefix: metadata.roomIdPrefix,
+          alias: sanitizeRoomAlias(metadata.alias),
+          pinned: metadata.pinned,
+          joinedAt:
+            existingRoom && typeof existingRoom.joinedAt === "number"
+              ? Math.min(existingRoom.joinedAt, metadata.joinedAt)
+              : metadata.joinedAt,
+          lastActiveAt:
+            existingRoom && typeof existingRoom.lastActiveAt === "number"
+              ? Math.max(existingRoom.lastActiveAt, metadata.lastActiveAt)
+              : metadata.lastActiveAt,
+          lastReadAt:
+            existingRoom && typeof existingRoom.lastReadAt === "number"
+              ? Math.max(existingRoom.lastReadAt, metadata.lastReadAt)
+              : metadata.lastReadAt,
+        };
+
+        const pendingSet = new Set<string>(
+          replacePending !== undefined
+            ? sanitizePendingRelayMsgIds(replacePending)
+            : sanitizePendingRelayMsgIds(existingRoom?.pendingRelayMsgIds),
+        );
+        if (addPending) {
+          for (const id of addPending) {
+            if (id.length > 0) pendingSet.add(id);
+          }
+        }
+        if (removePending) {
+          for (const id of removePending) {
+            pendingSet.delete(id);
+          }
+        }
+        const pendingRelayMsgIds = Array.from(pendingSet).slice(
+          -MAX_VAULT_MESSAGES_PER_ROOM,
+        );
+
+        const existingCursor = sanitizeRelayCursor(existingRoom?.relayCursor);
+        let relayCursor = existingCursor;
+        if (params.relayCursor !== undefined) {
+          const normalized = sanitizeRelayCursor(params.relayCursor);
+          relayCursor = params.cursorReset
+            ? normalized
+            : Math.max(existingCursor, normalized);
+        }
+
+        let finalMessages: ChatMessageEnvelope[] | undefined;
+        if (incomingMessages !== undefined) {
+          const diskMessages = mergeWithExisting
+            ? await this.readExistingMessages(userId, roomId)
+            : [];
+          finalMessages = mergeOrderedMessages(
+            diskMessages,
+            incomingMessages,
+          ).slice(-MAX_VAULT_MESSAGES_PER_ROOM);
+        }
+
+        let finalFiles: FileManifest[] | undefined;
+        if (incomingFiles !== undefined) {
+          const diskFiles = mergeWithExisting
+            ? await this.readExistingFiles(userId, roomId)
+            : [];
+          finalFiles = mergeOrderedFiles(diskFiles, incomingFiles).slice(
+            -MAX_VAULT_FILES_PER_ROOM,
+          );
+        }
+
+        const roomPayload: SerializedVaultRoomPayload = {
+          v: 1,
+          roomId,
+          roomIdPrefix: mergedMetadata.roomIdPrefix,
+          signalingKeyB64,
+          roomAuthKeyB64,
+          roomAppKeyB64,
+          alias: mergedMetadata.alias,
+          pinned: mergedMetadata.pinned,
+          joinedAt: mergedMetadata.joinedAt,
+          lastActiveAt: mergedMetadata.lastActiveAt,
+          lastReadAt: mergedMetadata.lastReadAt,
+          pendingRelayMsgIds,
+          relayCursor,
+        };
+
+        const [roomEnc, messagesEnc, filesEnc] = await Promise.all([
+          this.encryptJson(userId, roomId, "room", roomPayload),
+          finalMessages !== undefined
+            ? this.encryptJson(userId, roomId, "messages", finalMessages)
+            : Promise.resolve(undefined),
+          finalFiles !== undefined
+            ? this.encryptJson(userId, roomId, "files", finalFiles)
+            : Promise.resolve(undefined),
+        ]);
+
+        await this.backend.commitRoomBundle(userId, roomId, {
+          room: roomEnc,
+          ...(messagesEnc ? { messages: messagesEnc } : {}),
+          ...(filesEnc ? { files: filesEnc } : {}),
+        });
+
+        return {
+          metadata: mergedMetadata,
+          ...(finalMessages !== undefined ? { messages: finalMessages } : {}),
+          ...(finalFiles !== undefined ? { files: finalFiles } : {}),
+          pendingRelayMsgIds,
+          relayCursor,
+        };
+      }),
+    );
+  }
+
+  saveRoom(
+    userId: string,
+    metadata: VaultRoomMetadata,
+    roomKeys: DerivedRoomKeys,
+  ): Promise<void> {
+    return this.commitRoomState({
+      userId,
+      metadata,
+      roomKeys,
+    }).then(() => undefined);
   }
 
   saveRoomMessages(
@@ -752,16 +1165,22 @@ export class RoomVault {
     roomId: string,
     messages: readonly ChatMessageEnvelope[],
   ): Promise<void> {
-    const bounded = messages.slice(-MAX_VAULT_MESSAGES_PER_ROOM);
-    return this.enqueueWrite(async () => {
-      const encrypted = await this.encryptJson(
-        userId,
-        roomId,
-        "messages",
-        bounded,
-      );
-      await this.backend.putMessagesEntry(userId, roomId, encrypted);
-    });
+    const incoming = [...messages];
+    return this.enqueueWrite(() =>
+      this.withRoomLock(userId, roomId, async () => {
+        const diskMessages = await this.readExistingMessages(userId, roomId);
+        const merged = mergeOrderedMessages(diskMessages, incoming).slice(
+          -MAX_VAULT_MESSAGES_PER_ROOM,
+        );
+        const encrypted = await this.encryptJson(
+          userId,
+          roomId,
+          "messages",
+          merged,
+        );
+        await this.backend.putMessagesEntry(userId, roomId, encrypted);
+      }),
+    );
   }
 
   saveRoomFiles(
@@ -769,23 +1188,38 @@ export class RoomVault {
     roomId: string,
     files: readonly FileManifest[],
   ): Promise<void> {
-    const bounded = files.slice(-MAX_VAULT_FILES_PER_ROOM);
-    return this.enqueueWrite(async () => {
-      const encrypted = await this.encryptJson(userId, roomId, "files", bounded);
-      await this.backend.putFilesEntry(userId, roomId, encrypted);
-    });
+    const incoming = [...files];
+    return this.enqueueWrite(() =>
+      this.withRoomLock(userId, roomId, async () => {
+        const diskFiles = await this.readExistingFiles(userId, roomId);
+        const merged = mergeOrderedFiles(diskFiles, incoming).slice(
+          -MAX_VAULT_FILES_PER_ROOM,
+        );
+        const encrypted = await this.encryptJson(
+          userId,
+          roomId,
+          "files",
+          merged,
+        );
+        await this.backend.putFilesEntry(userId, roomId, encrypted);
+      }),
+    );
   }
 
   destroyRoom(userId: string, roomId: string): Promise<void> {
-    return this.enqueueWrite(async () => {
-      await this.backend.deleteRoomAll(userId, roomId);
-    });
+    return this.enqueueWrite(() =>
+      this.withRoomLock(userId, roomId, async () => {
+        await this.backend.deleteRoomAll(userId, roomId);
+      }),
+    );
   }
 
   wipeUserVault(userId: string): Promise<void> {
-    return this.enqueueWrite(async () => {
-      this.keyCache.delete(userId);
-      await this.backend.deleteUserAll(userId);
-    });
+    return this.enqueueWrite(() =>
+      this.withUserLock(userId, async () => {
+        this.keyCache.delete(userId);
+        await this.backend.deleteUserAll(userId);
+      }),
+    );
   }
 }

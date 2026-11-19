@@ -81,6 +81,10 @@ export const ja = {
   "room.send": "送信",
   "room.shortcutSend": "Enter で送信",
   "room.shortcutNewline": "Shift+Enter で改行",
+  "room.msg.delivery.pending": "送信中…",
+  "room.msg.delivery.relayed": "✓ 一時保存済",
+  "room.msg.delivery.p2pOnly": "P2P",
+  "room.msg.delivery.failed": "再試行",
 
   "room.sidebarAria": "ルームメンバーと共有ファイル",
   "room.peers.heading": "メンバー",

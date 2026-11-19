@@ -17,6 +17,7 @@ export interface RelayConfig extends RelayMetaConfig {
   readonly ttlMs: number;
   readonly maxFileBytes: number;
   readonly maxTotalBytes: number;
+  readonly maxEnvelopeTotalBytes: number;
 }
 
 export interface StoredRelayEnvelope {
@@ -35,6 +36,7 @@ export interface PutRelayEnvelopeResult {
 export interface ListRelayEnvelopesResult {
   readonly items: readonly StoredRelayEnvelope[];
   readonly hasMore: boolean;
+  readonly cursorReset?: boolean;
 }
 
 export interface PutRelayChunkResult {

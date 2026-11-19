@@ -1,5 +1,6 @@
 import { dirname, join } from "node:path";
 import {
+  DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES,
   DEFAULT_RELAY_MAX_FILE_BYTES,
   DEFAULT_RELAY_MAX_TOTAL_BYTES,
   DEFAULT_RELAY_TTL_MS,
@@ -100,6 +101,11 @@ if (import.meta.main) {
     process.env.RELAY_MAX_TOTAL_BYTES,
     DEFAULT_RELAY_MAX_TOTAL_BYTES,
   );
+  const relayMaxEnvelopeTotalBytes = parsePositiveIntEnv(
+    "RELAY_MAX_ENVELOPE_TOTAL_BYTES",
+    process.env.RELAY_MAX_ENVELOPE_TOTAL_BYTES,
+    DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES,
+  );
   const serverIdentityPrivateKey =
     process.env.SERVER_IDENTITY_PRIVATE_KEY?.trim() || undefined;
   const serverKeyId = process.env.SERVER_KEY_ID?.trim() || "srvk_2026_01";
@@ -139,6 +145,7 @@ if (import.meta.main) {
       ttlMs: relayTtlMs,
       maxFileBytes: relayMaxFileBytes,
       maxTotalBytes: relayMaxTotalBytes,
+      maxEnvelopeTotalBytes: relayMaxEnvelopeTotalBytes,
     },
     logger,
   });

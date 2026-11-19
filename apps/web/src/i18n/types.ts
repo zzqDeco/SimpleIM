@@ -101,6 +101,10 @@ export interface TranslationSchema {
   "room.send": string;
   "room.shortcutSend": string;
   "room.shortcutNewline": string;
+  "room.msg.delivery.pending": string;
+  "room.msg.delivery.relayed": string;
+  "room.msg.delivery.p2pOnly": string;
+  "room.msg.delivery.failed": string;
 
   // Side Pane (Members & Files)
   "room.sidebarAria": string;

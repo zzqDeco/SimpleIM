@@ -83,6 +83,7 @@ function AppShell(): ReactElement {
       centerConnected={room.centerConnected}
       peers={room.peers}
       messages={room.messages}
+      deliveryStates={room.deliveryStates}
       files={room.files}
       transfers={room.transfers}
       joinPhase={room.joinPhase}
@@ -95,6 +96,7 @@ function AppShell(): ReactElement {
       securityEvent={room.securityEvent}
       onDismissSecurityEvent={room.dismissSecurityEvent}
       onSendMessage={room.sendMessage}
+      onRetryMessage={room.retryChatMessage}
       onShareFiles={room.shareFiles}
       onDownloadFile={room.downloadFile}
       onCancelDownload={room.cancelDownload}

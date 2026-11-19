@@ -140,6 +140,12 @@ export type TransferStatus =
   | "paused"
   | "error";
 
+export type ChatDeliveryStatus =
+  | "pending"
+  | "relayed"
+  | "p2p_only"
+  | "failed";
+
 export type RelayFileCacheState =
   | "none"
   | "uploading"
@@ -161,6 +167,7 @@ export interface BlindRelayClientPort {
     boxId: string;
     blobId: string;
     payload: Uint8Array;
+    keepalive?: boolean;
   }): Promise<{ seq: number; expiresAt: number }>;
   listEnvelopes(params: {
     boxId: string;
@@ -170,6 +177,7 @@ export interface BlindRelayClientPort {
     items: BlindRelayListedEnvelope[];
     nextCursor: number;
     hasMore: boolean;
+    cursorReset?: boolean;
   }>;
   putChunk(params: {
     boxId: string;
@@ -213,6 +221,13 @@ export interface RoomPeerEngineEvents {
     reason: PeerTransportFailureReason,
   ) => void;
   onChatMessage?: (message: ChatMessageEnvelope, isHistoricalSync: boolean) => void;
+  onChatDeliveryChange?: (msgId: string, status: ChatDeliveryStatus) => void;
+  onRelayBatchPulled?: (batch: {
+    readonly messages: readonly ChatMessageEnvelope[];
+    readonly files: readonly FileManifest[];
+    readonly nextCursor: number;
+    readonly cursorReset: boolean;
+  }) => Promise<void> | void;
   onFileAnnounced?: (manifest: FileManifest) => void;
   onTransferProgress?: (progress: SwarmTransferProgress) => void;
   onTransferCompleted?: (manifest: FileManifest) => void;
@@ -232,6 +247,8 @@ export interface RoomPeerEngineOptions {
   relayClient?: BlindRelayClientPort;
   initialMessages?: readonly ChatMessageEnvelope[];
   initialFiles?: readonly FileManifest[];
+  initialPendingRelayMsgIds?: readonly string[];
+  initialRelayCursor?: number;
   events?: RoomPeerEngineEvents;
   maxInFlightPerPeer?: number;
   requestTimeoutMs?: number;
@@ -262,12 +279,15 @@ export interface RoomPeerEngine {
   getSignalingPeerCount(): number;
   getVerifiedPeers(): VerifiedPeerInfo[];
   getMessages(): ChatMessageEnvelope[];
+  getChatDeliveryStates(): ReadonlyMap<string, ChatDeliveryStatus>;
   getFiles(): FileManifest[];
   getTransferProgress(fileId: string): SwarmTransferProgress | undefined;
   sendChatMessage(
     body: string,
     replyToMsgId?: string | null,
   ): Promise<ChatMessageEnvelope>;
+  retryChatMessage(msgId?: string): Promise<void>;
+  flushPendingRelayKeepalive(): void;
   shareFile(input: ShareFileInput): Promise<FileManifest>;
   downloadFile(fileId: string): Promise<void>;
   cancelDownload(fileId: string): Promise<void>;

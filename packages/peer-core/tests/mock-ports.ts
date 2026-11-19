@@ -913,11 +913,14 @@ export class MockBlindRelayClient implements BlindRelayClientPort {
   enabled: boolean;
   readonly maxFileBytes: number;
   putEnvelopeCalls = 0;
+  keepalivePutCount = 0;
   listEnvelopeCalls = 0;
   putChunkCalls = 0;
   getChunkCalls = 0;
+  readonly recordedListAfterSeqs: number[] = [];
 
   private readonly hub: MockBlindRelayHub;
+  private remainingEnvelopePutFailures = 0;
 
   constructor(hub: MockBlindRelayHub, options?: MockBlindRelayClientOptions) {
     this.hub = hub;
@@ -925,13 +928,29 @@ export class MockBlindRelayClient implements BlindRelayClientPort {
     this.maxFileBytes = options?.maxFileBytes ?? hub.maxFileBytes;
   }
 
+  failNextEnvelopePuts(count: number): void {
+    this.remainingEnvelopePutFailures = Math.max(0, Math.floor(count));
+  }
+
+  setEnvelopePutFailures(count: number): void {
+    this.failNextEnvelopePuts(count);
+  }
+
   async putEnvelope(params: {
     boxId: string;
     blobId: string;
     payload: Uint8Array;
+    keepalive?: boolean;
   }): Promise<{ seq: number; expiresAt: number }> {
     this.putEnvelopeCalls += 1;
+    if (params.keepalive) {
+      this.keepalivePutCount += 1;
+    }
     await Promise.resolve();
+    if (this.remainingEnvelopePutFailures > 0) {
+      this.remainingEnvelopePutFailures -= 1;
+      throw new Error("Simulated transient blind relay putEnvelope failure");
+    }
     return this.hub.putEnvelope(params);
   }
 
@@ -943,8 +962,10 @@ export class MockBlindRelayClient implements BlindRelayClientPort {
     items: BlindRelayListedEnvelope[];
     nextCursor: number;
     hasMore: boolean;
+    cursorReset?: boolean;
   }> {
     this.listEnvelopeCalls += 1;
+    this.recordedListAfterSeqs.push(params.afterSeq);
     await Promise.resolve();
     return this.hub.listEnvelopes(params);
   }
@@ -973,15 +994,25 @@ export class MockBlindRelayClient implements BlindRelayClientPort {
 
 export class MockBlindRelayHub {
   isOnline = true;
+  keepalivePutCount = 0;
   readonly ttlMs: number;
   readonly maxFileBytes: number;
   private readonly now: () => number;
   private readonly boxes = new Map<string, StoredRelayBox>();
+  private remainingEnvelopePutFailures = 0;
 
   constructor(options?: MockBlindRelayHubOptions) {
     this.ttlMs = options?.ttlMs ?? DEFAULT_RELAY_TTL_MS;
     this.maxFileBytes = options?.maxFileBytes ?? DEFAULT_RELAY_MAX_FILE_BYTES;
     this.now = options?.now ?? (() => Date.now());
+  }
+
+  failNextEnvelopePuts(count: number): void {
+    this.remainingEnvelopePutFailures = Math.max(0, Math.floor(count));
+  }
+
+  setEnvelopePutFailures(count: number): void {
+    this.failNextEnvelopePuts(count);
   }
 
   createClient(options?: MockBlindRelayClientOptions): MockBlindRelayClient {
@@ -1019,9 +1050,17 @@ export class MockBlindRelayHub {
     boxId: string;
     blobId: string;
     payload: Uint8Array;
+    keepalive?: boolean;
   }): { seq: number; expiresAt: number } {
+    if (params.keepalive) {
+      this.keepalivePutCount += 1;
+    }
     if (!this.isOnline) {
       throw new Error("Blind relay server is offline");
+    }
+    if (this.remainingEnvelopePutFailures > 0) {
+      this.remainingEnvelopePutFailures -= 1;
+      throw new Error("Simulated transient blind relay putEnvelope failure");
     }
     if (!isValidRelayBoxId(params.boxId) || !isValidRelayBlobId(params.blobId)) {
       throw new Error("Invalid relay boxId or blobId");
@@ -1057,6 +1096,7 @@ export class MockBlindRelayHub {
     items: BlindRelayListedEnvelope[];
     nextCursor: number;
     hasMore: boolean;
+    cursorReset?: boolean;
   } {
     if (!this.isOnline) {
       throw new Error("Blind relay server is offline");
@@ -1067,16 +1107,26 @@ export class MockBlindRelayHub {
 
     const box = this.boxes.get(params.boxId);
     if (!box) {
-      return { items: [], nextCursor: params.afterSeq, hasMore: false };
+      const cursorReset = params.afterSeq > 0;
+      return {
+        items: [],
+        nextCursor: 0,
+        hasMore: false,
+        ...(cursorReset ? { cursorReset: true } : {}),
+      };
     }
     this.purgeExpired(box);
+
+    const highestIssuedSeq = box.nextSeq - 1;
+    const cursorReset = params.afterSeq > highestIssuedSeq;
+    const effectiveAfterSeq = cursorReset ? 0 : params.afterSeq;
 
     const effectiveLimit = Math.min(
       Math.max(1, params.limit ?? MAX_RELAY_LIST_LIMIT),
       MAX_RELAY_LIST_LIMIT,
     );
     const matching = Array.from(box.envelopesByBlobId.values())
-      .filter((it) => it.seq > params.afterSeq)
+      .filter((it) => it.seq > effectiveAfterSeq)
       .sort((a, b) => a.seq - b.seq);
 
     const page = matching.slice(0, effectiveLimit).map((it) => ({
@@ -1087,9 +1137,14 @@ export class MockBlindRelayHub {
     }));
     const hasMore = matching.length > effectiveLimit;
     const nextCursor =
-      page.length > 0 ? page[page.length - 1]!.seq : params.afterSeq;
+      page.length > 0 ? page[page.length - 1]!.seq : effectiveAfterSeq;
 
-    return { items: page, nextCursor, hasMore };
+    return {
+      items: page,
+      nextCursor,
+      hasMore,
+      ...(cursorReset ? { cursorReset: true } : {}),
+    };
   }
 
   putChunk(params: {

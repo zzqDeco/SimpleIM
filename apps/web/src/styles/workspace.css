@@ -472,6 +472,39 @@
   color: var(--text-dim);
 }
 
+.msg-delivery-tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+}
+
+.msg-delivery-pending {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.msg-delivery-relayed {
+  color: var(--status-success);
+  border-color: var(--status-success-border);
+  background: var(--status-success-soft);
+}
+
+.msg-delivery-failed {
+  color: var(--status-danger);
+  border-color: var(--status-danger-border);
+  background: var(--status-danger-soft);
+  cursor: pointer;
+}
+
+.msg-delivery-failed:hover {
+  opacity: 0.9;
+}
+
 .msg-reply-trigger {
   border: 0;
   background: transparent;

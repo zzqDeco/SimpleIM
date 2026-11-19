@@ -81,6 +81,10 @@ export const zhCN = {
   "room.send": "发送",
   "room.shortcutSend": "Enter 发送",
   "room.shortcutNewline": "Shift+Enter 换行",
+  "room.msg.delivery.pending": "发送中…",
+  "room.msg.delivery.relayed": "✓ 已暂存",
+  "room.msg.delivery.p2pOnly": "P2P",
+  "room.msg.delivery.failed": "待重试",
 
   "room.sidebarAria": "房间成员与共享文件",
   "room.peers.heading": "在线成员",

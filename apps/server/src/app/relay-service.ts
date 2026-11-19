@@ -1,4 +1,5 @@
 import {
+  DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES,
   DEFAULT_RELAY_MAX_FILE_BYTES,
   DEFAULT_RELAY_MAX_TOTAL_BYTES,
   DEFAULT_RELAY_TTL_MS,
@@ -27,6 +28,7 @@ export const DEFAULT_RELAY_CONFIG: RelayConfig = {
   ttlMs: DEFAULT_RELAY_TTL_MS,
   maxFileBytes: DEFAULT_RELAY_MAX_FILE_BYTES,
   maxTotalBytes: DEFAULT_RELAY_MAX_TOTAL_BYTES,
+  maxEnvelopeTotalBytes: DEFAULT_RELAY_MAX_ENVELOPE_TOTAL_BYTES,
 };
 
 export const DEFAULT_RELAY_ENVELOPE_RATE_LIMIT: RateLimitRule = {
@@ -107,10 +109,10 @@ export class RelayService {
         413,
       );
     }
-    if (params.payload.byteLength > this.config.maxTotalBytes) {
+    if (params.payload.byteLength > this.config.maxEnvelopeTotalBytes) {
       throw new DomainError(
         "payload_too_large",
-        "Relay envelope exceeds total cache capacity",
+        "Relay envelope exceeds envelope cache capacity",
         413,
       );
     }
@@ -183,13 +185,18 @@ export class RelayService {
     }));
 
     const nextCursor =
-      items.length > 0 ? items[items.length - 1]!.seq : afterSeq;
+      items.length > 0
+        ? items[items.length - 1]!.seq
+        : listed.cursorReset
+          ? 0
+          : afterSeq;
 
     return {
       ok: true,
       items,
       nextCursor,
       hasMore: listed.hasMore,
+      ...(listed.cursorReset ? { cursorReset: true } : {}),
     };
   }
 
