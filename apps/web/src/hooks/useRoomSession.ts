@@ -660,6 +660,9 @@ export function useRoomSession({
                       : entry.metadata.lastReadAt,
                 };
 
+                const preCommitFileIds = new Set(
+                  entry.files.map((f) => f.fileId),
+                );
                 const committed = await vault.commitRoomState({
                   userId: currentUser.id,
                   metadata: nextMetadata,
@@ -694,6 +697,7 @@ export function useRoomSession({
                   committedFiles: committed.files,
                   committedPendingRelayMsgIds: committed.pendingRelayMsgIds,
                   committedRelayCursor: committed.relayCursor,
+                  preCommitFileIds,
                   removedPendingRelayMsgIds: batch.messages.map((m) => m.msgId),
                   cursorReset: batch.cursorReset,
                   maxMessages: MAX_VAULT_MESSAGES_PER_ROOM,

@@ -43,7 +43,10 @@ import {
   writeStoredLocale,
 } from "../src/i18n/registry.ts";
 import { LOCALE_CODES, type TranslationKey } from "../src/i18n/types.ts";
-import { reconcileCommittedRoomState } from "../src/state/collections.ts";
+import {
+  mergeOrderedFiles,
+  reconcileCommittedRoomState,
+} from "../src/state/collections.ts";
 import { deriveMessageViewModel } from "../src/state/message-vm.ts";
 import {
   buildSortedRoomSummaries,
@@ -2264,6 +2267,120 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
       [msgConcurrentSend.msgId, msgOtherTab.msgId].sort(),
     );
     expect(reconciled.relayCursor).toBe(6);
+
+    // Capped file reconciliation (PR #31 Codex Review P2): preserves insertion order and never resurrects evicted manifests
+    const makeManifestFixture = (fileId: string, fileName: string): FileManifest => ({
+      fileId,
+      roomId: roomKeys.roomId,
+      fileName,
+      fileSize: 0,
+      mimeType: "application/octet-stream",
+      chunkSize: SWARM_CHUNK_SIZE,
+      totalChunks: 0,
+      fileSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      chunkHashes: [],
+      senderCert: cert,
+      senderSig: "sig_stub",
+    });
+    const old1 = makeManifestFixture("019a0000-0000-7000-8000-000000000001", "old1.bin");
+    const old2 = makeManifestFixture("019a0000-0000-7000-8000-000000000002", "old2.bin");
+    const new1 = makeManifestFixture("019a0000-0000-7000-8000-000000000003", "new1.bin");
+    const new2 = makeManifestFixture("019a0000-0000-7000-8000-000000000004", "new2.bin");
+    const liveNew = makeManifestFixture("019a0000-0000-7000-8000-000000000005", "liveNew.bin");
+
+    // 1. Live [old1, old2] + committed [old2, new1] at cap 2 -> [old2, new1] (never [new1, old1]!)
+    expect(
+      mergeOrderedFiles([old2, new1], [old1, old2])
+        .slice(-2)
+        .map((f) => f.fileName),
+    ).toEqual(["old2.bin", "new1.bin"]);
+
+    const baseFileMeta = {
+      roomId: roomKeys.roomId,
+      roomIdPrefix: roomKeys.roomIdPrefix,
+      alias: null,
+      pinned: false,
+      joinedAt: 1_765_000_000_000,
+      lastActiveAt: 1_765_000_000_000,
+      lastReadAt: 1_765_000_000_000,
+    };
+
+    const cappedNoConcurrent = reconcileCommittedRoomState({
+      liveMetadata: baseFileMeta,
+      liveMessages: [],
+      liveFiles: [old1, old2],
+      livePendingRelayMsgIds: new Set(),
+      liveDeliveryStates: new Map(),
+      liveRelayCursor: 0,
+      committedMetadata: baseFileMeta,
+      committedFiles: [old2, new1],
+      committedPendingRelayMsgIds: [],
+      committedRelayCursor: 1,
+      maxFiles: 2,
+    });
+    expect(cappedNoConcurrent.files.map((f) => f.fileName)).toEqual([
+      "old2.bin",
+      "new1.bin",
+    ]);
+
+    // 2. Live [old1, old2, liveNew] + committed [old2, new1] at cap 2 -> [new1, liveNew]
+    const cappedWithConcurrent = reconcileCommittedRoomState({
+      liveMetadata: baseFileMeta,
+      liveMessages: [],
+      liveFiles: [old1, old2, liveNew],
+      livePendingRelayMsgIds: new Set(),
+      liveDeliveryStates: new Map(),
+      liveRelayCursor: 0,
+      committedMetadata: baseFileMeta,
+      committedFiles: [old2, new1],
+      committedPendingRelayMsgIds: [],
+      committedRelayCursor: 1,
+      preCommitFileIds: new Set([old1.fileId, old2.fileId]),
+      maxFiles: 2,
+    });
+    expect(cappedWithConcurrent.files.map((f) => f.fileName)).toEqual([
+      "new1.bin",
+      "liveNew.bin",
+    ]);
+
+    // 3. Disjoint full replacement [new1, new2] + concurrent liveNew -> [new2, liveNew] (never resurrects old1/old2!)
+    const cappedDisjointWithConcurrent = reconcileCommittedRoomState({
+      liveMetadata: baseFileMeta,
+      liveMessages: [],
+      liveFiles: [old1, old2, liveNew],
+      livePendingRelayMsgIds: new Set(),
+      liveDeliveryStates: new Map(),
+      liveRelayCursor: 0,
+      committedMetadata: baseFileMeta,
+      committedFiles: [new1, new2],
+      committedPendingRelayMsgIds: [],
+      committedRelayCursor: 2,
+      preCommitFileIds: new Set([old1.fileId, old2.fileId]),
+      maxFiles: 2,
+    });
+    expect(cappedDisjointWithConcurrent.files.map((f) => f.fileName)).toEqual([
+      "new2.bin",
+      "liveNew.bin",
+    ]);
+
+    // 4. Disjoint full replacement without preCommitFileIds -> [new1, new2]
+    const cappedDisjointNoPreCommit = reconcileCommittedRoomState({
+      liveMetadata: baseFileMeta,
+      liveMessages: [],
+      liveFiles: [old1, old2],
+      livePendingRelayMsgIds: new Set(),
+      liveDeliveryStates: new Map(),
+      liveRelayCursor: 0,
+      committedMetadata: baseFileMeta,
+      committedFiles: [new1, new2],
+      committedPendingRelayMsgIds: [],
+      committedRelayCursor: 2,
+      maxFiles: 2,
+    });
+    expect(cappedDisjointNoPreCommit.files.map((f) => f.fileName)).toEqual([
+      "new1.bin",
+      "new2.bin",
+    ]);
 
     // Fix 3: RoomVault distinguishes legacy rooms (missing pendingRelayMsgIds) from acknowledged empty outbox ([])
     const backend = new InMemoryVaultBackend();

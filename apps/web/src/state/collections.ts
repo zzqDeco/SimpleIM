@@ -25,6 +25,7 @@ export interface ReconcileCommittedRoomStateInput<
   readonly committedFiles?: readonly FileManifest[];
   readonly committedPendingRelayMsgIds: readonly string[];
   readonly committedRelayCursor: number;
+  readonly preCommitFileIds?: ReadonlySet<string>;
   readonly removedPendingRelayMsgIds?: readonly string[];
   readonly cursorReset?: boolean;
   readonly maxMessages?: number;
@@ -62,14 +63,68 @@ export function mergeOrderedFiles(
   existing: readonly FileManifest[],
   incoming: readonly FileManifest[],
 ): FileManifest[] {
-  const byId = new Map<string, FileManifest>();
+  const existingDedup: FileManifest[] = [];
+  const existingPos = new Map<string, number>();
   for (const f of existing) {
-    byId.set(f.fileId, f);
+    const pos = existingPos.get(f.fileId);
+    if (pos !== undefined) {
+      existingDedup[pos] = f;
+    } else {
+      existingPos.set(f.fileId, existingDedup.length);
+      existingDedup.push(f);
+    }
   }
+
+  const incomingDedup: FileManifest[] = [];
+  const incomingPos = new Map<string, number>();
   for (const f of incoming) {
-    byId.set(f.fileId, f);
+    const pos = incomingPos.get(f.fileId);
+    if (pos !== undefined) {
+      incomingDedup[pos] = f;
+    } else {
+      incomingPos.set(f.fileId, incomingDedup.length);
+      incomingDedup.push(f);
+    }
   }
-  return Array.from(byId.values());
+
+  // Insert incoming-only segments ahead of the existing anchor they precede and
+  // append trailing incoming-only items at the end so evicted older manifests
+  // never jump past newer ones when merging capped snapshots.
+  const insertBefore = new Map<number, FileManifest[]>();
+  const trailing: FileManifest[] = [];
+  let pendingSegment: FileManifest[] = [];
+
+  for (const f of incomingDedup) {
+    const anchorPos = existingPos.get(f.fileId);
+    if (anchorPos !== undefined) {
+      existingDedup[anchorPos] = f;
+      if (pendingSegment.length > 0) {
+        const bucket = insertBefore.get(anchorPos);
+        if (bucket) {
+          bucket.push(...pendingSegment);
+        } else {
+          insertBefore.set(anchorPos, pendingSegment);
+        }
+        pendingSegment = [];
+      }
+    } else {
+      pendingSegment.push(f);
+    }
+  }
+  if (pendingSegment.length > 0) {
+    trailing.push(...pendingSegment);
+  }
+
+  const out: FileManifest[] = [];
+  for (let i = 0; i < existingDedup.length; i++) {
+    const before = insertBefore.get(i);
+    if (before) {
+      out.push(...before);
+    }
+    out.push(existingDedup[i]!);
+  }
+  out.push(...trailing);
+  return out;
 }
 
 /**
@@ -106,12 +161,36 @@ export function reconcileCommittedRoomState<
         )
       : [...input.liveMessages];
 
-  const files =
-    input.committedFiles !== undefined
-      ? mergeOrderedFiles(input.committedFiles, input.liveFiles).slice(
-          -maxFiles,
-        )
-      : [...input.liveFiles];
+  let files: FileManifest[];
+  if (input.committedFiles !== undefined) {
+    if (input.preCommitFileIds !== undefined) {
+      const committedIds = new Set(input.committedFiles.map((f) => f.fileId));
+      const preCommitOnly: FileManifest[] = [];
+      const concurrentLiveOnly: FileManifest[] = [];
+      for (const f of input.liveFiles) {
+        if (committedIds.has(f.fileId)) continue;
+        if (input.preCommitFileIds.has(f.fileId)) {
+          preCommitOnly.push(f);
+        } else {
+          concurrentLiveOnly.push(f);
+        }
+      }
+      files = mergeOrderedFiles(
+        [],
+        [...preCommitOnly, ...input.committedFiles, ...concurrentLiveOnly],
+      ).slice(-maxFiles);
+    } else {
+      const committedIds = new Set(input.committedFiles.map((f) => f.fileId));
+      const hasOverlap = input.liveFiles.some((f) => committedIds.has(f.fileId));
+      files = (
+        hasOverlap
+          ? mergeOrderedFiles(input.committedFiles, input.liveFiles)
+          : mergeOrderedFiles(input.liveFiles, input.committedFiles)
+      ).slice(-maxFiles);
+    }
+  } else {
+    files = [...input.liveFiles];
+  }
 
   const removedSet = new Set(input.removedPendingRelayMsgIds ?? []);
   const pendingRelayMsgIds = new Set<string>(input.livePendingRelayMsgIds);
