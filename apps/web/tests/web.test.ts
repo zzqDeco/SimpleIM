@@ -47,6 +47,10 @@ import {
   mergeOrderedFiles,
   reconcileCommittedRoomState,
 } from "../src/state/collections.ts";
+import {
+  isTranscriptNearBottom,
+  shouldAutoScrollTranscript,
+} from "../src/state/transcript-scroll.ts";
 import { deriveMessageViewModel } from "../src/state/message-vm.ts";
 import {
   buildSortedRoomSummaries,
@@ -2499,5 +2503,99 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
 
     wipeRoomKeys(roomKeys);
     wipeRoomKeys(newRoomKeys);
+  });
+
+  test("Transcript scroll helpers preserve manual upward reading and auto-scroll only on room switch, initial load, near-bottom, or self-send", () => {
+    expect(
+      isTranscriptNearBottom({
+        scrollTop: 904,
+        scrollHeight: 1_500,
+        clientHeight: 500,
+      }),
+    ).toBe(true);
+    expect(
+      isTranscriptNearBottom({
+        scrollTop: 500,
+        scrollHeight: 1_500,
+        clientHeight: 500,
+      }),
+    ).toBe(false);
+
+    // Empty room -> never auto-scroll
+    expect(
+      shouldAutoScrollTranscript({
+        roomChanged: true,
+        previousLastMsgId: null,
+        nextLastMsgId: null,
+        wasNearBottom: true,
+        latestMessageIsSelf: false,
+      }),
+    ).toBe(false);
+
+    // Room switch to non-empty room -> always scroll to latest
+    expect(
+      shouldAutoScrollTranscript({
+        roomChanged: true,
+        previousLastMsgId: "m10",
+        nextLastMsgId: "m20",
+        wasNearBottom: false,
+        latestMessageIsSelf: false,
+      }),
+    ).toBe(true);
+
+    // Initial hydration (null -> m10) -> scroll to latest
+    expect(
+      shouldAutoScrollTranscript({
+        roomChanged: false,
+        previousLastMsgId: null,
+        nextLastMsgId: "m10",
+        wasNearBottom: false,
+        latestMessageIsSelf: false,
+      }),
+    ).toBe(true);
+
+    // Scrolled up reading history + remote message arrives -> DO NOT yank to bottom!
+    expect(
+      shouldAutoScrollTranscript({
+        roomChanged: false,
+        previousLastMsgId: "m10",
+        nextLastMsgId: "m11",
+        wasNearBottom: false,
+        latestMessageIsSelf: false,
+      }),
+    ).toBe(false);
+
+    // Scrolled up reading history + older historical message prepended (tail unchanged) -> DO NOT yank!
+    expect(
+      shouldAutoScrollTranscript({
+        roomChanged: false,
+        previousLastMsgId: "m10",
+        nextLastMsgId: "m10",
+        wasNearBottom: false,
+        latestMessageIsSelf: false,
+      }),
+    ).toBe(false);
+
+    // Scrolled up reading history + user sends a message themselves -> scroll to bottom
+    expect(
+      shouldAutoScrollTranscript({
+        roomChanged: false,
+        previousLastMsgId: "m10",
+        nextLastMsgId: "m11",
+        wasNearBottom: false,
+        latestMessageIsSelf: true,
+      }),
+    ).toBe(true);
+
+    // Already near bottom + remote message arrives -> auto-scroll
+    expect(
+      shouldAutoScrollTranscript({
+        roomChanged: false,
+        previousLastMsgId: "m10",
+        nextLastMsgId: "m11",
+        wasNearBottom: true,
+        latestMessageIsSelf: false,
+      }),
+    ).toBe(true);
   });
 });

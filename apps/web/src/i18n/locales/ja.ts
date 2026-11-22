@@ -85,6 +85,7 @@ export const ja = {
   "room.msg.delivery.relayed": "✓ 一時保存済",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "再試行",
+  "room.jumpToLatest": "最新へ",
 
   "room.sidebarAria": "ルームメンバーと共有ファイル",
   "room.peers.heading": "メンバー",

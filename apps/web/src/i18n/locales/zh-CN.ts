@@ -85,6 +85,7 @@ export const zhCN = {
   "room.msg.delivery.relayed": "✓ 已暂存",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "待重试",
+  "room.jumpToLatest": "回到底部",
 
   "room.sidebarAria": "房间成员与共享文件",
   "room.peers.heading": "在线成员",

@@ -105,6 +105,7 @@ export interface TranslationSchema {
   "room.msg.delivery.relayed": string;
   "room.msg.delivery.p2pOnly": string;
   "room.msg.delivery.failed": string;
+  "room.jumpToLatest": string;
 
   // Side Pane (Members & Files)
   "room.sidebarAria": string;

@@ -1,4 +1,4 @@
-import { useCallback, useState, type ReactElement } from "react";
+import { useCallback, useRef, useState, type ReactElement } from "react";
 import type {
   ChatMessageEnvelope,
   FileManifest,
@@ -13,6 +13,7 @@ import { NoticeBanner } from "../../design-system/index.ts";
 import { useFileDropzone } from "../../hooks/useFileDropzone.ts";
 import { usePromptComposer } from "../../hooks/usePromptComposer.ts";
 import type { JoinPhase, SecurityEvent } from "../../hooks/useRoomSession.ts";
+import { useRoomViewportLock } from "../../hooks/useRoomViewportLock.ts";
 import {
   formatAppFailure,
   type AppFailure,
@@ -104,8 +105,11 @@ export function RoomScreen({
   onWipeAndSignOut,
 }: RoomScreenProps): ReactElement {
   const { t } = useI18n();
+  const shellRef = useRef<HTMLDivElement | null>(null);
   const [railOpen, setRailOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  useRoomViewportLock(shellRef);
 
   const composer = usePromptComposer({
     roomKey: selectedRoomId,
@@ -134,7 +138,7 @@ export function RoomScreen({
           : formatAppFailure(securityEvent.failure, t);
 
   return (
-    <div className="room-shell">
+    <div ref={shellRef} className="room-shell">
       <RoomTopBar
         roomIdPrefix={roomIdPrefix}
         roomAlias={selectedRoomAlias}
@@ -208,6 +212,7 @@ export function RoomScreen({
           ) : null}
 
           <MessageTranscript
+            roomId={selectedRoomId}
             messages={messages}
             deliveryStates={deliveryStates}
             localPeerId={localPeerId}
