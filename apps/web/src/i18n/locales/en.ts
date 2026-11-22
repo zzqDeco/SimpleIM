@@ -85,6 +85,7 @@ export const en = {
   "room.msg.delivery.relayed": "✓ Cached",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "Retry",
+  "room.jumpToLatest": "Latest",
 
   "room.sidebarAria": "Room members and shared files",
   "room.peers.heading": "Members",

@@ -85,6 +85,7 @@ export const zhTW = {
   "room.msg.delivery.relayed": "✓ 已暫存",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "待重試",
+  "room.jumpToLatest": "回到底部",
 
   "room.sidebarAria": "房間成員與共享檔案",
   "room.peers.heading": "在線成員",

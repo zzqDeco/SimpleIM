@@ -992,4 +992,153 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
     ]);
     expect(sqliteAudit.leaked).toEqual([]);
   });
+
+  test("mobile iOS-sized viewport scrolls smoothly to earliest messages, prevents input auto-zoom, and keeps scroll position when remote messages arrive", async ({
+    browser,
+  }) => {
+    const cluster = await harness.call<{
+      webOrigin: string;
+      apiUrl: string;
+      sqlitePath: string;
+    }>("startCluster");
+
+    const passphrase = "mobile-ios-scroll-regression-2026";
+    const cliPeer = await harness.call<{ peerId: string; username: string }>(
+      "spawnCliPeer",
+      {
+        username: "mobile_cli_peer",
+        displayName: "Mobile CLI Peer",
+        password: "Password-MobileCli-123!",
+        passphrase,
+      },
+    );
+
+    // Pre-populate 32 messages from CLI peer so the transcript overflows mobile viewport substantially
+    for (let i = 1; i <= 32; i++) {
+      await harness.call("cliSendChat", {
+        peerId: cliPeer.peerId,
+        body: `History entry #${i}: checking mobile upward scroll reachability`,
+      });
+    }
+
+    const context = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+    });
+    const page = await context.newPage();
+
+    try {
+      await registerAndJoinRoomOnWeb({
+        page,
+        webOrigin: cluster.webOrigin,
+        username: "mobile_ios_user",
+        displayName: "iOS Tester",
+        password: "Password-IosTester-123!",
+        passphrase,
+      });
+
+      await expect(page.locator(".message-stream")).toContainText(
+        "History entry #32:",
+        { timeout: 25_000 },
+      );
+
+      // Verify mobile layout constraints:
+      // 1) .room-shell stays locked at scrollTop 0 and does not overflow viewport
+      // 2) .message-stream has real vertical overflow and starts scrolled to bottom
+      // 3) textarea font-size is 16px to prevent iOS Safari focus auto-zoom
+      // 4) top-bar is compact on mobile (< 150px)
+      const initialLayout = await page.evaluate(() => {
+        const shell = document.querySelector(".room-shell") as HTMLElement;
+        const stream = document.querySelector(".message-stream") as HTMLElement;
+        const topBar = document.querySelector(".top-bar") as HTMLElement;
+        const input = document.querySelector(
+          "[data-testid='chat-input']",
+        ) as HTMLElement;
+        return {
+          shellScrollTop: shell.scrollTop,
+          shellHeight: Math.round(shell.getBoundingClientRect().height),
+          topBarHeight: Math.round(topBar.getBoundingClientRect().height),
+          streamClientH: stream.clientHeight,
+          streamScrollH: stream.scrollHeight,
+          streamScrollTop: stream.scrollTop,
+          streamMinHeight: getComputedStyle(stream).minHeight,
+          inputFontSize: getComputedStyle(input).fontSize,
+        };
+      });
+      expect(initialLayout.shellScrollTop).toBe(0);
+      expect(initialLayout.shellHeight).toBeLessThanOrEqual(844);
+      expect(initialLayout.topBarHeight).toBeLessThan(150);
+      expect(initialLayout.streamScrollH).toBeGreaterThan(
+        initialLayout.streamClientH + 400,
+      );
+      expect(initialLayout.streamScrollTop).toBeGreaterThan(200);
+      expect(initialLayout.streamMinHeight).toBe("0px");
+      expect(initialLayout.inputFontSize).toBe("16px");
+
+      // Scroll all the way up to message #1 inside .message-stream
+      await page.evaluate(() => {
+        const stream = document.querySelector(".message-stream") as HTMLElement;
+        stream.scrollTop = 0;
+        stream.dispatchEvent(new Event("scroll"));
+      });
+
+      await expect(page.getByTestId("jump-to-latest-button")).toBeVisible();
+
+      const topVisibility = await page.evaluate(() => {
+        const stream = document.querySelector(".message-stream") as HTMLElement;
+        const shell = document.querySelector(".room-shell") as HTMLElement;
+        const firstEntry = document.querySelector(".msg-entry") as HTMLElement;
+        const streamRect = stream.getBoundingClientRect();
+        const firstRect = firstEntry.getBoundingClientRect();
+        return {
+          shellScrollTop: shell.scrollTop,
+          streamScrollTop: stream.scrollTop,
+          firstText: firstEntry.textContent ?? "",
+          firstVisibleInStream:
+            firstRect.top >= streamRect.top - 2 &&
+            firstRect.bottom <= streamRect.bottom + 2,
+        };
+      });
+      expect(topVisibility.shellScrollTop).toBe(0);
+      expect(topVisibility.streamScrollTop).toBe(0);
+      expect(topVisibility.firstText).toContain("History entry #1:");
+      expect(topVisibility.firstVisibleInStream).toBe(true);
+
+      // While user is reading message #1 at the top, CLI sends a new remote message #33 ->
+      // transcript MUST NOT yank scrollTop back to bottom!
+      await harness.call("cliSendChat", {
+        peerId: cliPeer.peerId,
+        body: "Live remote entry #33 while reading top!",
+      });
+      await expect(page.locator(".message-stream")).toContainText(
+        "Live remote entry #33 while reading top!",
+        { timeout: 15_000 },
+      );
+
+      const afterRemoteScrollTop = await page.evaluate(
+        () => (document.querySelector(".message-stream") as HTMLElement).scrollTop,
+      );
+      expect(afterRemoteScrollTop).toBe(0);
+      await expect(page.getByTestId("jump-to-latest-button")).toBeVisible();
+
+      // Clicking "Latest" jumps cleanly to the bottom and hides the button
+      await page.getByTestId("jump-to-latest-button").click();
+      await expect(page.getByTestId("jump-to-latest-button")).toHaveCount(0);
+
+      const bottomMetrics = await page.evaluate(() => {
+        const stream = document.querySelector(".message-stream") as HTMLElement;
+        return {
+          distanceFromBottom:
+            stream.scrollHeight - stream.scrollTop - stream.clientHeight,
+          shellScrollTop: (document.querySelector(".room-shell") as HTMLElement)
+            .scrollTop,
+        };
+      });
+      expect(bottomMetrics.shellScrollTop).toBe(0);
+      expect(bottomMetrics.distanceFromBottom).toBeLessThanOrEqual(4);
+    } finally {
+      await context.close();
+    }
+  });
 });

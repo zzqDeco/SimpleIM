@@ -85,6 +85,7 @@ export const ko = {
   "room.msg.delivery.relayed": "✓ 임시보관됨",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "재시도",
+  "room.jumpToLatest": "최신으로",
 
   "room.sidebarAria": "방 참여자 및 공유 파일",
   "room.peers.heading": "참여자",
