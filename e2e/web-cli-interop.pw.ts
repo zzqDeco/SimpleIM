@@ -1085,6 +1085,40 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
 
       await expect(page.getByTestId("jump-to-latest-button")).toBeVisible();
 
+      // Verify IM timeline dividers, floating scroll date pill, compact short-burst grouping,
+      // and tap-to-reveal full YYYY-MM-DD HH:MM:SS timestamp drawer on mobile!
+      const floatingPill = page.getByTestId("floating-date-pill");
+      await expect(floatingPill).toHaveAttribute("data-visible", "true");
+      await expect(floatingPill).toContainText(/\d{2}-\d{2}/);
+
+      const firstDivider = page.getByTestId("msg-time-divider").first();
+      await expect(firstDivider).toBeVisible();
+      await expect(firstDivider).toHaveAttribute("data-divider-kind", "day");
+      await expect(firstDivider).toContainText(/\d{2}:\d{2}/);
+
+      // Compact burst message #2 has no permanent timestamp drawer at rest
+      const secondEntry = page.locator(".msg-entry").nth(1);
+      await expect(secondEntry).toHaveAttribute("data-compact", "true");
+      await expect(secondEntry).toHaveAttribute("data-time-expanded", "false");
+      await expect(page.getByTestId("msg-time-drawer")).toHaveCount(0);
+
+      // Tapping message #2 expands full YYYY-MM-DD HH:MM:SS timestamp drawer; tapping again collapses
+      await secondEntry.click();
+      await expect(secondEntry).toHaveAttribute("data-time-expanded", "true");
+      const timeDrawer = secondEntry.getByTestId("msg-time-drawer");
+      await expect(timeDrawer).toBeVisible();
+      await expect(timeDrawer).toContainText(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+      await expect(timeDrawer.locator(".msg-reply-trigger")).toBeVisible();
+
+      await secondEntry.click();
+      await expect(secondEntry).toHaveAttribute("data-time-expanded", "false");
+      await expect(page.getByTestId("msg-time-drawer")).toHaveCount(0);
+
+      // Floating scroll date pill auto-fades out after scrolling stops
+      await expect(floatingPill).toHaveAttribute("data-visible", "false", {
+        timeout: 4_000,
+      });
+
       const topVisibility = await page.evaluate(() => {
         const stream = document.querySelector(".message-stream") as HTMLElement;
         const shell = document.querySelector(".room-shell") as HTMLElement;

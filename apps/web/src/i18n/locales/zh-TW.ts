@@ -86,6 +86,9 @@ export const zhTW = {
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "待重試",
   "room.jumpToLatest": "回到底部",
+  "room.date.today": "今天",
+  "room.date.yesterday": "昨天",
+  "room.msg.toggleTimeAria": "切換顯示完整傳送時間（{time}）",
 
   "room.sidebarAria": "房間成員與共享檔案",
   "room.peers.heading": "在線成員",

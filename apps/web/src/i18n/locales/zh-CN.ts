@@ -86,6 +86,9 @@ export const zhCN = {
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "待重试",
   "room.jumpToLatest": "回到底部",
+  "room.date.today": "今天",
+  "room.date.yesterday": "昨天",
+  "room.msg.toggleTimeAria": "切换显示完整发送时间（{time}）",
 
   "room.sidebarAria": "房间成员与共享文件",
   "room.peers.heading": "在线成员",

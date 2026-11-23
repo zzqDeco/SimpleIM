@@ -86,6 +86,9 @@ export const ja = {
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "再試行",
   "room.jumpToLatest": "最新へ",
+  "room.date.today": "今日",
+  "room.date.yesterday": "昨日",
+  "room.msg.toggleTimeAria": "詳細な送信日時を表示切替（{time}）",
 
   "room.sidebarAria": "ルームメンバーと共有ファイル",
   "room.peers.heading": "メンバー",

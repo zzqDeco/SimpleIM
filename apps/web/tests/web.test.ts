@@ -51,6 +51,12 @@ import {
   isTranscriptNearBottom,
   shouldAutoScrollTranscript,
 } from "../src/state/transcript-scroll.ts";
+import {
+  buildTranscriptTimeline,
+  TRANSCRIPT_TIME_GAP_MS,
+} from "../src/state/transcript-timeline.ts";
+import { I18nProvider } from "../src/i18n/I18nProvider.tsx";
+import { MessageTranscript } from "../src/features/room/MessageTranscript.tsx";
 import { deriveMessageViewModel } from "../src/state/message-vm.ts";
 import {
   buildSortedRoomSummaries,
@@ -95,10 +101,16 @@ import { BrowserSignalingClient } from "../src/transport/browser-signaling.ts";
 import { MultiplexedSignalingHub } from "../src/transport/multiplexed-signaling.ts";
 import {
   formatBytes,
+  formatDatePillLabel,
+  formatMessageClockShort,
+  formatMessageDateTime,
   formatMessageTime,
   formatRoomFingerprint,
   formatSha256Prefix,
   formatSpeedMBps,
+  formatTranscriptDividerLabel,
+  getLocalDayKey,
+  msUntilNextLocalMidnight,
 } from "../src/utils/format.ts";
 import {
   renderSafeMarkdown,
@@ -2597,5 +2609,220 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
         latestMessageIsSelf: false,
       }),
     ).toBe(true);
+  });
+
+  test("IM date/time formatting helpers produce DST-safe relative labels, full timestamps, and midnight rollover delays", () => {
+    const labels = { today: "Today", yesterday: "Yesterday" } as const;
+    const now = new Date(2026, 10, 24, 15, 30, 0).getTime(); // 2026-11-24 15:30:00 local
+
+    const todayMorning = new Date(2026, 10, 24, 9, 5, 8).getTime();
+    const yesterdayEvening = new Date(2026, 10, 23, 21, 45, 3).getTime();
+    const earlierSameYear = new Date(2026, 10, 20, 8, 7, 9).getTime();
+    const previousYear = new Date(2025, 11, 31, 23, 59, 58).getTime();
+    const futureSkew = new Date(2026, 10, 25, 1, 2, 3).getTime();
+
+    expect(getLocalDayKey(todayMorning)).toBe("2026-11-24");
+    expect(getLocalDayKey(0)).toBe("");
+    expect(getLocalDayKey(Number.NaN)).toBe("");
+
+    expect(formatMessageClockShort(todayMorning)).toBe("09:05");
+    expect(formatMessageClockShort(0)).toBe("--:--");
+    expect(formatMessageDateTime(todayMorning)).toBe("2026-11-24 09:05:08");
+    expect(formatMessageDateTime(-1)).toBe("--:--");
+
+    // Inline divider labels: today day-boundary includes "Today", same-day gap is compact HH:MM
+    expect(
+      formatTranscriptDividerLabel(todayMorning, now, labels, true),
+    ).toBe("Today 09:05");
+    expect(
+      formatTranscriptDividerLabel(todayMorning, now, labels, false),
+    ).toBe("09:05");
+    expect(
+      formatTranscriptDividerLabel(yesterdayEvening, now, labels, true),
+    ).toBe("Yesterday 21:45");
+    expect(
+      formatTranscriptDividerLabel(yesterdayEvening, now, labels, false),
+    ).toBe("Yesterday 21:45");
+    expect(
+      formatTranscriptDividerLabel(earlierSameYear, now, labels, true),
+    ).toBe("11-20 08:07");
+    expect(
+      formatTranscriptDividerLabel(previousYear, now, labels, true),
+    ).toBe("2025-12-31 23:59");
+    // Future clock skew does not falsely display Today/Yesterday
+    expect(
+      formatTranscriptDividerLabel(futureSkew, now, labels, true),
+    ).toBe("11-25 01:02");
+    expect(formatTranscriptDividerLabel(0, now, labels, true)).toBe("--:--");
+
+    // Floating scroll date pill labels
+    expect(formatDatePillLabel(todayMorning, now, labels)).toBe(
+      "Today · 11-24",
+    );
+    expect(formatDatePillLabel(yesterdayEvening, now, labels)).toBe(
+      "Yesterday · 11-23",
+    );
+    expect(formatDatePillLabel(earlierSameYear, now, labels)).toBe(
+      "2026-11-20",
+    );
+    expect(formatDatePillLabel(previousYear, now, labels)).toBe("2025-12-31");
+    expect(formatDatePillLabel(0, now, labels)).toBe("");
+
+    // Midnight rollover timer lands strictly in the next local calendar day and clamps >= 1s
+    const delayMidday = msUntilNextLocalMidnight(now);
+    expect(delayMidday).toBeGreaterThan(8 * 60 * 60 * 1000);
+    expect(getLocalDayKey(now + delayMidday)).toBe("2026-11-25");
+
+    const nearMidnight = new Date(2026, 10, 24, 23, 59, 59, 990).getTime();
+    expect(msUntilNextLocalMidnight(nearMidnight)).toBe(1_000);
+  });
+
+  test("buildTranscriptTimeline inserts day/gap dividers, groups same-author short bursts, and preserves attribution on quotes/runtime changes", () => {
+    const serverKeys = generateEd25519KeyPair();
+    const aliceWebKeys = generateEd25519KeyPair();
+    const aliceCliKeys = generateEd25519KeyPair();
+    const bobKeys = generateEd25519KeyPair();
+    const roomId = "d".repeat(64);
+
+    const aliceWebCert = issuePeerIdentityCert({
+      serverKeyId: "srvk_t",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000010",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_019a0000000070008000000000000010",
+      peerSignPubKey: aliceWebKeys.publicKeyBase64Url,
+      clientKind: "web",
+    });
+    const aliceCliCert = issuePeerIdentityCert({
+      serverKeyId: "srvk_t",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000010",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_019a0000000070008000000000000011",
+      peerSignPubKey: aliceCliKeys.publicKeyBase64Url,
+      clientKind: "cli",
+    });
+    const bobCert = issuePeerIdentityCert({
+      serverKeyId: "srvk_t",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000020",
+      username: "bob",
+      displayName: "Bob",
+      peerId: "peer_019a0000000070008000000000000020",
+      peerSignPubKey: bobKeys.publicKeyBase64Url,
+      clientKind: "web",
+    });
+
+    const mkMsg = (
+      id: string,
+      cert: typeof aliceWebCert,
+      privKey: Uint8Array,
+      createdAt: number,
+      body: string,
+      replyToMsgId?: string,
+    ): ChatMessageEnvelope =>
+      signChatMessage({
+        msgId: id,
+        roomId,
+        body,
+        createdAt,
+        replyToMsgId,
+        authorCert: cert,
+        peerSignPrivKey: privKey,
+      });
+
+    const nowMs = new Date(2026, 10, 24, 12, 0, 0).getTime();
+    const tPrevYear = new Date(2025, 11, 31, 23, 50, 0).getTime();
+    const tYesterday = new Date(2026, 10, 23, 18, 0, 0).getTime();
+    const tToday1 = new Date(2026, 10, 24, 10, 0, 0).getTime();
+    const tToday2 = tToday1 + 30_000; // +30s same author -> compact
+    const tToday3 = tToday2 + 20_000; // +20s same author, reply quote -> NOT compact
+    const tToday4 = tToday3 + 15_000; // +15s same user but CLI runtime -> NOT compact
+    const tToday5 = tToday4 + 10_000; // +10s different author (Bob) -> NOT compact, no divider
+    const tToday6 = tToday5 + TRANSCRIPT_TIME_GAP_MS; // +5m same author (Bob) -> gap divider, NOT compact
+
+    const msgs = [
+      mkMsg("m1", aliceWebCert, aliceWebKeys.privateKeyBytes, tPrevYear, "Last year"),
+      mkMsg("m2", aliceWebCert, aliceWebKeys.privateKeyBytes, tYesterday, "Yesterday"),
+      mkMsg("m3", aliceWebCert, aliceWebKeys.privateKeyBytes, tToday1, "Today #1"),
+      mkMsg("m4", aliceWebCert, aliceWebKeys.privateKeyBytes, tToday2, "Today #2 burst"),
+      mkMsg("m5", aliceWebCert, aliceWebKeys.privateKeyBytes, tToday3, "Today #3 reply", "m2"),
+      mkMsg("m6", aliceCliCert, aliceCliKeys.privateKeyBytes, tToday4, "Today #4 from CLI"),
+      mkMsg("m7", bobCert, bobKeys.privateKeyBytes, tToday5, "Bob quick reply"),
+      mkMsg("m8", bobCert, bobKeys.privateKeyBytes, tToday6, "Bob after 5m gap"),
+    ];
+
+    const timeline = buildTranscriptTimeline({
+      messages: msgs,
+      localPeerId: aliceWebCert.payload.peerId,
+      currentUserId: aliceWebCert.payload.userId,
+      nowMs,
+      dateLabels: { today: "今天", yesterday: "昨天" },
+    });
+
+    expect(timeline.length).toBe(8);
+    expect(timeline[0]!.showDivider).toBe(true);
+    expect(timeline[0]!.isDayBoundary).toBe(true);
+    expect(timeline[0]!.dividerLabel).toBe("2025-12-31 23:50");
+    expect(timeline[0]!.isCompact).toBe(false);
+
+    expect(timeline[1]!.showDivider).toBe(true);
+    expect(timeline[1]!.isDayBoundary).toBe(true);
+    expect(timeline[1]!.dividerLabel).toBe("昨天 18:00");
+    expect(timeline[1]!.isCompact).toBe(false);
+
+    expect(timeline[2]!.showDivider).toBe(true);
+    expect(timeline[2]!.isDayBoundary).toBe(true);
+    expect(timeline[2]!.dividerLabel).toBe("今天 10:00");
+    expect(timeline[2]!.isCompact).toBe(false);
+
+    // Same author within 5m -> compact burst without divider
+    expect(timeline[3]!.showDivider).toBe(false);
+    expect(timeline[3]!.dividerLabel).toBeNull();
+    expect(timeline[3]!.isCompact).toBe(true);
+    expect(timeline[3]!.vm.formattedDateTime).toBe("2026-11-24 10:00:30");
+
+    // Reply with quote preserves full header
+    expect(timeline[4]!.showDivider).toBe(false);
+    expect(timeline[4]!.isCompact).toBe(false);
+
+    // Different clientKind (CLI vs WEB) breaks compact grouping
+    expect(timeline[5]!.showDivider).toBe(false);
+    expect(timeline[5]!.isCompact).toBe(false);
+
+    // Different user within 5m -> no divider, not compact
+    expect(timeline[6]!.showDivider).toBe(false);
+    expect(timeline[6]!.isCompact).toBe(false);
+
+    // >= 5m gap on same day -> gap divider (HH:MM only) and breaks compact grouping
+    expect(timeline[7]!.showDivider).toBe(true);
+    expect(timeline[7]!.isDayBoundary).toBe(false);
+    expect(timeline[7]!.dividerLabel).toBe("10:06");
+    expect(timeline[7]!.isCompact).toBe(false);
+
+    // SSR smoke check on MessageTranscript markup
+    const html = renderToStaticMarkup(
+      createElement(
+        I18nProvider,
+        null,
+        createElement(MessageTranscript, {
+          roomId,
+          messages: msgs,
+          localPeerId: aliceWebCert.payload.peerId,
+          currentUserId: aliceWebCert.payload.userId,
+          onReply: () => {},
+          nowMs,
+        }),
+      ),
+    );
+    expect(html).toContain('data-testid="msg-time-divider"');
+    expect(html).toContain('data-divider-kind="day"');
+    expect(html).toContain('data-divider-kind="gap"');
+    expect(html).toContain('data-compact="true"');
+    expect(html).toContain('data-time-expanded="false"');
+    expect(html).toContain('title="2026-11-24 10:00:30"');
+    expect(html).not.toContain('data-testid="msg-time-drawer"');
   });
 });
