@@ -75,6 +75,11 @@ export interface TranslationSchema {
   "room.leave": string;
   "room.signOut": string;
   "room.wipeSignOut": string;
+  "room.moreMenuAria": string;
+  "room.moreMenuLabel": string;
+  "room.wipeConfirmTitle": string;
+  "room.wipeConfirmAction": string;
+  "room.wipeCancel": string;
   "room.railAria": string;
   "room.rail.heading": string;
   "room.rail.addButton": string;
@@ -93,6 +98,8 @@ export interface TranslationSchema {
   "room.you": string;
   "room.reply": string;
   "room.quotedFallback": string;
+  "room.quoteJumpAria": string;
+  "room.quoteUnavailable": string;
   "room.replyingTo": string;
   "room.cancelReply": string;
   "room.attach": string;

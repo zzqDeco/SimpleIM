@@ -55,6 +55,12 @@ export const es = {
   "room.leave": "Salir de sala",
   "room.signOut": "Cerrar sesión",
   "room.wipeSignOut": "Borrar y salir",
+  "room.moreMenuAria": "Más opciones",
+  "room.moreMenuLabel": "Más",
+  "room.wipeConfirmTitle":
+    "¿Borrar todas las claves y el historial local y salir?",
+  "room.wipeConfirmAction": "Confirmar borrado",
+  "room.wipeCancel": "Cancelar",
   "room.railAria": "Lista de salas unidas",
   "room.rail.heading": "Salas",
   "room.rail.addButton": "+ Unirse / Nueva",
@@ -73,6 +79,9 @@ export const es = {
   "room.you": "tú",
   "room.reply": "Responder",
   "room.quotedFallback": "Mensaje citado",
+  "room.quoteJumpAria": "Ir al mensaje citado",
+  "room.quoteUnavailable":
+    "El mensaje original ya no está en el historial cargado",
   "room.replyingTo": "Respondiendo a @{username}",
   "room.cancelReply": "Cancelar",
   "room.attach": "Adjuntar",

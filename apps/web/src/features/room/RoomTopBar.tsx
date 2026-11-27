@@ -3,7 +3,7 @@ import { Button, StatusIcon } from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import type { RoomMeshConnectionStatus } from "../../state/room-list-vm.ts";
 import { formatRoomFingerprint } from "../../utils/format.ts";
-import { PreferenceControls } from "../preferences/PreferenceControls.tsx";
+import { RoomMoreMenu } from "./RoomMoreMenu.tsx";
 
 export interface RoomTopBarProps {
   readonly roomIdPrefix: string;
@@ -12,15 +12,19 @@ export interface RoomTopBarProps {
   readonly centerConnected: boolean;
   readonly username: string;
   readonly roomCount: number;
+  readonly totalUnreadCount: number;
   readonly peerCount: number;
   readonly fileCount: number;
   readonly railOpen: boolean;
-  readonly sidebarOpen: boolean;
+  readonly sidebarExpanded: boolean;
+  readonly moreMenuOpen: boolean;
+  readonly onMoreMenuOpenChange: (next: boolean) => void;
   readonly onToggleRail: () => void;
   readonly onToggleSidebar: () => void;
   readonly onLeaveRoom: () => Promise<void>;
   readonly onSignOut: () => Promise<void>;
   readonly onWipeAndSignOut: () => Promise<void>;
+  readonly onActionError?: (err: unknown) => void;
 }
 
 export function RoomTopBar({
@@ -30,15 +34,19 @@ export function RoomTopBar({
   centerConnected,
   username,
   roomCount,
+  totalUnreadCount,
   peerCount,
   fileCount,
   railOpen,
-  sidebarOpen,
+  sidebarExpanded,
+  moreMenuOpen,
+  onMoreMenuOpenChange,
   onToggleRail,
   onToggleSidebar,
   onLeaveRoom,
   onSignOut,
   onWipeAndSignOut,
+  onActionError,
 }: RoomTopBarProps): ReactElement {
   const { t } = useI18n();
   const fingerprint = formatRoomFingerprint(roomIdPrefix);
@@ -66,7 +74,7 @@ export function RoomTopBar({
 
   return (
     <header className="top-bar">
-      <div className="top-bar-group">
+      <div className="top-bar-group top-bar-left">
         <div className="brand-prompt">
           <span className="brand-prompt-sigil" aria-hidden="true">
             ❯
@@ -77,18 +85,28 @@ export function RoomTopBar({
         <Button
           variant="secondary"
           size="sm"
-          className="drawer-toggle-btn"
+          className="drawer-toggle-btn rooms-toggle-btn"
           testId="rooms-drawer-toggle"
           aria-expanded={railOpen}
           aria-controls="room-list-rail"
           onClick={onToggleRail}
         >
-          {t("room.roomsToggle", { count: roomCount })}
+          <span>{t("room.roomsToggle", { count: roomCount })}</span>
+          {totalUnreadCount > 0 ? (
+            <span
+              className="top-bar-unread-dot"
+              data-testid="rooms-total-unread"
+            >
+              {totalUnreadCount > 99 ? "99+" : totalUnreadCount}
+            </span>
+          ) : null}
         </Button>
 
-        <span className="room-chip">
+        <span className="room-chip room-chip-title">
           <span className="room-chip-strong">{roomAlias ?? fingerprint}</span>
-          {roomAlias ? <span>{fingerprint}</span> : null}
+          {roomAlias ? (
+            <span className="room-chip-hash">{fingerprint}</span>
+          ) : null}
         </span>
 
         <div
@@ -102,52 +120,32 @@ export function RoomTopBar({
           <StatusIcon
             status={badgeState === "connected" ? "online" : "offline"}
           />
-          <span>{badgeLabel}</span>
+          <span className="connection-badge-label">{badgeLabel}</span>
         </div>
       </div>
 
-      <div className="top-bar-group">
+      <div className="top-bar-group top-bar-right">
         <Button
           variant="secondary"
           size="sm"
-          className="drawer-toggle-btn"
-          aria-expanded={sidebarOpen}
+          className="sidebar-toggle-btn"
+          testId="sidebar-drawer-toggle"
+          aria-expanded={sidebarExpanded}
           aria-controls="room-sidebar"
           onClick={onToggleSidebar}
         >
           {t("room.drawerToggle", { peers: peerCount, files: fileCount })}
         </Button>
 
-        <span className="user-handle">@{username}</span>
-
-        <PreferenceControls />
-
-        <Button
-          variant="secondary"
-          size="sm"
-          testId="leave-room-button"
-          onClick={() => void onLeaveRoom()}
-        >
-          {t("room.leave")}
-        </Button>
-
-        <Button
-          variant="secondary"
-          size="sm"
-          testId="sign-out-button"
-          onClick={() => void onSignOut()}
-        >
-          {t("room.signOut")}
-        </Button>
-
-        <Button
-          variant="danger"
-          size="sm"
-          testId="wipe-vault-button"
-          onClick={() => void onWipeAndSignOut()}
-        >
-          {t("room.wipeSignOut")}
-        </Button>
+        <RoomMoreMenu
+          open={moreMenuOpen}
+          username={username}
+          onOpenChange={onMoreMenuOpenChange}
+          onLeaveRoom={onLeaveRoom}
+          onSignOut={onSignOut}
+          onWipeAndSignOut={onWipeAndSignOut}
+          onActionError={onActionError}
+        />
       </div>
     </header>
   );

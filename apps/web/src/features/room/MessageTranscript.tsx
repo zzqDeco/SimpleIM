@@ -31,6 +31,7 @@ import { ImageLightbox } from "./ImageLightbox.tsx";
 
 const FLOATING_DATE_HIDE_DELAY_MS = 1400;
 const LOCATE_HIGHLIGHT_DURATION_MS = 1600;
+const TRANSCRIPT_TOAST_DURATION_MS = 2200;
 const INTERACTIVE_TARGET_SELECTOR =
   'a, button, input, textarea, select, label, summary, [role="button"], [role="link"]';
 
@@ -122,6 +123,7 @@ export function MessageTranscript({
   const programmaticScrollTopRef = useRef<number | null>(null);
   const hideDatePillTimerRef = useRef<number | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
 
   const [liveNowMs, setLiveNowMs] = useState<number>(() => nowMs ?? Date.now());
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
@@ -129,6 +131,7 @@ export function MessageTranscript({
   const [highlightedItemKey, setHighlightedItemKey] = useState<string | null>(
     null,
   );
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [floatingDateCreatedAt, setFloatingDateCreatedAt] = useState<
     number | null
   >(null);
@@ -175,12 +178,20 @@ export function MessageTranscript({
     }
   }, []);
 
+  const clearToastTimer = useCallback((): void => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     return () => {
       clearHideDatePillTimer();
       clearHighlightTimer();
+      clearToastTimer();
     };
-  }, [clearHideDatePillTimer, clearHighlightTimer]);
+  }, [clearHideDatePillTimer, clearHighlightTimer, clearToastTimer]);
 
   // Close lightbox automatically if the referenced file is no longer in the active room.
   useEffect(() => {
@@ -382,9 +393,11 @@ export function MessageTranscript({
     if (roomChanged) {
       setExpandedItemKey(null);
       setHighlightedItemKey(null);
+      setToastMessage(null);
       setLightbox(null);
       clearHideDatePillTimer();
       clearHighlightTimer();
+      clearToastTimer();
       setFloatingDateVisible(false);
       setFloatingDateCreatedAt(null);
     }
@@ -411,6 +424,7 @@ export function MessageTranscript({
   }, [
     clearHideDatePillTimer,
     clearHighlightTimer,
+    clearToastTimer,
     latestItemIsSelf,
     latestItemKey,
     roomId,
@@ -487,6 +501,21 @@ export function MessageTranscript({
     }
     setProgrammaticScrollTop(el, el.scrollHeight);
   }, [setProgrammaticScrollTop]);
+
+  const handleQuoteJump = useCallback(
+    (replyToMsgId: string): void => {
+      const found = scrollToItemKey(`msg:${replyToMsgId}`);
+      if (!found) {
+        clearToastTimer();
+        setToastMessage(t("room.quoteUnavailable"));
+        toastTimerRef.current = window.setTimeout(() => {
+          toastTimerRef.current = null;
+          setToastMessage(null);
+        }, TRANSCRIPT_TOAST_DURATION_MS);
+      }
+    },
+    [clearToastTimer, scrollToItemKey, t],
+  );
 
   const handleOpenLightbox = useCallback(
     (imageUrl: string, manifest: FileManifest): void => {
@@ -845,13 +874,21 @@ export function MessageTranscript({
                       </div>
 
                       {vm.quote ? (
-                        <Subline>
-                          <span className="msg-quote-author">
-                            {vm.quote.resolvedAuthorHandle ??
-                              t("room.quotedFallback")}
-                          </span>
-                          <span>{vm.quote.previewText}</span>
-                        </Subline>
+                        <button
+                          type="button"
+                          className="msg-quote-jump-btn"
+                          data-testid="msg-quote-jump"
+                          aria-label={t("room.quoteJumpAria")}
+                          onClick={() => handleQuoteJump(vm.quote!.replyToMsgId)}
+                        >
+                          <Subline>
+                            <span className="msg-quote-author">
+                              {vm.quote.resolvedAuthorHandle ??
+                                t("room.quotedFallback")}
+                            </span>
+                            <span>{vm.quote.previewText}</span>
+                          </Subline>
+                        </button>
                       ) : null}
 
                       <div className="msg-body">
@@ -894,6 +931,17 @@ export function MessageTranscript({
           })
         )}
       </div>
+
+      {toastMessage ? (
+        <div
+          className="transcript-toast"
+          data-testid="transcript-toast"
+          role="status"
+          aria-live="polite"
+        >
+          {toastMessage}
+        </div>
+      ) : null}
 
       {showJumpToLatest ? (
         <button
