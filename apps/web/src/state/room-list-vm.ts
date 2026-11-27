@@ -1,4 +1,5 @@
-import type { ChatMessageEnvelope } from "@simpleim/contracts";
+import type { ChatMessageEnvelope, FileManifest } from "@simpleim/contracts";
+import { getFileCreatedAtMs } from "../utils/format.ts";
 
 export const MAX_ACTIVE_MESH_ROOMS = 8;
 
@@ -13,6 +14,7 @@ export interface RoomSummaryInput {
   readonly lastActiveAt: number;
   readonly lastReadAt: number;
   readonly messages: readonly ChatMessageEnvelope[];
+  readonly files?: readonly FileManifest[];
   readonly peerCount: number;
   readonly fileCount: number;
   readonly connectionStatus: RoomMeshConnectionStatus;
@@ -25,8 +27,11 @@ export interface RoomSummaryItem {
   readonly pinned: boolean;
   readonly joinedAt: number;
   readonly lastActiveAt: number;
+  readonly lastActivityMs: number;
   readonly unreadCount: number;
+  readonly lastMessageKind: "text" | "file" | null;
   readonly lastMessagePreview: string | null;
+  readonly lastMessageFileName: string | null;
   readonly lastMessageAuthor: string | null;
   readonly peerCount: number;
   readonly fileCount: number;
@@ -37,12 +42,22 @@ export function computeUnreadCount(
   messages: readonly ChatMessageEnvelope[],
   lastReadAt: number,
   currentUserId: string,
+  files: readonly FileManifest[] = [],
 ): number {
   let count = 0;
   for (const msg of messages) {
     if (
       msg.createdAt > lastReadAt &&
       msg.authorCert.payload.userId !== currentUserId
+    ) {
+      count += 1;
+    }
+  }
+  for (const file of files) {
+    const fileTs = getFileCreatedAtMs(file);
+    if (
+      fileTs > lastReadAt &&
+      file.senderCert.payload.userId !== currentUserId
     ) {
       count += 1;
     }
@@ -80,10 +95,40 @@ export function buildSortedRoomSummaries(
 ): RoomSummaryItem[] {
   const sorted = [...inputs].sort(compareRoomOrder);
   return sorted.map((item) => {
+    const files = item.files ?? [];
     const lastMsg =
       item.messages.length > 0
         ? item.messages[item.messages.length - 1]
         : undefined;
+    let latestFile: FileManifest | undefined;
+    let latestFileTs = -1;
+    for (const file of files) {
+      const ts = getFileCreatedAtMs(file);
+      if (ts >= latestFileTs) {
+        latestFileTs = ts;
+        latestFile = file;
+      }
+    }
+
+    const lastMsgTs = lastMsg?.createdAt ?? -1;
+    let lastMessageKind: "text" | "file" | null = null;
+    let lastMessagePreview: string | null = null;
+    let lastMessageFileName: string | null = null;
+    let lastMessageAuthor: string | null = null;
+    let latestContentTs = 0;
+
+    if (latestFile && latestFileTs > lastMsgTs) {
+      lastMessageKind = "file";
+      lastMessageFileName = latestFile.fileName;
+      lastMessageAuthor = latestFile.senderCert.payload.username;
+      latestContentTs = Math.max(0, latestFileTs);
+    } else if (lastMsg) {
+      lastMessageKind = "text";
+      lastMessagePreview = summarizeMessagePreview(lastMsg.body);
+      lastMessageAuthor = lastMsg.authorCert.payload.username;
+      latestContentTs = Math.max(0, lastMsgTs);
+    }
+
     return {
       roomId: item.roomId,
       roomIdPrefix: item.roomIdPrefix,
@@ -91,17 +136,17 @@ export function buildSortedRoomSummaries(
       pinned: item.pinned,
       joinedAt: item.joinedAt,
       lastActiveAt: item.lastActiveAt,
+      lastActivityMs: Math.max(item.lastActiveAt, latestContentTs),
       unreadCount: computeUnreadCount(
         item.messages,
         item.lastReadAt,
         currentUserId,
+        files,
       ),
-      lastMessagePreview: lastMsg
-        ? summarizeMessagePreview(lastMsg.body)
-        : null,
-      lastMessageAuthor: lastMsg
-        ? lastMsg.authorCert.payload.username
-        : null,
+      lastMessageKind,
+      lastMessagePreview,
+      lastMessageFileName,
+      lastMessageAuthor,
       peerCount: item.peerCount,
       fileCount: item.fileCount,
       connectionStatus: item.connectionStatus,

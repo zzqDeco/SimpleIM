@@ -14,6 +14,7 @@ import {
   bytesToBase64Url,
   deriveRoomKeys,
   generateEd25519KeyPair,
+  generateUuidV7,
   issuePeerIdentityCert,
   randomBytes,
   sha256Hex,
@@ -47,6 +48,10 @@ import {
   mergeOrderedFiles,
   reconcileCommittedRoomState,
 } from "../src/state/collections.ts";
+import {
+  extractFilesFromClipboard,
+  makeClipboardFileName,
+} from "../src/state/composer-attachments.ts";
 import {
   isTranscriptNearBottom,
   shouldAutoScrollTranscript,
@@ -100,16 +105,22 @@ import {
 import { BrowserSignalingClient } from "../src/transport/browser-signaling.ts";
 import { MultiplexedSignalingHub } from "../src/transport/multiplexed-signaling.ts";
 import {
+  extractUuidV7TimestampMs,
   formatBytes,
   formatDatePillLabel,
+  formatFileExtensionBadge,
   formatMessageClockShort,
   formatMessageDateTime,
   formatMessageTime,
+  formatRoomActivityTime,
   formatRoomFingerprint,
   formatSha256Prefix,
   formatSpeedMBps,
   formatTranscriptDividerLabel,
+  getFileCreatedAtMs,
   getLocalDayKey,
+  isSafePreviewImage,
+  MAX_INLINE_IMAGE_PREVIEW_BYTES,
   msUntilNextLocalMidnight,
 } from "../src/utils/format.ts";
 import {
@@ -2782,7 +2793,10 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(timeline[3]!.showDivider).toBe(false);
     expect(timeline[3]!.dividerLabel).toBeNull();
     expect(timeline[3]!.isCompact).toBe(true);
-    expect(timeline[3]!.vm.formattedDateTime).toBe("2026-11-24 10:00:30");
+    expect(timeline[3]!.kind).toBe("message");
+    if (timeline[3]!.kind === "message") {
+      expect(timeline[3]!.vm.formattedDateTime).toBe("2026-11-24 10:00:30");
+    }
 
     // Reply with quote preserves full header
     expect(timeline[4]!.showDivider).toBe(false);
@@ -2824,5 +2838,240 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(html).toContain('data-time-expanded="false"');
     expect(html).toContain('title="2026-11-24 10:00:30"');
     expect(html).not.toContain('data-testid="msg-time-drawer"');
+  });
+
+  test("UUIDv7 file timestamps, safe image preview allowlist, clipboard file extraction, unified file timeline, and room-list file unread/summary", async () => {
+    const t0 = new Date(2026, 10, 27, 14, 10, 0).getTime();
+    const uuidV7 = generateUuidV7(t0);
+    expect(extractUuidV7TimestampMs(uuidV7)).toBe(t0);
+    // Rejects UUIDv4 and malformed strings
+    expect(
+      extractUuidV7TimestampMs("550e8400-e29b-41d4-a716-446655440000"),
+    ).toBeNull();
+    expect(extractUuidV7TimestampMs("not-a-uuid")).toBeNull();
+
+    expect(
+      getFileCreatedAtMs({
+        fileId: "550e8400-e29b-41d4-a716-446655440000",
+        senderCert: { payload: { iat: t0 - 5_000 } },
+      }),
+    ).toBe(t0 - 5_000);
+
+    // Safe raster image preview allowlist strictly excludes SVG & oversized files
+    expect(isSafePreviewImage("image/png", 1024)).toBe(true);
+    expect(isSafePreviewImage("image/jpeg; charset=binary", 1024)).toBe(true);
+    expect(isSafePreviewImage("image/webp", MAX_INLINE_IMAGE_PREVIEW_BYTES)).toBe(true);
+    expect(isSafePreviewImage("image/svg+xml", 256)).toBe(false);
+    expect(isSafePreviewImage("text/html", 256)).toBe(false);
+    expect(isSafePreviewImage("image/png", 0)).toBe(false);
+    expect(
+      isSafePreviewImage("image/png", MAX_INLINE_IMAGE_PREVIEW_BYTES + 1),
+    ).toBe(false);
+
+    expect(formatFileExtensionBadge("report.final.pdf")).toBe("PDF");
+    expect(formatFileExtensionBadge("README")).toBe("FILE");
+
+    const nowMs = new Date(2026, 10, 27, 18, 0, 0).getTime();
+    const labels = { today: "今天", yesterday: "昨天" } as const;
+    expect(formatRoomActivityTime(t0, nowMs, labels)).toBe("14:10");
+    expect(
+      formatRoomActivityTime(
+        new Date(2026, 10, 26, 9, 0, 0).getTime(),
+        nowMs,
+        labels,
+      ),
+    ).toBe("昨天");
+    expect(
+      formatRoomActivityTime(
+        new Date(2026, 10, 20, 9, 0, 0).getTime(),
+        nowMs,
+        labels,
+      ),
+    ).toBe("11-20");
+    expect(
+      formatRoomActivityTime(
+        new Date(2025, 11, 31, 9, 0, 0).getTime(),
+        nowMs,
+        labels,
+      ),
+    ).toBe("2025-12-31");
+
+    // Clipboard paste extraction renames generic screenshots and preserves custom names
+    const screenshotBlob = new File([new Uint8Array([1, 2, 3])], "image.png", {
+      type: "image/png",
+    });
+    const customDoc = new File([new Uint8Array([4, 5])], "design-spec.pdf", {
+      type: "application/pdf",
+    });
+    const extracted = extractFilesFromClipboard(
+      {
+        items: [
+          { kind: "string", getAsFile: () => null },
+          { kind: "file", getAsFile: () => screenshotBlob },
+          { kind: "file", getAsFile: () => customDoc },
+        ],
+      },
+      t0,
+    );
+    expect(extracted.length).toBe(2);
+    expect(extracted[0]!.name).toBe(makeClipboardFileName("image/png", t0, 0));
+    expect(extracted[0]!.name).toMatch(/^image-20261127-141000\.png$/);
+    expect(extracted[1]!.name).toBe("design-spec.pdf");
+
+    // Unified message + file timeline interleaving & room summary/unread tracking
+    const serverKeys = generateEd25519KeyPair();
+    const aliceKeys = generateEd25519KeyPair();
+    const bobKeys = generateEd25519KeyPair();
+    const roomId = "e".repeat(64);
+    const aliceCert = issuePeerIdentityCert({
+      serverKeyId: "srvk_u",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000100",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_019a0000000070008000000000000100",
+      peerSignPubKey: aliceKeys.publicKeyBase64Url,
+      clientKind: "web",
+    });
+    const bobCert = issuePeerIdentityCert({
+      serverKeyId: "srvk_u",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000200",
+      username: "bob",
+      displayName: "Bob",
+      peerId: "peer_019a0000000070008000000000000200",
+      peerSignPubKey: bobKeys.publicKeyBase64Url,
+      clientKind: "cli",
+    });
+
+    const msgBefore = signChatMessage({
+      msgId: generateUuidV7(t0),
+      roomId,
+      body: "Sending screenshot now",
+      createdAt: t0,
+      authorCert: aliceCert,
+      peerSignPrivKey: aliceKeys.privateKeyBytes,
+    });
+    const fileAtSameMs: FileManifest = {
+      ...buildDummyManifest({
+        fileId: generateUuidV7(t0),
+        fileName: "capture.png",
+        fileSize: 2048,
+        totalChunks: 1,
+      }),
+      roomId,
+      mimeType: "image/png",
+      senderCert: aliceCert,
+    };
+    const msgAfterFile = signChatMessage({
+      msgId: generateUuidV7(t0 + 10_000),
+      roomId,
+      body: "Did you get it?",
+      createdAt: t0 + 10_000,
+      authorCert: aliceCert,
+      peerSignPrivKey: aliceKeys.privateKeyBytes,
+    });
+    const bobFile: FileManifest = {
+      ...buildDummyManifest({
+        fileId: generateUuidV7(t0 + 25_000),
+        fileName: "telemetry.bin",
+        fileSize: 4096,
+        totalChunks: 1,
+      }),
+      roomId,
+      senderCert: bobCert,
+    };
+
+    const timeline = buildTranscriptTimeline({
+      messages: [msgBefore, msgAfterFile],
+      files: [bobFile, fileAtSameMs],
+      localPeerId: aliceCert.payload.peerId,
+      currentUserId: aliceCert.payload.userId,
+      nowMs,
+      dateLabels: labels,
+    });
+
+    // Caption message precedes file at identical ms; message after file is NOT compact; bobFile is last
+    expect(timeline.map((i) => i.kind)).toEqual([
+      "message",
+      "file",
+      "message",
+      "file",
+    ]);
+    expect(timeline[0]!.itemKey).toBe(`msg:${msgBefore.msgId}`);
+    expect(timeline[1]!.itemKey).toBe(`file:${fileAtSameMs.fileId}`);
+    expect(timeline[2]!.isCompact).toBe(false);
+    expect(timeline[3]!.itemKey).toBe(`file:${bobFile.fileId}`);
+    expect(timeline[3]!.isSelf).toBe(false);
+
+    // SSR check renders inline file cards inside MessageTranscript
+    const html = renderToStaticMarkup(
+      createElement(
+        I18nProvider,
+        null,
+        createElement(MessageTranscript, {
+          roomId,
+          messages: [msgBefore, msgAfterFile],
+          files: [fileAtSameMs, bobFile],
+          localPeerId: aliceCert.payload.peerId,
+          currentUserId: aliceCert.payload.userId,
+          onReply: () => {},
+          nowMs,
+        }),
+      ),
+    );
+    expect(html).toContain('data-testid="msg-file-card"');
+    expect(html).toContain(`data-file-id="${bobFile.fileId}"`);
+    expect(html).toContain("telemetry.bin");
+
+    // Room list unread count & preview include remote files while ignoring own files
+    expect(
+      computeUnreadCount(
+        [msgBefore, msgAfterFile],
+        t0 + 15_000,
+        aliceCert.payload.userId,
+        [fileAtSameMs, bobFile],
+      ),
+    ).toBe(1);
+
+    const summaries = buildSortedRoomSummaries(
+      [
+        {
+          roomId,
+          roomIdPrefix: roomId.slice(0, 16),
+          alias: "Ops",
+          pinned: false,
+          joinedAt: t0 - 1_000,
+          lastActiveAt: t0 + 25_000,
+          lastReadAt: t0 + 15_000,
+          messages: [msgBefore, msgAfterFile],
+          files: [fileAtSameMs, bobFile],
+          peerCount: 1,
+          fileCount: 2,
+          connectionStatus: "connected",
+        },
+      ],
+      aliceCert.payload.userId,
+    );
+    expect(summaries[0]!.unreadCount).toBe(1);
+    expect(summaries[0]!.lastMessageKind).toBe("file");
+    expect(summaries[0]!.lastMessageFileName).toBe("telemetry.bin");
+    expect(summaries[0]!.lastMessageAuthor).toBe("bob");
+
+    // OpfsChunkStorageAdapter.getFileBlob returns attached local source blob cleanly
+    const adapter = new OpfsChunkStorageAdapter({
+      forceInlineFallback: true,
+      storageProvider: () => undefined,
+    });
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    adapter.attachLocalSourceBlob(
+      fileAtSameMs.fileId,
+      new Blob([pngBytes], { type: "image/png" }),
+    );
+    const readBlob = await adapter.getFileBlob(fileAtSameMs.fileId, "image/png");
+    expect(readBlob).not.toBeNull();
+    expect(readBlob?.type).toBe("image/png");
+    expect(readBlob?.size).toBe(4);
+    await adapter.closeAll();
   });
 });

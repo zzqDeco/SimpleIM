@@ -18,6 +18,7 @@ export interface RoomSidePaneProps {
   readonly onDownloadFile: (fileId: string) => Promise<void>;
   readonly onCancelDownload: (fileId: string) => Promise<void>;
   readonly onSaveFile: (manifest: FileManifest) => Promise<void>;
+  readonly onLocateFile?: (fileId: string) => void;
   readonly onActionError: (err: unknown) => void;
 }
 
@@ -31,6 +32,7 @@ export function RoomSidePane({
   onDownloadFile,
   onCancelDownload,
   onSaveFile,
+  onLocateFile,
   onActionError,
 }: RoomSidePaneProps): ReactElement {
   const { t } = useI18n();
@@ -50,6 +52,7 @@ export function RoomSidePane({
         onDownloadFile={onDownloadFile}
         onCancelDownload={onCancelDownload}
         onSaveFile={onSaveFile}
+        onLocateFile={onLocateFile}
         onActionError={onActionError}
       />
     </aside>

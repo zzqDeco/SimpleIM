@@ -21,6 +21,7 @@ export interface FileListSectionProps {
   readonly onDownloadFile: (fileId: string) => Promise<void>;
   readonly onCancelDownload: (fileId: string) => Promise<void>;
   readonly onSaveFile: (manifest: FileManifest) => Promise<void>;
+  readonly onLocateFile?: (fileId: string) => void;
   readonly onActionError: (err: unknown) => void;
 }
 
@@ -32,6 +33,7 @@ export function FileListSection({
   onDownloadFile,
   onCancelDownload,
   onSaveFile,
+  onLocateFile,
   onActionError,
 }: FileListSectionProps): ReactElement {
   const { t } = useI18n();
@@ -121,6 +123,20 @@ export function FileListSection({
                 ) : null}
 
                 <div className="file-row-actions">
+                  {onLocateFile ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      testId="file-locate-button"
+                      aria-label={t("room.files.action.locateAria", {
+                        name: vm.fileName,
+                      })}
+                      onClick={() => onLocateFile(manifest.fileId)}
+                    >
+                      {t("room.files.action.locate")}
+                    </Button>
+                  ) : null}
+
                   {vm.canDownload ? (
                     <Button
                       variant="primary"

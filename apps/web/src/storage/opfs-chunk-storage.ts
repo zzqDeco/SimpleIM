@@ -339,52 +339,66 @@ export class OpfsChunkStorageAdapter implements ChunkStoragePort {
     }
   }
 
+  async getFileBlob(
+    fileId: string,
+    mimeType = "application/octet-stream",
+  ): Promise<Blob | null> {
+    if (this.closed) {
+      return null;
+    }
+    const safeMime = mimeType.trim() || "application/octet-stream";
+
+    const localBlob = this.localSourceBlobs.get(fileId);
+    if (localBlob) {
+      return localBlob.slice(0, localBlob.size, safeMime);
+    }
+
+    if (!this.downloadedFileIds.has(fileId)) {
+      return null;
+    }
+
+    const prep = await this.sendRpc({
+      id: this.nextRpcId++,
+      type: "prepareDownload",
+      fileId,
+    });
+    if (prep.type !== "prepareDownload") {
+      throw new Error("Unexpected prepareDownload response");
+    }
+
+    if (prep.backend === "opfs") {
+      const storage = this.options.storageProvider
+        ? this.options.storageProvider()
+        : typeof navigator !== "undefined"
+          ? (navigator.storage as unknown as OpfsStorageNavigatorLike | undefined)
+          : undefined;
+      if (!storage?.getDirectory) {
+        throw new Error("OPFS directory API unavailable on main thread");
+      }
+      const rootDir: OpfsDirectoryHandleLike = await storage.getDirectory();
+      const swarmRootDir =
+        await rootDir.getDirectoryHandle(OPFS_SWARM_DIR_NAME);
+      const instanceDir = await swarmRootDir.getDirectoryHandle(
+        this.instanceId,
+      );
+      const fileHandle = await instanceDir.getFileHandle(`${fileId}.bin`);
+      // Zero-copy File backed directly by OPFS disk storage
+      const opfsFile = await fileHandle.getFile();
+      return opfsFile.slice(0, opfsFile.size, safeMime);
+    }
+
+    return new Blob(prep.fallbackChunks ?? [], { type: safeMime });
+  }
+
   async triggerBrowserDownload(
     fileId: string,
     fileName: string,
     mimeType = "application/octet-stream",
   ): Promise<void> {
     const safeName = sanitizeFileName(fileName);
-    const safeMime = mimeType.trim() || "application/octet-stream";
-
-    let blobToSave: Blob | null = null;
-    const localBlob = this.localSourceBlobs.get(fileId);
-    if (localBlob) {
-      blobToSave = localBlob.slice(0, localBlob.size, safeMime);
-    } else {
-      const prep = await this.sendRpc({
-        id: this.nextRpcId++,
-        type: "prepareDownload",
-        fileId,
-      });
-      if (prep.type !== "prepareDownload") {
-        throw new Error("Unexpected prepareDownload response");
-      }
-
-      if (prep.backend === "opfs") {
-        const storage = (
-          this.options.storageProvider
-            ? this.options.storageProvider()
-            : typeof navigator !== "undefined"
-              ? (navigator.storage as unknown as OpfsStorageNavigatorLike | undefined)
-              : undefined
-        );
-        if (!storage?.getDirectory) {
-          throw new Error("OPFS directory API unavailable on main thread");
-        }
-        const rootDir: OpfsDirectoryHandleLike = await storage.getDirectory();
-        const swarmRootDir =
-          await rootDir.getDirectoryHandle(OPFS_SWARM_DIR_NAME);
-        const instanceDir = await swarmRootDir.getDirectoryHandle(
-          this.instanceId,
-        );
-        const fileHandle = await instanceDir.getFileHandle(`${fileId}.bin`);
-        // Zero-copy File backed directly by OPFS disk storage
-        const opfsFile = await fileHandle.getFile();
-        blobToSave = opfsFile.slice(0, opfsFile.size, safeMime);
-      } else {
-        blobToSave = new Blob(prep.fallbackChunks ?? [], { type: safeMime });
-      }
+    const blobToSave = await this.getFileBlob(fileId, mimeType);
+    if (!blobToSave) {
+      throw new Error(`File ${fileId} is not ready to save`);
     }
 
     if (typeof document === "undefined" || typeof URL.createObjectURL !== "function") {

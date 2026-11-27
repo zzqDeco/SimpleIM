@@ -23,7 +23,10 @@ import type {
   RoomMeshConnectionStatus,
   RoomSummaryItem,
 } from "../../state/room-list-vm.ts";
-import { MessageTranscript } from "./MessageTranscript.tsx";
+import {
+  MessageTranscript,
+  type TranscriptLocateRequest,
+} from "./MessageTranscript.tsx";
 import { PromptComposer } from "./PromptComposer.tsx";
 import { RoomListRail } from "./RoomListRail.tsx";
 import { RoomSidePane } from "./RoomSidePane.tsx";
@@ -65,6 +68,10 @@ export interface RoomScreenProps {
   readonly onCancelDownload: (fileId: string) => Promise<void>;
   readonly onSaveFile: (manifest: FileManifest) => Promise<void>;
   readonly canSaveFile: (fileId: string) => boolean;
+  readonly onReadFileBlob?: (
+    fileId: string,
+    mimeType: string,
+  ) => Promise<Blob | null>;
   readonly onLeaveRoom: () => Promise<void>;
   readonly onSignOut: () => Promise<void>;
   readonly onWipeAndSignOut: () => Promise<void>;
@@ -100,33 +107,38 @@ export function RoomScreen({
   onCancelDownload,
   onSaveFile,
   canSaveFile,
+  onReadFileBlob,
   onLeaveRoom,
   onSignOut,
   onWipeAndSignOut,
 }: RoomScreenProps): ReactElement {
   const { t } = useI18n();
   const shellRef = useRef<HTMLDivElement | null>(null);
+  const locateNonceRef = useRef(0);
   const [railOpen, setRailOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [locateRequest, setLocateRequest] =
+    useState<TranscriptLocateRequest | null>(null);
 
   useRoomViewportLock(shellRef);
 
   const composer = usePromptComposer({
     roomKey: selectedRoomId,
     onSendMessage,
+    onShareFiles,
   });
-
-  const shareSelectedFiles = useCallback(
-    (selected: File[]): void => {
-      composer.setActionFailure(null);
-      void onShareFiles(selected).catch(composer.reportActionError);
-    },
-    [composer, onShareFiles],
-  );
 
   const dropzone = useFileDropzone({
-    onFilesDropped: shareSelectedFiles,
+    onFilesDropped: composer.stageFiles,
   });
+
+  const handleLocateFile = useCallback((fileId: string): void => {
+    setSidebarOpen(false);
+    setLocateRequest({
+      itemKey: `file:${fileId}`,
+      nonce: ++locateNonceRef.current,
+    });
+  }, []);
 
   const securityText =
     securityEvent === null
@@ -214,6 +226,14 @@ export function RoomScreen({
           <MessageTranscript
             roomId={selectedRoomId}
             messages={messages}
+            files={files}
+            transfers={transfers}
+            canSaveFile={canSaveFile}
+            onDownloadFile={onDownloadFile}
+            onCancelDownload={onCancelDownload}
+            onSaveFile={onSaveFile}
+            onReadFileBlob={onReadFileBlob}
+            onActionError={composer.reportActionError}
             deliveryStates={deliveryStates}
             localPeerId={localPeerId}
             currentUserId={user.id}
@@ -221,12 +241,10 @@ export function RoomScreen({
             onRetryMessage={(msgId) => {
               void onRetryMessage(msgId).catch(composer.reportActionError);
             }}
+            locateRequest={locateRequest}
           />
 
-          <PromptComposer
-            composer={composer}
-            onAttachFiles={shareSelectedFiles}
-          />
+          <PromptComposer composer={composer} />
         </main>
 
         <RoomSidePane
@@ -239,6 +257,7 @@ export function RoomScreen({
           onDownloadFile={onDownloadFile}
           onCancelDownload={onCancelDownload}
           onSaveFile={onSaveFile}
+          onLocateFile={handleLocateFile}
           onActionError={composer.reportActionError}
         />
       </div>

@@ -102,6 +102,7 @@ function AppShell(): ReactElement {
       onCancelDownload={room.cancelDownload}
       onSaveFile={room.saveFile}
       canSaveFile={room.canSaveFile}
+      onReadFileBlob={room.readFileBlob}
       onLeaveRoom={() => room.leaveRoom()}
       onSignOut={auth.signOut}
       onWipeAndSignOut={handleWipeAndSignOut}

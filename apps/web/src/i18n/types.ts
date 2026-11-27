@@ -85,6 +85,7 @@ export interface TranslationSchema {
   "room.rail.renameSave": string;
   "room.rail.renamePlaceholder": string;
   "room.rail.emptyPreview": string;
+  "room.rail.filePreview": string;
   "room.dismiss": string;
   "room.dropFiles": string;
   "room.streamAria": string;
@@ -101,6 +102,9 @@ export interface TranslationSchema {
   "room.send": string;
   "room.shortcutSend": string;
   "room.shortcutNewline": string;
+  "room.composer.stagedAria": string;
+  "room.composer.removeStagedAria": string;
+  "room.composer.pasteHint": string;
   "room.msg.delivery.pending": string;
   "room.msg.delivery.relayed": string;
   "room.msg.delivery.p2pOnly": string;
@@ -127,6 +131,10 @@ export interface TranslationSchema {
   "room.files.action.download": string;
   "room.files.action.cancel": string;
   "room.files.action.save": string;
+  "room.files.action.locate": string;
+  "room.files.action.locateAria": string;
+  "room.files.previewAria": string;
+  "room.files.lightboxClose": string;
   "room.files.relay.uploading": string;
   "room.files.relay.cached": string;
   "room.files.relay.tooLarge": string;

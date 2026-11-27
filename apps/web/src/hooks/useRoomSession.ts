@@ -50,6 +50,10 @@ import {
 } from "../storage/room-vault.ts";
 import { BrowserWebRtcTransportFactory } from "../transport/browser-webrtc.ts";
 import { MultiplexedSignalingHub } from "../transport/multiplexed-signaling.ts";
+import {
+  getFileCreatedAtMs,
+  isSafePreviewImage,
+} from "../utils/format.ts";
 
 export type JoinPhase = "idle" | "deriving" | "connecting";
 
@@ -197,6 +201,10 @@ export interface RoomSessionController {
   readonly cancelDownload: (fileId: string) => Promise<void>;
   readonly saveFile: (manifest: FileManifest) => Promise<void>;
   readonly canSaveFile: (fileId: string) => boolean;
+  readonly readFileBlob: (
+    fileId: string,
+    mimeType: string,
+  ) => Promise<Blob | null>;
 }
 
 interface UiWorkspaceSnapshot {
@@ -252,6 +260,7 @@ export function useRoomSession({
   const meshOpChainRef = useRef<Promise<void>>(Promise.resolve());
   const inFlightJoinsRef = useRef<Map<string, Promise<boolean>>>(new Map());
   const activeUserIdRef = useRef<string | null>(null);
+  const pendingAutoSaveRef = useRef<Set<string>>(new Set());
 
   const isEntryLive = useCallback(
     (
@@ -315,6 +324,7 @@ export function useRoomSession({
       lastActiveAt: entry.metadata.lastActiveAt,
       lastReadAt: entry.metadata.lastReadAt,
       messages: entry.messages,
+      files: entry.files,
       peerCount: entry.peers.length,
       fileCount: entry.files.length,
       connectionStatus: computeEntryConnectionStatus(entry),
@@ -640,21 +650,29 @@ export function useRoomSession({
                     ? mergeOrderedFiles(entry.files, batch.files)
                     : entry.files;
 
-                let latestMsgTs = entry.metadata.lastActiveAt;
+                let latestActivityTs = entry.metadata.lastActiveAt;
                 for (const m of batch.messages) {
-                  if (m.createdAt > latestMsgTs) {
-                    latestMsgTs = m.createdAt;
+                  if (m.createdAt > latestActivityTs) {
+                    latestActivityTs = m.createdAt;
+                  }
+                }
+                for (const f of batch.files) {
+                  const fileTs = getFileCreatedAtMs(f);
+                  if (fileTs > latestActivityTs) {
+                    latestActivityTs = fileTs;
                   }
                 }
                 const isSelected = selectedRoomIdRef.current === roomId;
+                const hasNewContent =
+                  batch.messages.length > 0 || batch.files.length > 0;
                 const nextMetadata: VaultRoomMetadata = {
                   ...entry.metadata,
-                  lastActiveAt: latestMsgTs,
+                  lastActiveAt: latestActivityTs,
                   lastReadAt:
-                    isSelected && batch.messages.length > 0
+                    isSelected && hasNewContent
                       ? Math.max(
                           entry.metadata.lastReadAt,
-                          latestMsgTs,
+                          latestActivityTs,
                           Date.now(),
                         )
                       : entry.metadata.lastReadAt,
@@ -767,6 +785,23 @@ export function useRoomSession({
                   ...activeEngine.getFiles(),
                   manifest,
                 ]);
+                const fileCreatedAt = getFileCreatedAtMs(manifest);
+                const nextActiveAt = Math.max(
+                  entry.metadata.lastActiveAt,
+                  fileCreatedAt,
+                );
+                const isSelected = selectedRoomIdRef.current === roomId;
+                entry.metadata = {
+                  ...entry.metadata,
+                  lastActiveAt: nextActiveAt,
+                  lastReadAt: isSelected
+                    ? Math.max(
+                        entry.metadata.lastReadAt,
+                        fileCreatedAt,
+                        Date.now(),
+                      )
+                    : entry.metadata.lastReadAt,
+                };
                 const prog = activeEngine.getTransferProgress(manifest.fileId);
                 if (prog) {
                   entry.transfers.set(manifest.fileId, { ...prog });
@@ -813,6 +848,24 @@ export function useRoomSession({
                       },
                 );
                 publishSnapshot(currentUser.id);
+
+                // Seamless save for non-image files initiated by the user (silently tolerating
+                // iOS Safari async gesture restrictions because the card retains a Save button).
+                const autoSaveKey = `${roomId}:${manifest.fileId}`;
+                if (
+                  pendingAutoSaveRef.current.delete(autoSaveKey) &&
+                  selectedRoomIdRef.current === roomId &&
+                  !isSafePreviewImage(manifest.mimeType, manifest.fileSize) &&
+                  chunkStorage.isSaveAvailable(manifest.fileId)
+                ) {
+                  void chunkStorage
+                    .triggerBrowserDownload(
+                      manifest.fileId,
+                      manifest.fileName,
+                      manifest.mimeType,
+                    )
+                    .catch(() => {});
+                }
               },
               onError: (err) => {
                 if (!isEntryLive(expectedGen, roomId, entry)) {
@@ -1010,6 +1063,7 @@ export function useRoomSession({
     workspaceGenRef.current += 1;
     identityPromiseRef.current = null;
     inFlightJoinsRef.current.clear();
+    pendingAutoSaveRef.current.clear();
 
     const entries = Array.from(roomsRef.current.values());
     for (const entry of entries) {
@@ -1455,9 +1509,17 @@ export function useRoomSession({
         entry.messages.length > 0
           ? entry.messages[entry.messages.length - 1]!.createdAt
           : 0;
+      let latestFileTime = 0;
+      for (const file of entry.files) {
+        const ts = getFileCreatedAtMs(file);
+        if (ts > latestFileTime) {
+          latestFileTime = ts;
+        }
+      }
       const nextReadAt = Math.max(
         entry.metadata.lastReadAt,
         latestMsgTime,
+        latestFileTime,
         Date.now(),
       );
       if (nextReadAt !== entry.metadata.lastReadAt) {
@@ -1553,6 +1615,11 @@ export function useRoomSession({
         entry.disposed = true;
       }
       roomsRef.current.delete(targetRoomId);
+      for (const key of pendingAutoSaveRef.current) {
+        if (key.startsWith(`${targetRoomId}:`)) {
+          pendingAutoSaveRef.current.delete(key);
+        }
+      }
 
       if (selectedRoomIdRef.current === targetRoomId) {
         const remaining = Array.from(roomsRef.current.values())
@@ -1715,9 +1782,12 @@ export function useRoomSession({
                 status: "seeding",
               },
         );
+        const fileCreatedAt = getFileCreatedAtMs(manifest);
+        const nowMs = Math.max(Date.now(), fileCreatedAt);
         entry.metadata = {
           ...entry.metadata,
-          lastActiveAt: Date.now(),
+          lastActiveAt: Math.max(entry.metadata.lastActiveAt, nowMs),
+          lastReadAt: Math.max(entry.metadata.lastReadAt, nowMs),
         };
         publishSnapshot(user.id);
 
@@ -1742,7 +1812,21 @@ export function useRoomSession({
       const rt = entry?.activeRuntime;
       if (!user || !entry || !rt) return;
 
-      await rt.engine.downloadFile(fileId);
+      const manifest = entry.files.find((f) => f.fileId === fileId);
+      const autoSaveKey = `${entry.metadata.roomId}:${fileId}`;
+      if (
+        manifest &&
+        !isSafePreviewImage(manifest.mimeType, manifest.fileSize)
+      ) {
+        pendingAutoSaveRef.current.add(autoSaveKey);
+      }
+
+      try {
+        await rt.engine.downloadFile(fileId);
+      } catch (err) {
+        pendingAutoSaveRef.current.delete(autoSaveKey);
+        throw err;
+      }
       const prog = rt.engine.getTransferProgress(fileId);
       if (prog) {
         entry.transfers.set(fileId, { ...prog });
@@ -1759,6 +1843,7 @@ export function useRoomSession({
       const rt = entry?.activeRuntime;
       if (!user || !entry || !rt) return;
 
+      pendingAutoSaveRef.current.delete(`${entry.metadata.roomId}:${fileId}`);
       await rt.engine.cancelDownload(fileId);
       const prog = rt.engine.getTransferProgress(fileId);
       if (prog) {
@@ -1788,6 +1873,17 @@ export function useRoomSession({
     const rt = entry?.activeRuntime;
     return rt ? rt.chunkStorage.isSaveAvailable(fileId) : false;
   }, []);
+
+  const readFileBlob = useCallback(
+    async (fileId: string, mimeType: string): Promise<Blob | null> => {
+      const selId = selectedRoomIdRef.current;
+      const entry = selId ? roomsRef.current.get(selId) : undefined;
+      const rt = entry?.activeRuntime;
+      if (!rt) return null;
+      return rt.chunkStorage.getFileBlob(fileId, mimeType);
+    },
+    [],
+  );
 
   const clearJoinFailure = useCallback((): void => {
     setJoinFailure(null);
@@ -1834,5 +1930,6 @@ export function useRoomSession({
     cancelDownload,
     saveFile,
     canSaveFile,
+    readFileBlob,
   };
 }
