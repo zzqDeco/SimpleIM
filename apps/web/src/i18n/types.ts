@@ -106,6 +106,9 @@ export interface TranslationSchema {
   "room.msg.delivery.p2pOnly": string;
   "room.msg.delivery.failed": string;
   "room.jumpToLatest": string;
+  "room.date.today": string;
+  "room.date.yesterday": string;
+  "room.msg.toggleTimeAria": string;
 
   // Side Pane (Members & Files)
   "room.sidebarAria": string;

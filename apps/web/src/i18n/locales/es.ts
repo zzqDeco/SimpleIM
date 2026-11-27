@@ -86,6 +86,9 @@ export const es = {
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "Reintentar",
   "room.jumpToLatest": "Últimos",
+  "room.date.today": "Hoy",
+  "room.date.yesterday": "Ayer",
+  "room.msg.toggleTimeAria": "Mostrar u ocultar fecha y hora ({time})",
 
   "room.sidebarAria": "Miembros y archivos compartidos",
   "room.peers.heading": "Miembros",

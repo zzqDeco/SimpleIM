@@ -1,6 +1,9 @@
 import type { ChatMessageEnvelope } from "@simpleim/contracts";
 import type { ChatDeliveryStatus } from "@simpleim/peer-core";
-import { formatMessageTime } from "../utils/format.ts";
+import {
+  formatMessageDateTime,
+  formatMessageTime,
+} from "../utils/format.ts";
 
 export type MessageDeliveryTranslationKey =
   | "room.msg.delivery.pending"
@@ -20,8 +23,10 @@ export interface MessageViewModel {
   readonly authorDisplayName: string;
   readonly authorUsername: string;
   readonly runtimeTag: "CLI" | "WEB";
+  readonly createdAtMs: number;
   readonly createdAtIso: string;
   readonly formattedTime: string;
+  readonly formattedDateTime: string;
   readonly quote: MessageQuoteViewModel | null;
   readonly body: string;
   readonly deliveryStatus: ChatDeliveryStatus | null;
@@ -85,14 +90,21 @@ export function deriveMessageViewModel(
     ? (deliveryStates?.get(msg.msgId) ?? null)
     : null;
 
+  const createdAtIso =
+    Number.isFinite(msg.createdAt) && msg.createdAt > 0
+      ? new Date(msg.createdAt).toISOString()
+      : "";
+
   return {
     msgId: msg.msgId,
     isSelf,
     authorDisplayName: author.displayName,
     authorUsername: author.username,
     runtimeTag,
-    createdAtIso: new Date(msg.createdAt).toISOString(),
+    createdAtMs: msg.createdAt,
+    createdAtIso,
     formattedTime: formatMessageTime(msg.createdAt),
+    formattedDateTime: formatMessageDateTime(msg.createdAt),
     quote,
     body: msg.body,
     deliveryStatus,

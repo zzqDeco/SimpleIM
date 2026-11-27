@@ -415,6 +415,35 @@ body.room-viewport-locked {
   overflow: hidden;
 }
 
+.floating-date-pill {
+  position: absolute;
+  top: var(--space-2);
+  left: 50%;
+  transform: translate(-50%, -4px);
+  z-index: 6;
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  box-shadow: var(--shadow-panel);
+  pointer-events: none;
+  user-select: none;
+  opacity: 0;
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease;
+}
+
+.floating-date-pill-visible {
+  opacity: 0.96;
+  transform: translate(-50%, 0);
+}
+
 .message-stream {
   flex: 1 1 0%;
   min-height: 0;
@@ -427,7 +456,50 @@ body.room-viewport-locked {
   padding: var(--space-4) var(--space-5);
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-1);
+}
+
+.msg-time-divider {
+  flex-shrink: 0;
+  max-width: min(860px, 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 var(--space-1);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.3;
+  user-select: none;
+}
+
+.msg-time-divider:first-child {
+  margin-top: 0;
+}
+
+.msg-time-divider time {
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.msg-time-divider-day {
+  color: var(--text-muted);
+}
+
+.msg-time-divider-day::before,
+.msg-time-divider-day::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+.msg-time-divider-day time {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
 }
 
 .jump-to-latest-btn {
@@ -460,15 +532,30 @@ body.room-viewport-locked {
 
 /* Terminal Message Entries (cc REPL + IM hybrid) */
 .msg-entry {
+  position: relative;
   flex-shrink: 0;
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  margin-top: var(--space-2);
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   max-width: min(860px, 100%);
+}
+
+.msg-time-divider + .msg-entry {
+  margin-top: 0;
+}
+
+.msg-entry-compact {
+  margin-top: 0;
+  padding: 6px var(--space-3);
+}
+
+.msg-entry-compact:focus-within {
+  z-index: 2;
 }
 
 .msg-entry-peer {
@@ -479,6 +566,10 @@ body.room-viewport-locked {
 .msg-entry-self {
   background: var(--bg-user-msg);
   border-color: var(--border-subtle);
+}
+
+.msg-entry-expanded {
+  border-color: var(--border-default);
 }
 
 .msg-header {
@@ -575,6 +666,150 @@ body.room-viewport-locked {
 }
 
 .msg-reply-trigger:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.msg-time-toggle {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.msg-time-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+/* Zero permanent space on touch/narrow viewports; remains accessible to screen readers & keyboard Tab */
+.msg-header-time-toggle {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.msg-header-time-toggle:focus-visible {
+  position: static;
+  width: auto;
+  height: auto;
+  margin: 0;
+  padding: 1px 4px;
+  overflow: visible;
+  clip: auto;
+}
+
+.msg-compact-hover-bar {
+  position: absolute;
+  top: -12px;
+  right: 8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  box-shadow: var(--shadow-panel);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--ease-fast);
+}
+
+.msg-entry-compact:focus-within .msg-compact-hover-bar {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .msg-entry-compact:hover {
+    z-index: 2;
+  }
+
+  .msg-entry-compact:hover .msg-compact-hover-bar {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+@media (hover: hover) and (pointer: fine) and (min-width: 769px) {
+  .msg-header-time-toggle {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    padding: 1px 4px;
+    overflow: visible;
+    clip: auto;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--ease-fast);
+  }
+
+  .msg-entry:hover .msg-header-time-toggle,
+  .msg-entry:focus-within .msg-header-time-toggle {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.msg-compact-body-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.msg-compact-body-row > .msg-body {
+  flex: 1 1 auto;
+}
+
+.msg-compact-meta {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.msg-time-drawer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding-top: 3px;
+  margin-top: 2px;
+  border-top: 1px dashed var(--border-subtle);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.msg-time-drawer-btn {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+
+.msg-time-drawer-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
@@ -939,7 +1174,16 @@ body.room-viewport-locked {
 
   .message-stream {
     padding: var(--space-3);
-    gap: var(--space-2);
+    gap: var(--space-1);
+  }
+
+  .msg-entry {
+    margin-top: var(--space-1);
+  }
+
+  .msg-time-divider + .msg-entry,
+  .msg-entry-compact {
+    margin-top: 0;
   }
 
   .composer-dock {

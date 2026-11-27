@@ -86,6 +86,9 @@ export const ko = {
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "재시도",
   "room.jumpToLatest": "최신으로",
+  "room.date.today": "오늘",
+  "room.date.yesterday": "어제",
+  "room.msg.toggleTimeAria": "전체 전송 시각 표시 전환 ({time})",
 
   "room.sidebarAria": "방 참여자 및 공유 파일",
   "room.peers.heading": "참여자",
