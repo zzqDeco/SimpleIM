@@ -1,4 +1,11 @@
-import { useCallback, useRef, useState, type ReactElement } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactElement,
+} from "react";
 import type {
   ChatMessageEnvelope,
   FileManifest,
@@ -117,10 +124,73 @@ export function RoomScreen({
   const locateNonceRef = useRef(0);
   const [railOpen, setRailOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(true);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [isCompactViewport, setIsCompactViewport] = useState<boolean>(() => {
+    if (
+      typeof window === "undefined" ||
+      typeof window.matchMedia !== "function"
+    ) {
+      return false;
+    }
+    return window.matchMedia("(max-width: 1024px)").matches;
+  });
   const [locateRequest, setLocateRequest] =
     useState<TranscriptLocateRequest | null>(null);
 
   useRoomViewportLock(shellRef);
+
+  useEffect(() => {
+    if (
+      typeof window === "undefined" ||
+      typeof window.matchMedia !== "function"
+    ) {
+      return;
+    }
+    const mq = window.matchMedia("(max-width: 1024px)");
+    const sync = (): void => {
+      setIsCompactViewport(mq.matches);
+      if (!mq.matches) {
+        setRailOpen(false);
+        setSidebarOpen(false);
+      }
+    };
+    sync();
+    mq.addEventListener("change", sync);
+    return () => {
+      mq.removeEventListener("change", sync);
+    };
+  }, []);
+
+  useEffect(() => {
+    setMoreMenuOpen(false);
+  }, [selectedRoomId]);
+
+  const closeDrawers = useCallback((): void => {
+    setRailOpen(false);
+    setSidebarOpen(false);
+  }, []);
+
+  useEffect(() => {
+    if (!railOpen && !sidebarOpen) {
+      return;
+    }
+    const handleKeyDown = (ev: KeyboardEvent): void => {
+      if (ev.key === "Escape" && !ev.defaultPrevented) {
+        ev.preventDefault();
+        closeDrawers();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [closeDrawers, railOpen, sidebarOpen]);
+
+  const totalUnreadCount = useMemo(
+    () => rooms.reduce((sum, item) => sum + item.unreadCount, 0),
+    [rooms],
+  );
 
   const composer = usePromptComposer({
     roomKey: selectedRoomId,
@@ -134,10 +204,35 @@ export function RoomScreen({
 
   const handleLocateFile = useCallback((fileId: string): void => {
     setSidebarOpen(false);
+    setMoreMenuOpen(false);
     setLocateRequest({
       itemKey: `file:${fileId}`,
       nonce: ++locateNonceRef.current,
     });
+  }, []);
+
+  const handleToggleRail = useCallback((): void => {
+    setSidebarOpen(false);
+    setMoreMenuOpen(false);
+    setRailOpen((v) => !v);
+  }, []);
+
+  const handleToggleSidebar = useCallback((): void => {
+    setMoreMenuOpen(false);
+    if (isCompactViewport) {
+      setRailOpen(false);
+      setSidebarOpen((v) => !v);
+    } else {
+      setDesktopSidebarOpen((v) => !v);
+    }
+  }, [isCompactViewport]);
+
+  const handleMoreMenuOpenChange = useCallback((next: boolean): void => {
+    if (next) {
+      setRailOpen(false);
+      setSidebarOpen(false);
+    }
+    setMoreMenuOpen(next);
   }, []);
 
   const securityText =
@@ -158,24 +253,32 @@ export function RoomScreen({
         centerConnected={centerConnected}
         username={user.username}
         roomCount={rooms.length}
+        totalUnreadCount={totalUnreadCount}
         peerCount={peers.length}
         fileCount={files.length}
         railOpen={railOpen}
-        sidebarOpen={sidebarOpen}
-        onToggleRail={() => {
-          setSidebarOpen(false);
-          setRailOpen((v) => !v);
-        }}
-        onToggleSidebar={() => {
-          setRailOpen(false);
-          setSidebarOpen((v) => !v);
-        }}
+        sidebarExpanded={isCompactViewport ? sidebarOpen : desktopSidebarOpen}
+        moreMenuOpen={moreMenuOpen}
+        onMoreMenuOpenChange={handleMoreMenuOpenChange}
+        onToggleRail={handleToggleRail}
+        onToggleSidebar={handleToggleSidebar}
         onLeaveRoom={onLeaveRoom}
         onSignOut={onSignOut}
         onWipeAndSignOut={onWipeAndSignOut}
+        onActionError={composer.reportActionError}
       />
 
-      <div className="room-grid">
+      <div
+        className={`room-grid ${!desktopSidebarOpen ? "room-grid-sidebar-collapsed" : ""}`}
+      >
+        {railOpen || sidebarOpen ? (
+          <div
+            className="drawer-backdrop"
+            data-testid="drawer-backdrop"
+            aria-hidden="true"
+            onClick={closeDrawers}
+          />
+        ) : null}
         <RoomListRail
           open={railOpen}
           rooms={rooms}

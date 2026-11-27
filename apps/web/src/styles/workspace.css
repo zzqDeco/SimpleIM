@@ -9,6 +9,8 @@
 }
 
 .top-bar {
+  position: relative;
+  z-index: 30;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -25,6 +27,126 @@
   align-items: center;
   gap: var(--space-2);
   flex-wrap: wrap;
+  min-width: 0;
+}
+
+.top-bar-left {
+  flex: 1 1 auto;
+}
+
+.top-bar-right {
+  flex-shrink: 0;
+}
+
+.top-bar-unread-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--text-inverse);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.room-chip-title {
+  max-width: min(260px, 48vw);
+  overflow: hidden;
+}
+
+.room-chip-title .room-chip-strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* More / Settings Popover Menu */
+.more-menu-root {
+  position: relative;
+}
+
+.more-menu-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 32;
+  width: min(272px, 90vw);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-panel);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.more-menu-account {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.more-menu-prefs .top-bar-group {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-2);
+}
+
+.more-menu-prefs .theme-switcher {
+  justify-content: space-between;
+}
+
+.more-menu-prefs .theme-switcher-btn {
+  flex: 1;
+  text-align: center;
+}
+
+.more-menu-divider {
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+.more-menu-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.more-menu-action-btn {
+  width: 100%;
+  justify-content: center;
+}
+
+.more-menu-wipe-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--status-danger-border);
+  background: var(--status-danger-soft);
+}
+
+.more-menu-wipe-warning {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--status-danger);
+}
+
+.more-menu-wipe-buttons {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .brand-prompt {
@@ -475,7 +597,9 @@ body.room-viewport-locked {
 
 .msg-time-divider {
   flex-shrink: 0;
-  max-width: min(860px, 100%);
+  width: 100%;
+  max-width: 100%;
+  align-self: stretch;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -516,6 +640,24 @@ body.room-viewport-locked {
   color: var(--text-muted);
 }
 
+.transcript-toast {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-3);
+  transform: translateX(-50%);
+  z-index: 6;
+  padding: 5px 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  box-shadow: var(--shadow-panel);
+  pointer-events: none;
+  max-width: min(360px, 90%);
+  text-align: center;
+}
+
 .jump-to-latest-btn {
   position: absolute;
   right: var(--space-4);
@@ -544,19 +686,21 @@ body.room-viewport-locked {
   padding: var(--space-5);
 }
 
-/* Terminal Message Entries (cc REPL + IM hybrid) */
+/* Standard IM Left/Right Bubble Entries (terminal-refined aesthetic) */
 .msg-entry {
   position: relative;
   flex-shrink: 0;
-  min-width: 0;
+  min-width: min(210px, 88%);
+  width: fit-content;
+  max-width: min(680px, 88%);
   display: flex;
   flex-direction: column;
   gap: 4px;
   margin-top: var(--space-2);
   padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   border: 1px solid transparent;
-  max-width: min(860px, 100%);
+  text-align: left;
 }
 
 .msg-time-divider + .msg-entry {
@@ -565,6 +709,7 @@ body.room-viewport-locked {
 
 .msg-entry-compact {
   margin-top: 0;
+  min-width: min(132px, 88%);
   padding: 6px var(--space-3);
 }
 
@@ -572,14 +717,21 @@ body.room-viewport-locked {
   z-index: 2;
 }
 
+.msg-entry-file {
+  width: min(440px, 88%);
+  max-width: min(460px, 90%);
+}
+
 .msg-entry-peer {
+  align-self: flex-start;
   background: var(--bg-panel);
   border-color: var(--border-subtle);
 }
 
 .msg-entry-self {
+  align-self: flex-end;
   background: var(--bg-user-msg);
-  border-color: var(--border-subtle);
+  border-color: var(--accent-border);
 }
 
 .msg-entry-expanded {
@@ -828,6 +980,23 @@ body.room-viewport-locked {
   color: var(--text-primary);
 }
 
+.msg-quote-jump-btn {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  border-radius: var(--radius-xs);
+}
+
+.msg-quote-jump-btn:hover {
+  background: var(--bg-hover);
+}
+
 .msg-quote-author {
   font-weight: 600;
   color: var(--text-secondary);
@@ -835,7 +1004,7 @@ body.room-viewport-locked {
 }
 
 .msg-body {
-  padding-left: 14px;
+  padding-left: 2px;
   min-width: 0;
 }
 
@@ -1380,6 +1549,24 @@ body.room-viewport-locked {
   display: none;
 }
 
+.sidebar-toggle-btn {
+  display: inline-flex;
+}
+
+.drawer-backdrop {
+  display: none;
+}
+
+@media (min-width: 1025px) {
+  .room-grid.room-grid-sidebar-collapsed {
+    grid-template-columns: 248px minmax(0, 1fr);
+  }
+
+  .room-grid.room-grid-sidebar-collapsed .side-pane {
+    display: none;
+  }
+}
+
 @media (max-width: 1024px) {
   .room-grid {
     grid-template-columns: minmax(0, 1fr);
@@ -1388,6 +1575,14 @@ body.room-viewport-locked {
 
   .drawer-toggle-btn {
     display: inline-flex;
+  }
+
+  .drawer-backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    background: var(--bg-backdrop);
   }
 
   /* Prevent iOS Safari automatic pinch-zoom when focusing form inputs */
@@ -1443,9 +1638,25 @@ body.room-viewport-locked {
 
   .room-shell .brand-prompt,
   .room-shell .user-handle,
+  .room-chip-hash,
+  .more-menu-btn-label,
   .composer-footer,
   .composer-attach-label {
     display: none;
+  }
+
+  .msg-entry {
+    max-width: 90%;
+    min-width: min(160px, 90%);
+  }
+
+  .msg-entry-compact {
+    min-width: min(116px, 90%);
+  }
+
+  .msg-entry-file {
+    width: min(340px, 92%);
+    max-width: 92%;
   }
 
   .msg-file-card {

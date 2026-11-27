@@ -62,6 +62,8 @@ import {
 } from "../src/state/transcript-timeline.ts";
 import { I18nProvider } from "../src/i18n/I18nProvider.tsx";
 import { MessageTranscript } from "../src/features/room/MessageTranscript.tsx";
+import { RoomTopBar } from "../src/features/room/RoomTopBar.tsx";
+import { ThemeProvider } from "../src/theme/ThemeProvider.tsx";
 import { deriveMessageViewModel } from "../src/state/message-vm.ts";
 import {
   buildSortedRoomSummaries,
@@ -2837,6 +2839,7 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(html).toContain('data-compact="true"');
     expect(html).toContain('data-time-expanded="false"');
     expect(html).toContain('title="2026-11-24 10:00:30"');
+    expect(html).toContain('data-testid="msg-quote-jump"');
     expect(html).not.toContain('data-testid="msg-time-drawer"');
   });
 
@@ -3073,5 +3076,75 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(readBlob?.type).toBe("image/png");
     expect(readBlob?.size).toBe(4);
     await adapter.closeAll();
+
+    // Minimalist RoomTopBar keeps dangerous wipe action tucked inside More menu at rest
+    const closedTopBarHtml = renderToStaticMarkup(
+      createElement(
+        ThemeProvider,
+        null,
+        createElement(
+          I18nProvider,
+          null,
+          createElement(RoomTopBar, {
+            roomIdPrefix: "a1b2c3d4e5f60718",
+            roomAlias: "Ops",
+            connectionStatus: "connected",
+            centerConnected: true,
+            username: "alice",
+            roomCount: 3,
+            totalUnreadCount: 4,
+            peerCount: 2,
+            fileCount: 1,
+            railOpen: false,
+            sidebarExpanded: true,
+            moreMenuOpen: false,
+            onMoreMenuOpenChange: () => {},
+            onToggleRail: () => {},
+            onToggleSidebar: () => {},
+            onLeaveRoom: async () => {},
+            onSignOut: async () => {},
+            onWipeAndSignOut: async () => {},
+          }),
+        ),
+      ),
+    );
+    expect(closedTopBarHtml).toContain('data-testid="room-more-menu-toggle"');
+    expect(closedTopBarHtml).toContain('data-testid="rooms-total-unread"');
+    expect(closedTopBarHtml).not.toContain('data-testid="wipe-vault-button"');
+
+    const openTopBarHtml = renderToStaticMarkup(
+      createElement(
+        ThemeProvider,
+        null,
+        createElement(
+          I18nProvider,
+          null,
+          createElement(RoomTopBar, {
+            roomIdPrefix: "a1b2c3d4e5f60718",
+            roomAlias: "Ops",
+            connectionStatus: "connected",
+            centerConnected: true,
+            username: "alice",
+            roomCount: 3,
+            totalUnreadCount: 0,
+            peerCount: 2,
+            fileCount: 1,
+            railOpen: false,
+            sidebarExpanded: true,
+            moreMenuOpen: true,
+            onMoreMenuOpenChange: () => {},
+            onToggleRail: () => {},
+            onToggleSidebar: () => {},
+            onLeaveRoom: async () => {},
+            onSignOut: async () => {},
+            onWipeAndSignOut: async () => {},
+          }),
+        ),
+      ),
+    );
+    expect(openTopBarHtml).toContain('data-testid="room-more-menu"');
+    expect(openTopBarHtml).toContain('data-testid="leave-room-button"');
+    expect(openTopBarHtml).toContain('data-testid="sign-out-button"');
+    expect(openTopBarHtml).toContain('data-testid="wipe-vault-button"');
   });
 });

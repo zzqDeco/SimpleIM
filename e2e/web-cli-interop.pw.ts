@@ -551,7 +551,8 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
         "Confidential Alpha message",
       );
 
-      // Leave Room wipes active room session and returns cleanly to JoinRoomView
+      // Leave Room inside More menu wipes active room session and returns cleanly to JoinRoomView
+      await pageA.getByTestId("room-more-menu-toggle").click();
       await pageA.getByTestId("leave-room-button").click();
       await expect(pageA.getByTestId("room-passphrase")).toBeVisible();
       await expect(pageA.getByTestId("room-passphrase")).toHaveValue("");
@@ -769,7 +770,8 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
         "Background unread ping in Alpha room!",
       );
 
-      // 4. Default Sign Out preserves encrypted local RoomVault -> signing back in restores both rooms + history!
+      // 4. Default Sign Out (inside More menu) preserves encrypted local RoomVault -> signing back in restores both rooms + history!
+      await page.getByTestId("room-more-menu-toggle").click();
       await page.getByTestId("sign-out-button").click();
       await expect(page.getByTestId("auth-username")).toBeVisible();
 
@@ -796,8 +798,18 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       expect(storageAudit.localStorageKeys).toEqual([]);
       expect(storageAudit.sessionStorageKeys).toEqual([]);
 
-      // 5. Explicit "Wipe & Sign Out" wipes local RoomVault -> next login starts fresh on JoinRoomScreen
+      // 5. Explicit "Wipe & Sign Out" requires 2-step confirmation inside More menu
+      await page.getByTestId("room-more-menu-toggle").click();
       await page.getByTestId("wipe-vault-button").click();
+      await expect(page.getByTestId("wipe-vault-confirm-panel")).toBeVisible();
+      // Canceling confirmation keeps session & local vault intact
+      await page.getByTestId("wipe-vault-cancel-button").click();
+      await expect(page.getByTestId("wipe-vault-confirm-panel")).toHaveCount(0);
+      await expect(page.getByTestId("room-list-rail")).toBeVisible();
+
+      // Confirming wipe clears RoomVault -> next login starts fresh on JoinRoomScreen
+      await page.getByTestId("wipe-vault-button").click();
+      await page.getByTestId("wipe-vault-confirm-button").click();
       await expect(page.getByTestId("auth-username")).toBeVisible();
 
       await page.getByTestId("auth-username").fill("persist_alice");
@@ -1232,6 +1244,45 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       );
       expect(afterRemoteScrollTop).toBe(0);
       await expect(page.getByTestId("jump-to-latest-button")).toBeVisible();
+
+      // Mobile drawer backdrop closes left room drawer on tap, and Escape closes right side drawer
+      await page.getByTestId("rooms-drawer-toggle").click();
+      await expect(page.getByTestId("drawer-backdrop")).toBeVisible();
+      await page.getByTestId("drawer-backdrop").click({ position: { x: 360, y: 400 } });
+      await expect(page.getByTestId("drawer-backdrop")).toHaveCount(0);
+
+      await page.getByTestId("sidebar-drawer-toggle").click();
+      await expect(page.getByTestId("drawer-backdrop")).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("drawer-backdrop")).toHaveCount(0);
+
+      // Reply to message #1, verify right-aligned self bubble vs left-aligned peer bubble,
+      // and click quote jump button to scroll back to & highlight message #1!
+      await page.locator(".msg-entry").first().locator(".msg-reply-trigger").click();
+      await page.getByTestId("chat-input").fill("Jumping back to entry #1!");
+      await page.getByTestId("chat-send").click();
+
+      const selfReplyEntry = page.locator(".msg-entry-self", {
+        hasText: "Jumping back to entry #1!",
+      });
+      await expect(selfReplyEntry).toBeVisible();
+
+      const bubbleAlignment = await page.evaluate(() => {
+        const peer = document.querySelector(".msg-entry-peer") as HTMLElement;
+        const self = document.querySelector(".msg-entry-self") as HTMLElement;
+        return {
+          peerLeft: Math.round(peer.getBoundingClientRect().left),
+          selfRight: Math.round(self.getBoundingClientRect().right),
+          peerRight: Math.round(peer.getBoundingClientRect().right),
+        };
+      });
+      expect(bubbleAlignment.selfRight).toBeGreaterThan(bubbleAlignment.peerRight);
+
+      await selfReplyEntry.getByTestId("msg-quote-jump").click();
+      await expect(page.locator(".msg-entry").first()).toHaveAttribute(
+        "data-highlighted",
+        "true",
+      );
 
       // Clicking "Latest" jumps cleanly to the bottom and hides the button
       await page.getByTestId("jump-to-latest-button").click();
