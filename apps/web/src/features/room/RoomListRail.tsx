@@ -1,4 +1,10 @@
-import { useState, type FormEvent, type ReactElement } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type FormEvent,
+  type ReactElement,
+} from "react";
 import {
   Button,
   NoticeBanner,
@@ -16,7 +22,11 @@ import {
   MAX_ROOM_ALIAS_CHARS,
   validateRoomPassphrase,
 } from "../../state/validation.ts";
-import { formatRoomFingerprint } from "../../utils/format.ts";
+import {
+  formatRoomActivityTime,
+  formatRoomFingerprint,
+  msUntilNextLocalMidnight,
+} from "../../utils/format.ts";
 
 export interface RoomListRailProps {
   readonly open: boolean;
@@ -57,6 +67,31 @@ export function RoomListRail({
 
   const [editingRoomId, setEditingRoomId] = useState<string | null>(null);
   const [editingAliasValue, setEditingAliasValue] = useState("");
+  const [liveNowMs, setLiveNowMs] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setLiveNowMs(Date.now());
+    }, msUntilNextLocalMidnight(liveNowMs));
+    const handleVisibilityChange = (): void => {
+      if (document.visibilityState === "visible") {
+        setLiveNowMs(Date.now());
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [liveNowMs]);
+
+  const dateLabels = useMemo(
+    () => ({
+      today: t("room.date.today"),
+      yesterday: t("room.date.yesterday"),
+    }),
+    [t],
+  );
 
   const busy = joinPhase !== "idle";
   const activeFailure = localFailure ?? joinFailure;
@@ -234,6 +269,12 @@ export function RoomListRail({
                 ? "warning"
                 : "offline";
 
+          const activityTime = formatRoomActivityTime(
+            item.lastActivityMs,
+            liveNowMs,
+            dateLabels,
+          );
+
           return (
             <div
               key={item.roomId}
@@ -268,22 +309,44 @@ export function RoomListRail({
                     ) : null}
                   </div>
 
-                  {item.unreadCount > 0 ? (
-                    <span
-                      className="room-unread-badge"
-                      data-testid="room-unread-badge"
-                    >
-                      {item.unreadCount > 99 ? "99+" : item.unreadCount}
-                    </span>
-                  ) : item.connectionStatus === "standby" ? (
-                    <span className="room-standby-tag">
-                      {t("room.status.standby")}
-                    </span>
-                  ) : null}
+                  <div className="room-item-top-right">
+                    {activityTime ? (
+                      <span
+                        className="room-item-time"
+                        data-testid="room-item-time"
+                      >
+                        {activityTime}
+                      </span>
+                    ) : null}
+                    {item.unreadCount > 0 ? (
+                      <span
+                        className="room-unread-badge"
+                        data-testid="room-unread-badge"
+                      >
+                        {item.unreadCount > 99 ? "99+" : item.unreadCount}
+                      </span>
+                    ) : item.connectionStatus === "standby" ? (
+                      <span className="room-standby-tag">
+                        {t("room.status.standby")}
+                      </span>
+                    ) : null}
+                  </div>
                 </div>
 
                 <div className="room-item-preview">
-                  {item.lastMessagePreview ? (
+                  {item.lastMessageKind === "file" &&
+                  item.lastMessageFileName ? (
+                    <>
+                      <span className="room-item-preview-author">
+                        @{item.lastMessageAuthor}:
+                      </span>{" "}
+                      <span>
+                        {t("room.rail.filePreview", {
+                          name: item.lastMessageFileName,
+                        })}
+                      </span>
+                    </>
+                  ) : item.lastMessagePreview ? (
                     <>
                       <span className="room-item-preview-author">
                         @{item.lastMessageAuthor}:

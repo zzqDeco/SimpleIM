@@ -8,8 +8,11 @@ import {
   type MouseEvent,
   type ReactElement,
 } from "react";
-import type { ChatMessageEnvelope } from "@simpleim/contracts";
-import type { ChatDeliveryStatus } from "@simpleim/peer-core";
+import type { ChatMessageEnvelope, FileManifest } from "@simpleim/contracts";
+import type {
+  ChatDeliveryStatus,
+  SwarmTransferProgress,
+} from "@simpleim/peer-core";
 import { Byline, StatusIcon, Subline } from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import type { MessageViewModel } from "../../state/message-vm.ts";
@@ -23,8 +26,11 @@ import {
   msUntilNextLocalMidnight,
 } from "../../utils/format.ts";
 import { SafeMarkdown } from "../../utils/markdown.tsx";
+import { FileMessageCard } from "./FileMessageCard.tsx";
+import { ImageLightbox } from "./ImageLightbox.tsx";
 
 const FLOATING_DATE_HIDE_DELAY_MS = 1400;
+const LOCATE_HIGHLIGHT_DURATION_MS = 1600;
 const INTERACTIVE_TARGET_SELECTOR =
   'a, button, input, textarea, select, label, summary, [role="button"], [role="link"]';
 
@@ -59,25 +65,51 @@ function findTopVisibleMessageCreatedAt(streamEl: HTMLElement): number | null {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+export interface TranscriptLocateRequest {
+  readonly itemKey: string;
+  readonly nonce: number;
+}
+
 export interface MessageTranscriptProps {
   readonly roomId?: string | null;
   readonly messages: readonly ChatMessageEnvelope[];
+  readonly files?: readonly FileManifest[];
+  readonly transfers?: ReadonlyMap<string, SwarmTransferProgress>;
+  readonly canSaveFile?: (fileId: string) => boolean;
+  readonly onDownloadFile?: (fileId: string) => Promise<void>;
+  readonly onCancelDownload?: (fileId: string) => Promise<void>;
+  readonly onSaveFile?: (manifest: FileManifest) => Promise<void>;
+  readonly onReadFileBlob?: (
+    fileId: string,
+    mimeType: string,
+  ) => Promise<Blob | null>;
+  readonly onActionError?: (err: unknown) => void;
   readonly deliveryStates?: ReadonlyMap<string, ChatDeliveryStatus>;
   readonly localPeerId: string;
   readonly currentUserId: string;
   readonly onReply: (msg: ChatMessageEnvelope) => void;
   readonly onRetryMessage?: (msgId: string) => void;
+  readonly locateRequest?: TranscriptLocateRequest | null;
   readonly nowMs?: number;
 }
 
 export function MessageTranscript({
   roomId = null,
   messages,
+  files = [],
+  transfers,
+  canSaveFile,
+  onDownloadFile,
+  onCancelDownload,
+  onSaveFile,
+  onReadFileBlob,
+  onActionError,
   deliveryStates,
   localPeerId,
   currentUserId,
   onReply,
   onRetryMessage,
+  locateRequest = null,
   nowMs,
 }: MessageTranscriptProps): ReactElement {
   const { t } = useI18n();
@@ -86,17 +118,25 @@ export function MessageTranscript({
   const isNearBottomRef = useRef(true);
   const lastClientHeightRef = useRef(0);
   const prevRoomIdRef = useRef<string | null>(roomId);
-  const prevLastMsgIdRef = useRef<string | null>(null);
+  const prevLastItemKeyRef = useRef<string | null>(null);
   const programmaticScrollTopRef = useRef<number | null>(null);
   const hideDatePillTimerRef = useRef<number | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
 
   const [liveNowMs, setLiveNowMs] = useState<number>(() => nowMs ?? Date.now());
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
-  const [expandedMsgId, setExpandedMsgId] = useState<string | null>(null);
+  const [expandedItemKey, setExpandedItemKey] = useState<string | null>(null);
+  const [highlightedItemKey, setHighlightedItemKey] = useState<string | null>(
+    null,
+  );
   const [floatingDateCreatedAt, setFloatingDateCreatedAt] = useState<
     number | null
   >(null);
   const [floatingDateVisible, setFloatingDateVisible] = useState(false);
+  const [lightbox, setLightbox] = useState<{
+    readonly imageUrl: string;
+    readonly manifest: FileManifest;
+  } | null>(null);
 
   const effectiveNowMs = nowMs ?? liveNowMs;
 
@@ -128,11 +168,30 @@ export function MessageTranscript({
     }
   }, []);
 
+  const clearHighlightTimer = useCallback((): void => {
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+      highlightTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     return () => {
       clearHideDatePillTimer();
+      clearHighlightTimer();
     };
-  }, [clearHideDatePillTimer]);
+  }, [clearHideDatePillTimer, clearHighlightTimer]);
+
+  // Close lightbox automatically if the referenced file is no longer in the active room.
+  useEffect(() => {
+    if (!lightbox) return;
+    const stillPresent = files.some(
+      (f) => f.fileId === lightbox.manifest.fileId,
+    );
+    if (!stillPresent) {
+      setLightbox(null);
+    }
+  }, [files, lightbox]);
 
   const dateLabels = useMemo(
     () => ({
@@ -146,6 +205,9 @@ export function MessageTranscript({
     () =>
       buildTranscriptTimeline({
         messages,
+        files,
+        transfers,
+        canSaveFile,
         localPeerId,
         currentUserId,
         deliveryStates,
@@ -153,22 +215,22 @@ export function MessageTranscript({
         dateLabels,
       }),
     [
+      canSaveFile,
       currentUserId,
       dateLabels,
       deliveryStates,
       effectiveNowMs,
+      files,
       localPeerId,
       messages,
+      transfers,
     ],
   );
 
-  const latestMessage =
-    messages.length > 0 ? messages[messages.length - 1] : undefined;
-  const latestMsgId = latestMessage?.msgId ?? null;
-  const latestMessageIsSelf =
-    latestMessage !== undefined &&
-    (latestMessage.authorCert.payload.userId === currentUserId ||
-      latestMessage.authorCert.payload.peerId === localPeerId);
+  const latestItem =
+    timeline.length > 0 ? timeline[timeline.length - 1] : undefined;
+  const latestItemKey = latestItem?.itemKey ?? null;
+  const latestItemIsSelf = latestItem?.isSelf ?? false;
 
   const setProgrammaticScrollTop = useCallback(
     (el: HTMLElement, nextScrollTop: number): void => {
@@ -191,6 +253,62 @@ export function MessageTranscript({
     clearHideDatePillTimer();
     setFloatingDateVisible(false);
   }, [clearHideDatePillTimer, setProgrammaticScrollTop]);
+
+  const scrollToItemKey = useCallback(
+    (targetItemKey: string): boolean => {
+      const el = streamRef.current;
+      if (!el) return false;
+      const entries = el.querySelectorAll<HTMLElement>(
+        ".msg-entry[data-item-key]",
+      );
+      let targetEl: HTMLElement | null = null;
+      for (let i = 0; i < entries.length; i++) {
+        if (entries[i]!.dataset.itemKey === targetItemKey) {
+          targetEl = entries[i]!;
+          break;
+        }
+      }
+      if (!targetEl) {
+        return false;
+      }
+
+      // Container-local scroll without scrollIntoView() so iOS Safari never shifts .room-shell.
+      const streamRect = el.getBoundingClientRect();
+      const targetRect = targetEl.getBoundingClientRect();
+      const targetOffsetWithinStream =
+        targetRect.top - streamRect.top + el.scrollTop;
+      const centeredTop = Math.max(
+        0,
+        Math.min(
+          el.scrollHeight - el.clientHeight,
+          targetOffsetWithinStream -
+            Math.max(0, (el.clientHeight - targetRect.height) / 2),
+        ),
+      );
+      setProgrammaticScrollTop(el, centeredTop);
+      const nearBottom = isTranscriptNearBottom({
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+      });
+      isNearBottomRef.current = nearBottom;
+      setShowJumpToLatest(!nearBottom && el.scrollHeight - el.clientHeight > 120);
+
+      clearHighlightTimer();
+      setHighlightedItemKey(targetItemKey);
+      highlightTimerRef.current = window.setTimeout(() => {
+        highlightTimerRef.current = null;
+        setHighlightedItemKey(null);
+      }, LOCATE_HIGHLIGHT_DURATION_MS);
+      return true;
+    },
+    [clearHighlightTimer, setProgrammaticScrollTop],
+  );
+
+  useEffect(() => {
+    if (!locateRequest) return;
+    scrollToItemKey(locateRequest.itemKey);
+  }, [locateRequest, scrollToItemKey]);
 
   const handleScroll = useCallback((): void => {
     const el = streamRef.current;
@@ -249,26 +367,29 @@ export function MessageTranscript({
   // cannot scroll ancestor overflow:hidden shells or yank users reading history.
   useEffect(() => {
     const roomChanged = prevRoomIdRef.current !== roomId;
-    const previousLastMsgId = prevLastMsgIdRef.current;
+    const previousLastItemKey = prevLastItemKeyRef.current;
     const shouldScroll = shouldAutoScrollTranscript({
       roomChanged,
-      previousLastMsgId,
-      nextLastMsgId: latestMsgId,
+      previousLastMsgId: previousLastItemKey,
+      nextLastMsgId: latestItemKey,
       wasNearBottom: isNearBottomRef.current,
-      latestMessageIsSelf,
+      latestMessageIsSelf: latestItemIsSelf,
     });
 
     prevRoomIdRef.current = roomId;
-    prevLastMsgIdRef.current = latestMsgId;
+    prevLastItemKeyRef.current = latestItemKey;
 
     if (roomChanged) {
-      setExpandedMsgId(null);
+      setExpandedItemKey(null);
+      setHighlightedItemKey(null);
+      setLightbox(null);
       clearHideDatePillTimer();
+      clearHighlightTimer();
       setFloatingDateVisible(false);
       setFloatingDateCreatedAt(null);
     }
 
-    if (roomChanged && latestMsgId === null) {
+    if (roomChanged && latestItemKey === null) {
       isNearBottomRef.current = true;
       setShowJumpToLatest(false);
       if (streamRef.current) {
@@ -281,20 +402,21 @@ export function MessageTranscript({
       scrollToBottom();
     } else if (
       !roomChanged &&
-      latestMsgId !== null &&
-      previousLastMsgId !== null &&
-      latestMsgId !== previousLastMsgId
+      latestItemKey !== null &&
+      previousLastItemKey !== null &&
+      latestItemKey !== previousLastItemKey
     ) {
       setShowJumpToLatest(true);
     }
   }, [
     clearHideDatePillTimer,
-    latestMessageIsSelf,
-    latestMsgId,
-    messages.length,
+    clearHighlightTimer,
+    latestItemIsSelf,
+    latestItemKey,
     roomId,
     scrollToBottom,
     setProgrammaticScrollTop,
+    timeline.length,
   ]);
 
   // Keep transcript anchored at bottom when mobile viewport shrinks (e.g. iOS keyboard opens)
@@ -316,10 +438,10 @@ export function MessageTranscript({
     };
   }, [setProgrammaticScrollTop]);
 
-  // When tapping a message near the bottom edge to inspect its full timestamp,
+  // When tapping a message/file near the bottom edge to inspect its full timestamp,
   // gently reveal the expanded timestamp drawer within .message-stream without scrollIntoView().
   useEffect(() => {
-    if (!expandedMsgId) {
+    if (!expandedItemKey) {
       return;
     }
     const streamEl = streamRef.current;
@@ -333,14 +455,14 @@ export function MessageTranscript({
       const delta = entryRect.bottom - streamRect.bottom + 8;
       setProgrammaticScrollTop(streamEl, streamEl.scrollTop + delta);
     }
-  }, [expandedMsgId, setProgrammaticScrollTop]);
+  }, [expandedItemKey, setProgrammaticScrollTop]);
 
-  const toggleExpandedMsg = useCallback((msgId: string): void => {
-    setExpandedMsgId((prev) => (prev === msgId ? null : msgId));
+  const toggleExpandedItem = useCallback((itemKey: string): void => {
+    setExpandedItemKey((prev) => (prev === itemKey ? null : itemKey));
   }, []);
 
-  const handleMessageClick = useCallback(
-    (ev: MouseEvent<HTMLElement>, msgId: string): void => {
+  const handleEntryClick = useCallback(
+    (ev: MouseEvent<HTMLElement>, itemKey: string): void => {
       if (ev.defaultPrevented || ev.detail > 1) {
         return;
       }
@@ -353,9 +475,34 @@ export function MessageTranscript({
       if (selection && selection.toString().trim().length > 0) {
         return;
       }
-      toggleExpandedMsg(msgId);
+      toggleExpandedItem(itemKey);
     },
-    [toggleExpandedMsg],
+    [toggleExpandedItem],
+  );
+
+  const handleMediaLayoutChange = useCallback((): void => {
+    const el = streamRef.current;
+    if (!el || !isNearBottomRef.current) {
+      return;
+    }
+    setProgrammaticScrollTop(el, el.scrollHeight);
+  }, [setProgrammaticScrollTop]);
+
+  const handleOpenLightbox = useCallback(
+    (imageUrl: string, manifest: FileManifest): void => {
+      setLightbox({ imageUrl, manifest });
+    },
+    [],
+  );
+
+  const handleLightboxSave = useCallback(
+    (manifest: FileManifest): void => {
+      if (!onSaveFile) return;
+      void onSaveFile(manifest).catch((err) => {
+        onActionError?.(err);
+      });
+    },
+    [onActionError, onSaveFile],
   );
 
   const renderDeliveryBadge = (vm: MessageViewModel): ReactElement | null => {
@@ -414,15 +561,150 @@ export function MessageTranscript({
           <div className="empty-transcript">{t("room.empty")}</div>
         ) : (
           timeline.map((item) => {
+            const isExpanded = expandedItemKey === item.itemKey;
+            const isHighlighted = highlightedItemKey === item.itemKey;
+
+            if (item.kind === "file") {
+              const toggleTimeAria = t("room.msg.toggleTimeAria", {
+                time: item.formattedDateTime,
+              });
+
+              return (
+                <Fragment key={item.itemKey}>
+                  {item.showDivider && item.dividerLabel ? (
+                    <div
+                      className={`msg-time-divider ${item.isDayBoundary ? "msg-time-divider-day" : ""}`}
+                      data-testid="msg-time-divider"
+                      data-day-key={item.dayKey}
+                      data-divider-kind={item.isDayBoundary ? "day" : "gap"}
+                    >
+                      <time
+                        dateTime={item.createdAtIso}
+                        title={item.formattedDateTime}
+                      >
+                        {item.dividerLabel}
+                      </time>
+                    </div>
+                  ) : null}
+
+                  <article
+                    ref={isExpanded ? expandedEntryRef : undefined}
+                    className={[
+                      "msg-entry",
+                      "msg-entry-file",
+                      item.isSelf ? "msg-entry-self" : "msg-entry-peer",
+                      isExpanded ? "msg-entry-expanded" : "",
+                      isHighlighted ? "msg-entry-highlighted" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                    data-item-key={item.itemKey}
+                    data-file-id={item.manifest.fileId}
+                    data-day-key={item.dayKey}
+                    data-created-at={String(item.createdAtMs)}
+                    data-compact="false"
+                    data-time-expanded={isExpanded ? "true" : "false"}
+                    data-highlighted={isHighlighted ? "true" : "false"}
+                    onClick={(ev) => handleEntryClick(ev, item.itemKey)}
+                  >
+                    <div className="msg-header">
+                      <div className="msg-author-line">
+                        {item.isSelf ? (
+                          <>
+                            <span
+                              className="msg-sigil-self"
+                              aria-hidden="true"
+                            >
+                              ❯
+                            </span>
+                            <span className="msg-author-name">
+                              {t("room.you")}
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <StatusIcon status="online" />
+                            <span className="msg-author-name">
+                              {item.authorDisplayName}
+                            </span>
+                          </>
+                        )}
+
+                        <span className="msg-author-meta">
+                          <Byline>
+                            <span>@{item.authorUsername}</span>
+                            <span className="msg-runtime-tag">
+                              {item.runtimeTag}
+                            </span>
+                          </Byline>
+                        </span>
+                      </div>
+
+                      <div className="msg-tools">
+                        {!isExpanded ? (
+                          <button
+                            type="button"
+                            className="msg-time-toggle msg-header-time-toggle"
+                            data-testid="msg-time-toggle"
+                            aria-expanded={false}
+                            aria-label={toggleTimeAria}
+                            title={item.formattedDateTime}
+                            onClick={() => toggleExpandedItem(item.itemKey)}
+                          >
+                            <time dateTime={item.createdAtIso}>
+                              {item.formattedTime}
+                            </time>
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <div className="msg-body">
+                      <FileMessageCard
+                        manifest={item.manifest}
+                        transfer={item.transfer}
+                        onDownloadFile={onDownloadFile}
+                        onCancelDownload={onCancelDownload}
+                        onSaveFile={onSaveFile}
+                        onReadFileBlob={onReadFileBlob}
+                        onOpenLightbox={handleOpenLightbox}
+                        onMediaLayoutChange={handleMediaLayoutChange}
+                        onActionError={onActionError}
+                      />
+                    </div>
+
+                    {isExpanded ? (
+                      <div
+                        className="msg-time-drawer"
+                        data-testid="msg-time-drawer"
+                      >
+                        <button
+                          type="button"
+                          className="msg-time-drawer-btn"
+                          data-testid="msg-time-toggle"
+                          aria-expanded={true}
+                          aria-label={toggleTimeAria}
+                          onClick={() => toggleExpandedItem(item.itemKey)}
+                        >
+                          <time dateTime={item.createdAtIso}>
+                            {item.formattedDateTime}
+                          </time>
+                        </button>
+                      </div>
+                    ) : null}
+                  </article>
+                </Fragment>
+              );
+            }
+
             const { vm } = item;
-            const isExpanded = expandedMsgId === vm.msgId;
             const deliveryBadge = renderDeliveryBadge(vm);
             const toggleTimeAria = t("room.msg.toggleTimeAria", {
               time: vm.formattedDateTime,
             });
 
             return (
-              <Fragment key={vm.msgId}>
+              <Fragment key={item.itemKey}>
                 {item.showDivider && item.dividerLabel ? (
                   <div
                     className={`msg-time-divider ${item.isDayBoundary ? "msg-time-divider-day" : ""}`}
@@ -446,15 +728,18 @@ export function MessageTranscript({
                     vm.isSelf ? "msg-entry-self" : "msg-entry-peer",
                     item.isCompact ? "msg-entry-compact" : "",
                     isExpanded ? "msg-entry-expanded" : "",
+                    isHighlighted ? "msg-entry-highlighted" : "",
                   ]
                     .filter(Boolean)
                     .join(" ")}
+                  data-item-key={item.itemKey}
                   data-delivery-status={vm.deliveryStatus ?? undefined}
                   data-day-key={item.dayKey}
                   data-created-at={String(vm.createdAtMs)}
                   data-compact={item.isCompact ? "true" : "false"}
                   data-time-expanded={isExpanded ? "true" : "false"}
-                  onClick={(ev) => handleMessageClick(ev, vm.msgId)}
+                  data-highlighted={isHighlighted ? "true" : "false"}
+                  onClick={(ev) => handleEntryClick(ev, item.itemKey)}
                 >
                   {item.isCompact ? (
                     <>
@@ -470,7 +755,7 @@ export function MessageTranscript({
                             aria-expanded={false}
                             aria-label={toggleTimeAria}
                             title={vm.formattedDateTime}
-                            onClick={() => toggleExpandedMsg(vm.msgId)}
+                            onClick={() => toggleExpandedItem(item.itemKey)}
                           >
                             <time dateTime={vm.createdAtIso}>
                               {vm.formattedTime}
@@ -542,7 +827,7 @@ export function MessageTranscript({
                               aria-expanded={false}
                               aria-label={toggleTimeAria}
                               title={vm.formattedDateTime}
-                              onClick={() => toggleExpandedMsg(vm.msgId)}
+                              onClick={() => toggleExpandedItem(item.itemKey)}
                             >
                               <time dateTime={vm.createdAtIso}>
                                 {vm.formattedTime}
@@ -586,7 +871,7 @@ export function MessageTranscript({
                         data-testid="msg-time-toggle"
                         aria-expanded={true}
                         aria-label={toggleTimeAria}
-                        onClick={() => toggleExpandedMsg(vm.msgId)}
+                        onClick={() => toggleExpandedItem(item.itemKey)}
                       >
                         <time dateTime={vm.createdAtIso}>
                           {vm.formattedDateTime}
@@ -619,6 +904,15 @@ export function MessageTranscript({
         >
           ↓ {t("room.jumpToLatest")}
         </button>
+      ) : null}
+
+      {lightbox ? (
+        <ImageLightbox
+          imageUrl={lightbox.imageUrl}
+          manifest={lightbox.manifest}
+          onSave={handleLightboxSave}
+          onClose={() => setLightbox(null)}
+        />
       ) : null}
     </div>
   );

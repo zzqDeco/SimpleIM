@@ -1,8 +1,14 @@
-import type { ChatMessageEnvelope } from "@simpleim/contracts";
-import type { ChatDeliveryStatus } from "@simpleim/peer-core";
+import type { ChatMessageEnvelope, FileManifest } from "@simpleim/contracts";
+import type {
+  ChatDeliveryStatus,
+  SwarmTransferProgress,
+} from "@simpleim/peer-core";
 import {
   formatDatePillLabel,
+  formatMessageDateTime,
+  formatMessageTime,
   formatTranscriptDividerLabel,
+  getFileCreatedAtMs,
   getLocalDayKey,
   type RelativeDateLabels,
 } from "../utils/format.ts";
@@ -10,22 +16,51 @@ import {
   deriveMessageViewModel,
   type MessageViewModel,
 } from "./message-vm.ts";
+import {
+  deriveTransferViewModel,
+  type TransferViewModel,
+} from "./transfer-vm.ts";
 
 /** Standard IM time-gap threshold (5 minutes) for inserting an inline timestamp divider. */
 export const TRANSCRIPT_TIME_GAP_MS = 5 * 60 * 1000;
 
-export interface TranscriptTimelineItem {
-  readonly vm: MessageViewModel;
+interface TranscriptTimelineBaseItem {
+  readonly itemKey: string;
+  readonly createdAtMs: number;
+  readonly isSelf: boolean;
   readonly dayKey: string;
   readonly datePillLabel: string;
   readonly showDivider: boolean;
   readonly isDayBoundary: boolean;
   readonly dividerLabel: string | null;
+}
+
+export interface TranscriptMessageItem extends TranscriptTimelineBaseItem {
+  readonly kind: "message";
+  readonly vm: MessageViewModel;
   readonly isCompact: boolean;
 }
 
+export interface TranscriptFileItem extends TranscriptTimelineBaseItem {
+  readonly kind: "file";
+  readonly createdAtIso: string;
+  readonly formattedTime: string;
+  readonly formattedDateTime: string;
+  readonly authorDisplayName: string;
+  readonly authorUsername: string;
+  readonly runtimeTag: "CLI" | "WEB";
+  readonly manifest: FileManifest;
+  readonly transfer: TransferViewModel;
+  readonly isCompact: false;
+}
+
+export type TranscriptTimelineItem = TranscriptMessageItem | TranscriptFileItem;
+
 export interface BuildTranscriptTimelineParams {
   readonly messages: readonly ChatMessageEnvelope[];
+  readonly files?: readonly FileManifest[];
+  readonly transfers?: ReadonlyMap<string, SwarmTransferProgress>;
+  readonly canSaveFile?: (fileId: string) => boolean;
   readonly localPeerId: string;
   readonly currentUserId?: string;
   readonly deliveryStates?: ReadonlyMap<string, ChatDeliveryStatus>;
@@ -34,11 +69,28 @@ export interface BuildTranscriptTimelineParams {
   readonly timeGapMs?: number;
 }
 
+type RawTimelineEntry =
+  | {
+      readonly kind: "message";
+      readonly id: string;
+      readonly createdAtMs: number;
+      readonly msg: ChatMessageEnvelope;
+    }
+  | {
+      readonly kind: "file";
+      readonly id: string;
+      readonly createdAtMs: number;
+      readonly manifest: FileManifest;
+    };
+
 export function buildTranscriptTimeline(
   params: BuildTranscriptTimelineParams,
 ): TranscriptTimelineItem[] {
   const {
     messages,
+    files = [],
+    transfers,
+    canSaveFile,
     localPeerId,
     currentUserId,
     deliveryStates,
@@ -52,61 +104,143 @@ export function buildTranscriptTimeline(
     byId.set(msg.msgId, msg);
   }
 
+  const rawEntries: RawTimelineEntry[] = [];
+  for (const msg of messages) {
+    rawEntries.push({
+      kind: "message",
+      id: msg.msgId,
+      createdAtMs: msg.createdAt,
+      msg,
+    });
+  }
+  for (const manifest of files) {
+    rawEntries.push({
+      kind: "file",
+      id: manifest.fileId,
+      createdAtMs: getFileCreatedAtMs(manifest),
+      manifest,
+    });
+  }
+
+  // Chronological merge: messages precede files on identical millisecond timestamps
+  // so caption + attachment bursts always render caption first.
+  rawEntries.sort((a, b) => {
+    if (a.createdAtMs !== b.createdAtMs) {
+      return a.createdAtMs - b.createdAtMs;
+    }
+    if (a.kind !== b.kind) {
+      return a.kind === "message" ? -1 : 1;
+    }
+    return a.id.localeCompare(b.id);
+  });
+
   const items: TranscriptTimelineItem[] = [];
-  let prevMsg: ChatMessageEnvelope | undefined;
+  let prevEntry: RawTimelineEntry | undefined;
   let prevDayKey = "";
 
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i]!;
-    const vm = deriveMessageViewModel(
-      msg,
-      localPeerId,
-      byId,
-      currentUserId,
-      deliveryStates,
-    );
-    const dayKey = getLocalDayKey(msg.createdAt);
+  for (let i = 0; i < rawEntries.length; i++) {
+    const entry = rawEntries[i]!;
+    const dayKey = getLocalDayKey(entry.createdAtMs);
     const isFirst = i === 0;
     const isDayBoundary = isFirst || dayKey !== prevDayKey;
     const hasTimeGap =
       !isFirst &&
-      prevMsg !== undefined &&
-      Math.abs(msg.createdAt - prevMsg.createdAt) >= timeGapMs;
+      prevEntry !== undefined &&
+      Math.abs(entry.createdAtMs - prevEntry.createdAtMs) >= timeGapMs;
     const showDivider = isDayBoundary || hasTimeGap;
     const dividerLabel = showDivider
       ? formatTranscriptDividerLabel(
-          msg.createdAt,
+          entry.createdAtMs,
           nowMs,
           dateLabels,
           isDayBoundary,
         )
       : null;
-    const datePillLabel = formatDatePillLabel(msg.createdAt, nowMs, dateLabels);
+    const datePillLabel = formatDatePillLabel(
+      entry.createdAtMs,
+      nowMs,
+      dateLabels,
+    );
 
-    const sameAuthorAsPrev =
-      prevMsg !== undefined &&
-      prevMsg.authorCert.payload.userId === msg.authorCert.payload.userId &&
-      prevMsg.authorCert.payload.username === msg.authorCert.payload.username &&
-      prevMsg.authorCert.payload.displayName ===
-        msg.authorCert.payload.displayName &&
-      prevMsg.authorCert.payload.clientKind ===
-        msg.authorCert.payload.clientKind;
+    if (entry.kind === "message") {
+      const { msg } = entry;
+      const vm = deriveMessageViewModel(
+        msg,
+        localPeerId,
+        byId,
+        currentUserId,
+        deliveryStates,
+      );
 
-    // Group consecutive messages from the same sender within a short window into compact entries,
-    // except when a divider starts a new block or the message quotes an earlier message.
-    const isCompact = !showDivider && sameAuthorAsPrev && !msg.replyToMsgId;
+      const sameAuthorAsPrevMsg =
+        prevEntry?.kind === "message" &&
+        prevEntry.msg.authorCert.payload.userId ===
+          msg.authorCert.payload.userId &&
+        prevEntry.msg.authorCert.payload.username ===
+          msg.authorCert.payload.username &&
+        prevEntry.msg.authorCert.payload.displayName ===
+          msg.authorCert.payload.displayName &&
+        prevEntry.msg.authorCert.payload.clientKind ===
+          msg.authorCert.payload.clientKind;
 
-    items.push({
-      vm,
-      dayKey,
-      datePillLabel,
-      showDivider,
-      isDayBoundary,
-      dividerLabel,
-      isCompact,
-    });
+      // Group consecutive text messages from the same sender within a short window,
+      // except after a divider, after a file card, or when quoting another message.
+      const isCompact = !showDivider && sameAuthorAsPrevMsg && !msg.replyToMsgId;
 
-    prevMsg = msg;
+      items.push({
+        kind: "message",
+        itemKey: `msg:${msg.msgId}`,
+        createdAtMs: entry.createdAtMs,
+        isSelf: vm.isSelf,
+        vm,
+        dayKey,
+        datePillLabel,
+        showDivider,
+        isDayBoundary,
+        dividerLabel,
+        isCompact,
+      });
+    } else {
+      const { manifest } = entry;
+      const sender = manifest.senderCert.payload;
+      const isSelf =
+        sender.peerId === localPeerId ||
+        (currentUserId !== undefined && sender.userId === currentUserId);
+      const runtimeTag = sender.clientKind === "cli" ? "CLI" : "WEB";
+      const createdAtIso =
+        Number.isFinite(entry.createdAtMs) && entry.createdAtMs > 0
+          ? new Date(entry.createdAtMs).toISOString()
+          : "";
+      const transfer = deriveTransferViewModel(
+        manifest,
+        transfers?.get(manifest.fileId),
+        localPeerId,
+        canSaveFile ? canSaveFile(manifest.fileId) : false,
+      );
+
+      items.push({
+        kind: "file",
+        itemKey: `file:${manifest.fileId}`,
+        createdAtMs: entry.createdAtMs,
+        createdAtIso,
+        formattedTime: formatMessageTime(entry.createdAtMs),
+        formattedDateTime: formatMessageDateTime(entry.createdAtMs),
+        isSelf,
+        authorDisplayName: sender.displayName,
+        authorUsername: sender.username,
+        runtimeTag,
+        manifest,
+        transfer,
+        dayKey,
+        datePillLabel,
+        showDivider,
+        isDayBoundary,
+        dividerLabel,
+        isCompact: false,
+      });
+    }
+
+    prevEntry = entry;
     prevDayKey = dayKey;
   }
 

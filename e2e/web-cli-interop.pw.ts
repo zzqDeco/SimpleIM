@@ -299,20 +299,37 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       });
       expect(cliShared.totalChunks).toBe(4);
 
-      const aliceCliFileCard = pageAlice
-        .getByTestId("file-list")
-        .locator(".file-card", { hasText: "cli-telemetry.bin" });
-      await expect(aliceCliFileCard).toBeVisible();
-      await aliceCliFileCard.getByTestId("file-download-button").click();
+      // Verify CLI-shared file appears INLINE inside the chat transcript AND in sidebar file index!
+      const aliceInlineCliCard = pageAlice
+        .locator(".message-stream")
+        .locator('[data-testid="msg-file-card"]', {
+          hasText: "cli-telemetry.bin",
+        });
+      await expect(aliceInlineCliCard).toBeVisible();
+      await aliceInlineCliCard.getByTestId("msg-file-download-button").click();
 
-      await expect(aliceCliFileCard).toHaveAttribute(
+      await expect(aliceInlineCliCard).toHaveAttribute(
         "data-transfer-status",
         "seeding",
         { timeout: 25_000 },
       );
 
+      const aliceCliFileCard = pageAlice
+        .getByTestId("file-list")
+        .locator(".file-card", { hasText: "cli-telemetry.bin" });
+      await expect(aliceCliFileCard).toHaveAttribute(
+        "data-transfer-status",
+        "seeding",
+      );
+
+      // Clicking "Locate" in right sidebar highlights the inline file card in the transcript
+      await aliceCliFileCard.getByTestId("file-locate-button").click();
+      await expect(
+        pageAlice.locator(`.msg-entry-file[data-file-id="${cliShared.fileId}"]`),
+      ).toHaveAttribute("data-highlighted", "true");
+
       const downloadPromise = pageAlice.waitForEvent("download");
-      await aliceCliFileCard.getByTestId("file-save-button").click();
+      await aliceInlineCliCard.getByTestId("msg-file-save-button").click();
       const browserDownload = await downloadPromise;
       expect(browserDownload.suggestedFilename()).toBe("cli-telemetry.bin");
       const downloadedPath = await browserDownload.path();
@@ -321,7 +338,7 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       expect(savedBytes.byteLength).toBe(cliShared.fileSize);
       expect(sha256HexNode(savedBytes)).toBe(cliShared.sha256);
 
-      // 5. Web -> CLI multi-chunk Swarm file transfer (200 KiB = 4 chunks of 64 KiB) to CLI disk
+      // 5. Web -> CLI multi-chunk Swarm file transfer (200 KiB = 4 chunks of 64 KiB) via staging queue + caption
       const webPayload = makeDeterministicBuffer(200 * 1024 + 509, 0xa7);
       const expectedWebSha = sha256HexNode(webPayload);
 
@@ -330,12 +347,58 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
         mimeType: "application/octet-stream",
         buffer: webPayload,
       });
+      await expect(pageAlice.getByTestId("staged-attachments")).toContainText(
+        "browser-capture.bin",
+      );
+      await pageAlice
+        .getByTestId("chat-input")
+        .fill("Sending browser capture with inline caption");
+      await pageAlice.getByTestId("chat-send").click();
 
+      await expect(pageAlice.getByTestId("staged-attachments")).toHaveCount(0);
+      await expect(pageAlice.locator(".message-stream")).toContainText(
+        "Sending browser capture with inline caption",
+      );
+      await expect(
+        pageAlice
+          .locator(".message-stream")
+          .locator('[data-testid="msg-file-card"]', {
+            hasText: "browser-capture.bin",
+          }),
+      ).toHaveAttribute("data-transfer-status", "seeding");
       await expect(
         pageAlice
           .getByTestId("file-list")
           .locator(".file-card", { hasText: "browser-capture.bin" }),
       ).toHaveAttribute("data-transfer-status", "seeding");
+
+      // 5b. Inline raster image preview + Lightbox (valid 1x1 PNG staged & sent via composer)
+      const tinyPng = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+8N8AAAAASUVORK5CYII=",
+        "base64",
+      );
+      await pageAlice.getByTestId("file-input").setInputFiles({
+        name: "inline-preview.png",
+        mimeType: "image/png",
+        buffer: tinyPng,
+      });
+      await expect(pageAlice.getByTestId("staged-attachments")).toContainText(
+        "inline-preview.png",
+      );
+      await pageAlice.getByTestId("chat-send").click();
+
+      const inlineImageCard = pageAlice
+        .locator(".message-stream")
+        .locator('[data-testid="msg-file-card"]', {
+          hasText: "inline-preview.png",
+        });
+      await expect(inlineImageCard.getByTestId("msg-file-preview")).toBeVisible({
+        timeout: 10_000,
+      });
+      await inlineImageCard.getByTestId("msg-file-preview").click();
+      await expect(pageAlice.getByTestId("image-lightbox")).toBeVisible();
+      await pageAlice.getByTestId("lightbox-close-button").click();
+      await expect(pageAlice.getByTestId("image-lightbox")).toHaveCount(0);
 
       let webAnnouncedFileId = "";
       await expect
@@ -854,6 +917,20 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
         mimeType: "application/octet-stream",
         buffer: offlineFileBuffer,
       });
+      await expect(pageSender.getByTestId("staged-attachments")).toContainText(
+        "offline-handover.bin",
+      );
+      await pageSender.getByTestId("chat-send").click();
+
+      const senderInlineFileCard = pageSender
+        .locator(".message-stream")
+        .locator('[data-testid="msg-file-card"]', {
+          hasText: "offline-handover.bin",
+        });
+      await expect(senderInlineFileCard).toHaveAttribute(
+        "data-transfer-status",
+        "seeding",
+      );
 
       const senderFileCard = pageSender
         .getByTestId("file-list")
