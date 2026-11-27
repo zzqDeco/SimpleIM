@@ -1784,10 +1784,13 @@ export function useRoomSession({
         );
         const fileCreatedAt = getFileCreatedAtMs(manifest);
         const nowMs = Math.max(Date.now(), fileCreatedAt);
+        const isSelected = selectedRoomIdRef.current === roomId;
         entry.metadata = {
           ...entry.metadata,
           lastActiveAt: Math.max(entry.metadata.lastActiveAt, nowMs),
-          lastReadAt: Math.max(entry.metadata.lastReadAt, nowMs),
+          lastReadAt: isSelected
+            ? Math.max(entry.metadata.lastReadAt, nowMs)
+            : entry.metadata.lastReadAt,
         };
         publishSnapshot(user.id);
 

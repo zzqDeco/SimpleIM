@@ -24,6 +24,7 @@ export interface FileMessageCardProps {
     mimeType: string,
   ) => Promise<Blob | null>;
   readonly onOpenLightbox?: (imageUrl: string, manifest: FileManifest) => void;
+  readonly onMediaLayoutChange?: () => void;
   readonly onActionError?: (err: unknown) => void;
 }
 
@@ -35,6 +36,7 @@ export function FileMessageCard({
   onSaveFile,
   onReadFileBlob,
   onOpenLightbox,
+  onMediaLayoutChange,
   onActionError,
 }: FileMessageCardProps): ReactElement {
   const { t } = useI18n();
@@ -89,6 +91,12 @@ export function FileMessageCard({
     transfer.canSave,
   ]);
 
+  useEffect(() => {
+    if (previewUrl) {
+      onMediaLayoutChange?.();
+    }
+  }, [onMediaLayoutChange, previewUrl]);
+
   const extBadge = formatFileExtensionBadge(transfer.fileName);
   const showProgressBar =
     transfer.status === "downloading" ||
@@ -115,6 +123,7 @@ export function FileMessageCard({
             alt={transfer.fileName}
             className="msg-file-preview-img"
             loading="lazy"
+            onLoad={() => onMediaLayoutChange?.()}
           />
         </button>
       ) : null}

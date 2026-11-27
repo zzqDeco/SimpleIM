@@ -203,11 +203,16 @@ export function usePromptComposer({
     try {
       if (trimmed.length > 0) {
         await onSendMessage(trimmed, replyId);
-        if (roomKeyRef.current === sendRoomKey) {
-          draftRef.current = "";
-          setDraftState("");
-          if (sendRoomKey) {
+        if (sendRoomKey) {
+          const cached = draftsByRoomRef.current.get(sendRoomKey);
+          if (cached !== undefined && cached.trim() === trimmed) {
             draftsByRoomRef.current.delete(sendRoomKey);
+          }
+        }
+        if (roomKeyRef.current === sendRoomKey) {
+          if (draftRef.current.trim() === trimmed) {
+            draftRef.current = "";
+            setDraftState("");
           }
           setReplyTarget(null);
         } else {

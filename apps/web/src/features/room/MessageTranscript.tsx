@@ -480,6 +480,14 @@ export function MessageTranscript({
     [toggleExpandedItem],
   );
 
+  const handleMediaLayoutChange = useCallback((): void => {
+    const el = streamRef.current;
+    if (!el || !isNearBottomRef.current) {
+      return;
+    }
+    setProgrammaticScrollTop(el, el.scrollHeight);
+  }, [setProgrammaticScrollTop]);
+
   const handleOpenLightbox = useCallback(
     (imageUrl: string, manifest: FileManifest): void => {
       setLightbox({ imageUrl, manifest });
@@ -660,6 +668,7 @@ export function MessageTranscript({
                         onSaveFile={onSaveFile}
                         onReadFileBlob={onReadFileBlob}
                         onOpenLightbox={handleOpenLightbox}
+                        onMediaLayoutChange={handleMediaLayoutChange}
                         onActionError={onActionError}
                       />
                     </div>
