@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -757,6 +757,32 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
         locale: "en",
         theme: "system",
       });
+
+      // 5. Verify dev-only preview page is strictly excluded from production apps/web/dist/
+      const webDistDir = resolve(import.meta.dirname, "../apps/web/dist");
+      const collectDistFiles = (dir: string): string[] => {
+        const files: string[] = [];
+        for (const entry of readdirSync(dir)) {
+          const full = resolve(dir, entry);
+          if (statSync(full).isDirectory()) {
+            files.push(...collectDistFiles(full));
+          } else {
+            files.push(full);
+          }
+        }
+        return files;
+      };
+      const distFiles = collectDistFiles(webDistDir);
+      expect(
+        distFiles.filter((f) => /preview/i.test(f)),
+        "Production dist/ must not include dev-only preview artifacts",
+      ).toEqual([]);
+      for (const f of distFiles) {
+        if (/\.(html|js|css)$/.test(f)) {
+          const content = readFileSync(f, "utf8");
+          expect(content).not.toContain("preview-section-palette");
+        }
+      }
     } finally {
       await context.close();
     }
