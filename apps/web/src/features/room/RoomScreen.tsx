@@ -256,6 +256,7 @@ export function RoomScreen({
         totalUnreadCount={totalUnreadCount}
         peerCount={peers.length}
         fileCount={files.length}
+        messageCount={messages.length}
         railOpen={railOpen}
         sidebarExpanded={isCompactViewport ? sidebarOpen : desktopSidebarOpen}
         moreMenuOpen={moreMenuOpen}

@@ -10,6 +10,10 @@ import { CredentialStore } from "../credentials.ts";
 import { FsChunkStorageAdapter } from "../fs-chunk-storage.ts";
 import { readPassphrase } from "../passphrase.ts";
 import { CliSignalingClient } from "../signaling-client.ts";
+import {
+  formatCliChatMessage,
+  sanitizeTerminalSingleLine,
+} from "../terminal-sanitize.ts";
 import { WeriftTransportFactory } from "../werift-transport.ts";
 import { requireValidCredentials, type CommandIo } from "./auth.ts";
 
@@ -159,7 +163,11 @@ export async function executeJoinInputLine(params: {
     const sent = await engine.sendChatMessage(trimmed);
     const author = sent.authorCert.payload;
     stdout.write(
-      `[${formatClock(sent.createdAt)}] @${author.username}: ${sent.body}\n`,
+      `${formatCliChatMessage({
+        clock: formatClock(sent.createdAt),
+        username: author.username,
+        body: sent.body,
+      })}\n`,
     );
     return "continue";
   }
@@ -190,7 +198,7 @@ export async function executeJoinInputLine(params: {
         for (const p of peers) {
           const rttLabel = p.rttMs !== null ? `${p.rttMs}ms` : "n/a";
           stdout.write(
-            `  - @${p.username} (${p.displayName}) [${p.clientKind}] ${p.peerId} rtt=${rttLabel}\n`,
+            `  - @${sanitizeTerminalSingleLine(p.username)} (${sanitizeTerminalSingleLine(p.displayName)}) [${sanitizeTerminalSingleLine(p.clientKind)}] ${sanitizeTerminalSingleLine(p.peerId)} rtt=${rttLabel}\n`,
           );
         }
       }
@@ -215,7 +223,7 @@ export async function executeJoinInputLine(params: {
         readChunk,
       });
       stdout.write(
-        `[file] Announced '${manifest.fileName}' (${formatHumanBytes(manifest.fileSize)}, ${manifest.totalChunks} chunks) id=${manifest.fileId}\n`,
+        `[file] Announced '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}, ${manifest.totalChunks} chunks) id=${sanitizeTerminalSingleLine(manifest.fileId)}\n`,
       );
       return "continue";
     }
@@ -243,9 +251,11 @@ export async function executeJoinInputLine(params: {
               : ` [relay:${prog.relayCacheState}]`
             : "";
         const savedPath = chunkStorage.getCompletedFilePath(f.fileId);
-        const savedSuffix = savedPath ? ` -> ${savedPath}` : "";
+        const savedSuffix = savedPath
+          ? ` -> ${sanitizeTerminalSingleLine(savedPath)}`
+          : "";
         stdout.write(
-          `  [${i + 1}] ${f.fileId}  ${f.fileName} (${formatHumanBytes(f.fileSize)}) from @${f.senderCert.payload.username} [${status}]${relaySuffix}${savedSuffix}\n`,
+          `  [${i + 1}] ${sanitizeTerminalSingleLine(f.fileId)}  ${sanitizeTerminalSingleLine(f.fileName)} (${formatHumanBytes(f.fileSize)}) from @${sanitizeTerminalSingleLine(f.senderCert.payload.username)} [${status}]${relaySuffix}${savedSuffix}\n`,
         );
       });
       return "continue";
@@ -258,14 +268,16 @@ export async function executeJoinInputLine(params: {
       }
       const target = resolveTargetManifest(engine.getFiles(), rest);
       stdout.write(
-        `[file] Starting Swarm download for '${target.fileName}' (${formatHumanBytes(target.fileSize)})...\n`,
+        `[file] Starting Swarm download for '${sanitizeTerminalSingleLine(target.fileName)}' (${formatHumanBytes(target.fileSize)})...\n`,
       );
       await engine.downloadFile(target.fileId);
       return "continue";
     }
 
     default:
-      stdout.write(`Unknown slash command '${verb}'. Type /help for commands.\n`);
+      stdout.write(
+        `Unknown slash command '${sanitizeTerminalSingleLine(verb)}'. Type /help for commands.\n`,
+      );
       return "continue";
   }
 }
@@ -341,36 +353,42 @@ export async function runJoinCommand(
         );
       },
       onPeersChange: (peers) => {
-        const names = peers.map((p) => `@${p.username}`).join(", ");
+        const names = peers
+          .map((p) => `@${sanitizeTerminalSingleLine(p.username)}`)
+          .join(", ");
         stdout.write(
           `[room] Verified peers (${peers.length}): ${names || "none"}\n`,
         );
       },
       onPeerAuthRejected: (remotePeerId, reason) => {
         stderr.write(
-          `[security] Quarantined peer ${remotePeerId} rejected (${reason})\n`,
+          `[security] Quarantined peer ${sanitizeTerminalSingleLine(remotePeerId)} rejected (${sanitizeTerminalSingleLine(reason)})\n`,
         );
       },
       onChatMessage: (msg, isSync) => {
-        const prefix = isSync ? "[sync] " : "";
         stdout.write(
-          `${prefix}[${formatClock(msg.createdAt)}] @${msg.authorCert.payload.username}: ${msg.body}\n`,
+          `${formatCliChatMessage({
+            prefix: isSync ? "[sync] " : "",
+            clock: formatClock(msg.createdAt),
+            username: msg.authorCert.payload.username,
+            body: msg.body,
+          })}\n`,
         );
       },
       onFileAnnounced: (manifest) => {
         if (manifest.senderCert.payload.peerId === peerId) return;
         stdout.write(
-          `[file] @${manifest.senderCert.payload.username} shared '${manifest.fileName}' (${formatHumanBytes(manifest.fileSize)}) — run '/get ${manifest.fileId}' or '/files'\n`,
+          `[file] @${sanitizeTerminalSingleLine(manifest.senderCert.payload.username)} shared '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}) — run '/get ${sanitizeTerminalSingleLine(manifest.fileId)}' or '/files'\n`,
         );
       },
       onTransferCompleted: (manifest) => {
         const finalPath = chunkStorage.getCompletedFilePath(manifest.fileId);
         stdout.write(
-          `[file] Completed '${manifest.fileName}' -> ${finalPath ?? cmd.downloadDir} (seeding)\n`,
+          `[file] Completed '${sanitizeTerminalSingleLine(manifest.fileName)}' -> ${sanitizeTerminalSingleLine(finalPath ?? cmd.downloadDir)} (seeding)\n`,
         );
       },
       onError: (err) => {
-        stderr.write(`[error] ${err.message}\n`);
+        stderr.write(`[error] ${sanitizeTerminalSingleLine(err.message)}\n`);
       },
     },
   });
@@ -421,7 +439,7 @@ export async function runJoinCommand(
               }
             } catch (err) {
               stderr.write(
-                `[command error] ${err instanceof Error ? err.message : String(err)}\n`,
+                `[command error] ${sanitizeTerminalSingleLine(err instanceof Error ? err.message : String(err))}\n`,
               );
             }
           })

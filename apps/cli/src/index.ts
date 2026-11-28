@@ -7,6 +7,7 @@ export * from "./werift-transport.ts";
 export * from "./fs-chunk-storage.ts";
 export * from "./seed-controller.ts";
 export * from "./logger.ts";
+export * from "./terminal-sanitize.ts";
 export * from "./commands/auth.ts";
 export * from "./commands/join.ts";
 export * from "./commands/seed.ts";

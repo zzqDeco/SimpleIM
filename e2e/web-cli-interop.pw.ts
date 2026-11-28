@@ -551,11 +551,29 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
         "Confidential Alpha message",
       );
 
-      // Leave Room inside More menu wipes active room session and returns cleanly to JoinRoomView
+      // Leave Room inside More menu requires 2-step confirmation with message count warning
       await pageA.getByTestId("room-more-menu-toggle").click();
       await pageA.getByTestId("leave-room-button").click();
+      await expect(pageA.getByTestId("leave-room-confirm-panel")).toBeVisible();
+      // Canceling leave confirmation keeps user in the room
+      await pageA.getByTestId("leave-room-cancel-button").click();
+      await expect(pageA.getByTestId("leave-room-confirm-panel")).toHaveCount(0);
+      await expect(pageA.locator(".message-stream")).toContainText(
+        "Confidential Alpha message",
+      );
+
+      // Confirming leave wipes active room session and returns cleanly to JoinRoomView
+      await pageA.getByTestId("leave-room-button").click();
+      await pageA.getByTestId("leave-room-confirm-button").click();
       await expect(pageA.getByTestId("room-passphrase")).toBeVisible();
       await expect(pageA.getByTestId("room-passphrase")).toHaveValue("");
+
+      // Lobby screen "Wipe & Sign Out" also requires 2-step confirmation (cancel keeps user on lobby)
+      await pageA.getByTestId("wipe-vault-button").click();
+      await expect(pageA.getByTestId("wipe-vault-confirm-panel")).toBeVisible();
+      await pageA.getByTestId("wipe-vault-cancel-button").click();
+      await expect(pageA.getByTestId("wipe-vault-confirm-panel")).toHaveCount(0);
+      await expect(pageA.getByTestId("room-passphrase")).toBeVisible();
     } finally {
       await contextA.close();
       await contextB.close();
