@@ -2675,17 +2675,22 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       wiredTerm.startPrompt();
       wiredIn.write(`/send ${wiredFile}\r`);
       await Bun.sleep(10);
-      wiredIn.write("123456789012345678901234567890");
+      // 30 single-cell accented characters ('é') on a 20-col TTY occupy exactly 2 rows
+      // (1 row up), NEVER 3 rows up (\x1b[3A) as a naive non-ASCII=2 estimate would emit!
+      wiredIn.write("é".repeat(30));
       await Bun.sleep(10);
       wiredBuf = "";
       releaseShare();
       await Bun.sleep(30);
+      expect(wiredBuf).toContain("\x1b[1A");
+      expect(wiredBuf).not.toContain("\x1b[2A");
+      expect(wiredBuf).not.toContain("\x1b[3A");
       expect(wiredBuf).toContain("[file] Announced 'report.pdf'");
       const afterAnnouncement = wiredBuf.slice(
         wiredBuf.indexOf("[file] Announced 'report.pdf'"),
       );
       expect(afterAnnouncement).not.toContain("\x1b[1A");
-      expect(afterAnnouncement).toContain("❯ 123456789012345678901234567890");
+      expect(afterAnnouncement).toContain(`❯ ${"é".repeat(30)}`);
     } finally {
       wiredTerm.close();
       await wiredShared.closeAll();

@@ -320,14 +320,11 @@ export function createJoinCompleter(
   };
 }
 
-function estimateVisualColumns(text: string): number {
-  let width = 0;
-  for (const ch of text) {
-    const cp = ch.codePointAt(0) ?? 0;
-    // Count CJK / fullwidth / emoji conservatively as 2 terminal cells
-    width += cp > 0x7f ? 2 : 1;
+function measureTerminalWidth(text: string): number {
+  if (typeof Bun !== "undefined" && typeof Bun.stringWidth === "function") {
+    return Bun.stringWidth(text);
   }
-  return width;
+  return Array.from(text).length;
 }
 
 export interface InteractiveJoinTerminalOptions {
@@ -488,7 +485,7 @@ export class InteractiveJoinTerminal {
       20,
       (this.stdout as TtyCapableStream).columns ?? 80,
     );
-    if (this.promptVisualWidth + estimateVisualColumns(rawLine) < cols) {
+    if (this.promptVisualWidth + measureTerminalWidth(rawLine) < cols) {
       this.outputEpoch += 1;
       this.stdout.write("\x1b[1A\r\x1b[2K");
     }
@@ -505,9 +502,10 @@ export class InteractiveJoinTerminal {
     } else {
       const prefixWidth = includePromptWidth ? this.promptVisualWidth : 0;
       const beforeCursor = this.rl.line.slice(0, this.rl.cursor);
-      cursorRow = Math.floor(
-        (prefixWidth + estimateVisualColumns(beforeCursor)) / cols,
-      );
+      const totalCells = prefixWidth + measureTerminalWidth(beforeCursor);
+      // A cursor on an exact column multiple stays in pending-wrap on the same row
+      // until the next cell is written, so subtract 1 before dividing when > 0.
+      cursorRow = totalCells > 0 ? Math.floor((totalCells - 1) / cols) : 0;
     }
     const rowsUp = Math.max(cursorRow, this.rl.prevRows ?? 0);
     if (rowsUp > 0) {
