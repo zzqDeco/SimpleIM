@@ -3,8 +3,12 @@ import type { FileManifest } from "@simpleim/contracts";
 import {
   Button,
   Byline,
+  Icon,
   NoticeBanner,
   ProgressBar,
+  Tag,
+  type IconName,
+  type TagTone,
 } from "../../design-system/index.ts";
 import { formatTransferError } from "../../i18n/error-catalog.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
@@ -27,6 +31,35 @@ export interface FileMessageCardProps {
   readonly onOpenLightbox?: (imageUrl: string, manifest: FileManifest) => void;
   readonly onMediaLayoutChange?: () => void;
   readonly onActionError?: (err: unknown) => void;
+}
+
+function transferStatusTone(status: TransferViewModel["status"]): TagTone {
+  switch (status) {
+    case "downloading":
+      return "accent";
+    case "seeding":
+      return "success";
+    case "error":
+      return "danger";
+    default:
+      return "neutral";
+  }
+}
+
+function relayBadgeProps(state: TransferViewModel["relayCacheState"]): {
+  tone: TagTone;
+  icon?: IconName;
+} {
+  switch (state) {
+    case "uploading":
+      return { tone: "accent", icon: "cloud-upload" };
+    case "cached":
+      return { tone: "success", icon: "cloud-check" };
+    case "error":
+      return { tone: "danger", icon: "triangle-alert" };
+    default:
+      return { tone: "neutral" };
+  }
 }
 
 export function FileMessageCard({
@@ -102,6 +135,7 @@ export function FileMessageCard({
   const showProgressBar =
     transfer.status === "downloading" ||
     (transfer.status === "paused" && transfer.percent > 0);
+  const relayMeta = relayBadgeProps(transfer.relayCacheState);
 
   return (
     <div
@@ -112,10 +146,10 @@ export function FileMessageCard({
       data-relay-state={transfer.relayCacheState}
     >
       {previewUrl ? (
-        <button
-          type="button"
+        <Button
+          variant="ghost"
           className="msg-file-preview-btn"
-          data-testid="msg-file-preview"
+          testId="msg-file-preview"
           aria-label={t("room.files.previewAria", { name: transfer.fileName })}
           onClick={() => onOpenLightbox?.(previewUrl, manifest)}
         >
@@ -126,12 +160,13 @@ export function FileMessageCard({
             loading="lazy"
             onLoad={() => onMediaLayoutChange?.()}
           />
-        </button>
+        </Button>
       ) : null}
 
       <div className="msg-file-header">
         <span className="msg-file-ext-badge" aria-hidden="true">
-          {extBadge}
+          <Icon name={previewEligible ? "image" : "file"} size={16} />
+          <span>{extBadge}</span>
         </span>
 
         <div className="msg-file-info">
@@ -157,11 +192,9 @@ export function FileMessageCard({
           </div>
         </div>
 
-        <span
-          className={`file-status-tag file-status-tag-${transfer.status}`}
-        >
+        <Tag tone={transferStatusTone(transfer.status)}>
           {t(transfer.statusKey)}
-        </span>
+        </Tag>
       </div>
 
       {showProgressBar ? (
@@ -175,12 +208,14 @@ export function FileMessageCard({
       ) : null}
 
       {transfer.relayBadgeKey ? (
-        <div
-          className={`file-relay-badge file-relay-badge-${transfer.relayCacheState}`}
-          data-testid="msg-file-relay-badge"
+        <Tag
+          tone={relayMeta.tone}
+          icon={relayMeta.icon}
+          testId="msg-file-relay-badge"
+          className="file-relay-tag"
         >
           {t(transfer.relayBadgeKey, { percent: transfer.relayCachePercent })}
-        </div>
+        </Tag>
       ) : null}
 
       {transfer.errorMessage ? (
@@ -195,6 +230,7 @@ export function FileMessageCard({
             <Button
               variant="primary"
               size="sm"
+              leadingIcon="download"
               testId="msg-file-download-button"
               onClick={() => {
                 void onDownloadFile(manifest.fileId).catch((err) => {
@@ -212,6 +248,7 @@ export function FileMessageCard({
             <Button
               variant="danger"
               size="sm"
+              leadingIcon="x"
               testId="msg-file-cancel-button"
               onClick={() => {
                 void onCancelDownload(manifest.fileId).catch((err) => {
@@ -227,6 +264,7 @@ export function FileMessageCard({
             <Button
               variant="secondary"
               size="sm"
+              leadingIcon="hard-drive-download"
               testId="msg-file-save-button"
               onClick={() => {
                 void onSaveFile(manifest).catch((err) => {

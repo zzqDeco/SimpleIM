@@ -568,12 +568,68 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       await expect(pageA.getByTestId("room-passphrase")).toBeVisible();
       await expect(pageA.getByTestId("room-passphrase")).toHaveValue("");
 
-      // Lobby screen "Wipe & Sign Out" also requires 2-step confirmation (cancel keeps user on lobby)
+      // Lobby screen "Wipe & Sign Out" inside unified AccountMenu requires 2-step confirmation
+      await pageA.getByTestId("account-menu-toggle").click();
       await pageA.getByTestId("wipe-vault-button").click();
       await expect(pageA.getByTestId("wipe-vault-confirm-panel")).toBeVisible();
       await pageA.getByTestId("wipe-vault-cancel-button").click();
       await expect(pageA.getByTestId("wipe-vault-confirm-panel")).toHaveCount(0);
       await expect(pageA.getByTestId("room-passphrase")).toBeVisible();
+
+      // Audit Lobby topbar single-row & <= 10% viewport height across key viewports,
+      // plus 844x390 landscape card fit and zero color emojis in DOM.
+      await pageA.keyboard.press("Escape");
+      for (const vp of [
+        { name: "320x568", width: 320, height: 568 },
+        { name: "390x844", width: 390, height: 844 },
+        { name: "844x390", width: 844, height: 390 },
+        { name: "1280x720", width: 1280, height: 720 },
+      ]) {
+        await pageA.setViewportSize({ width: vp.width, height: vp.height });
+        await pageA.waitForTimeout(120);
+        const lobbyAudit = await pageA.evaluate(() => {
+          const topBar = document.querySelector(".top-bar") as HTMLElement;
+          const topBarRect = topBar.getBoundingClientRect();
+          const controls = Array.from(
+            topBar.querySelectorAll<HTMLElement>("button, .brand-prompt"),
+          ).filter((el) => {
+            const s = getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return s.display !== "none" && r.width > 0 && r.height > 0;
+          });
+          const centers = controls.map(
+            (el) => el.getBoundingClientRect().top + el.getBoundingClientRect().height / 2,
+          );
+          const centerSpread =
+            centers.length > 1 ? Math.max(...centers) - Math.min(...centers) : 0;
+          const box = document.querySelector(".ds-terminal-box") as HTMLElement;
+          const boxRect = box.getBoundingClientRect();
+          const emojiMatches =
+            (document.body.innerText ?? "").match(/\p{Extended_Pictographic}/gu) ??
+            [];
+          return {
+            topBarHeight: Math.round(topBarRect.height),
+            centerSpread: Math.round(centerSpread),
+            boxBottomOverflow: Math.round(boxRect.bottom - window.innerHeight),
+            emojiMatches,
+          };
+        });
+        expect(
+          lobbyAudit.topBarHeight,
+          `[Lobby ${vp.name}] topBarHeight=${lobbyAudit.topBarHeight} > 10% of ${vp.height}`,
+        ).toBeLessThanOrEqual(vp.height * 0.1);
+        expect(
+          lobbyAudit.centerSpread,
+          `[Lobby ${vp.name}] topbar controls wrapped`,
+        ).toBeLessThanOrEqual(6);
+        expect(lobbyAudit.emojiMatches).toEqual([]);
+        if (vp.name === "844x390") {
+          expect(
+            lobbyAudit.boxBottomOverflow,
+            `[Lobby 844x390] card bottom overflowed by ${lobbyAudit.boxBottomOverflow}px`,
+          ).toBeLessThanOrEqual(0);
+        }
+      }
     } finally {
       await contextA.close();
       await contextB.close();
@@ -608,7 +664,54 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       );
       expect(initialKeys).toEqual([]);
 
-      // 2. One-click theme switch: dark -> light -> system (plus live OS media query reaction)
+      // 1b. Auth topbar stays single-row and <= 10% viewport height across narrow & landscape viewports, with zero color emojis
+      for (const vp of [
+        { name: "320x568", width: 320, height: 568 },
+        { name: "390x844", width: 390, height: 844 },
+        { name: "844x390", width: 844, height: 390 },
+        { name: "1280x720", width: 1280, height: 720 },
+      ]) {
+        await page.setViewportSize({ width: vp.width, height: vp.height });
+        await page.waitForTimeout(80);
+        const authTopBar = await page.evaluate(() => {
+          const topBar = document.querySelector(".top-bar") as HTMLElement;
+          const rect = topBar.getBoundingClientRect();
+          const controls = Array.from(
+            topBar.querySelectorAll<HTMLElement>("button, .brand-prompt"),
+          ).filter((el) => {
+            const s = getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return s.display !== "none" && r.width > 0 && r.height > 0;
+          });
+          const centers = controls.map(
+            (el) => el.getBoundingClientRect().top + el.getBoundingClientRect().height / 2,
+          );
+          const centerSpread =
+            centers.length > 1 ? Math.max(...centers) - Math.min(...centers) : 0;
+          const emojiMatches =
+            (document.body.innerText ?? "").match(/\p{Extended_Pictographic}/gu) ??
+            [];
+          return {
+            topBarHeight: Math.round(rect.height),
+            centerSpread: Math.round(centerSpread),
+            emojiMatches,
+          };
+        });
+        expect(
+          authTopBar.topBarHeight,
+          `[Auth ${vp.name}] topBarHeight=${authTopBar.topBarHeight} > 10% of ${vp.height}`,
+        ).toBeLessThanOrEqual(vp.height * 0.1);
+        expect(
+          authTopBar.centerSpread,
+          `[Auth ${vp.name}] topbar wrapped`,
+        ).toBeLessThanOrEqual(6);
+        expect(authTopBar.emojiMatches).toEqual([]);
+      }
+
+      // 2. Open unified AccountMenu and switch theme: dark -> light -> system (plus live OS media query reaction)
+      await page.getByTestId("account-menu-toggle").click();
+      await expect(page.getByTestId("account-menu")).toBeVisible();
+
       await page.getByTestId("theme-mode-dark").click();
       await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 
@@ -1114,7 +1217,7 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       "spawnCliPeer",
       {
         username: "mobile_cli_peer",
-        displayName: "Mobile CLI Peer",
+        displayName: "MobileCLILongDisplayNameThirty2!",
         password: "Password-MobileCli-123!",
         passphrase,
       },
@@ -1175,13 +1278,104 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       });
       expect(initialLayout.shellScrollTop).toBe(0);
       expect(initialLayout.shellHeight).toBeLessThanOrEqual(844);
-      expect(initialLayout.topBarHeight).toBeLessThan(150);
+      expect(initialLayout.topBarHeight).toBeLessThanOrEqual(52);
       expect(initialLayout.streamScrollH).toBeGreaterThan(
         initialLayout.streamClientH + 400,
       );
       expect(initialLayout.streamScrollTop).toBeGreaterThan(200);
       expect(initialLayout.streamMinHeight).toBe("0px");
       expect(initialLayout.inputFontSize).toBe("16px");
+
+      // Issue #41 touch hit-target (>= 44x44) & zero color emoji audit on mobile touch context
+      const touchAudit = await page.evaluate(() => {
+        const parsePx = (v: string): number => {
+          const n = Number.parseFloat(v);
+          return Number.isFinite(n) ? n : 0;
+        };
+        const measureHitTarget = (btn: HTMLElement) => {
+          const r = btn.getBoundingClientRect();
+          const after = getComputedStyle(btn, "::after");
+          const hasAfter =
+            after.content !== "none" && after.position === "absolute";
+          const expandTop = hasAfter ? Math.max(0, -parsePx(after.top)) : 0;
+          const expandBottom = hasAfter
+            ? Math.max(0, -parsePx(after.bottom))
+            : 0;
+          const expandLeft = hasAfter ? Math.max(0, -parsePx(after.left)) : 0;
+          const expandRight = hasAfter ? Math.max(0, -parsePx(after.right)) : 0;
+          return {
+            testId: btn.getAttribute("data-testid") ?? btn.className,
+            visualW: Math.round(r.width),
+            visualH: Math.round(r.height),
+            hitW: Math.round(r.width + expandLeft + expandRight),
+            hitH: Math.round(r.height + expandTop + expandBottom),
+          };
+        };
+
+        const targetButtons = Array.from(
+          document.querySelectorAll<HTMLElement>(
+            ".top-bar button, .composer-dock button",
+          ),
+        ).filter((el) => {
+          const s = getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          return s.display !== "none" && r.width > 0 && r.height > 0;
+        });
+
+        const msgHeader = document.querySelector(
+          ".msg-entry:not(.msg-entry-compact) .msg-header",
+        ) as HTMLElement | null;
+        let replyOnSameRow = true;
+        if (msgHeader) {
+          const author = msgHeader.querySelector(
+            ".msg-author-line",
+          ) as HTMLElement | null;
+          const reply = msgHeader.querySelector(
+            ".msg-reply-trigger",
+          ) as HTMLElement | null;
+          if (author && reply) {
+            const ar = author.getBoundingClientRect();
+            const rr = reply.getBoundingClientRect();
+            const authorCenterY = ar.top + ar.height / 2;
+            const replyCenterY = rr.top + rr.height / 2;
+            replyOnSameRow = Math.abs(authorCenterY - replyCenterY) <= 8;
+          }
+        }
+
+        const emojiMatches =
+          (document.body.innerText ?? "").match(/\p{Extended_Pictographic}/gu) ??
+          [];
+
+        return {
+          coarseMatches: window.matchMedia("(pointer: coarse)").matches,
+          buttons: targetButtons.map(measureHitTarget),
+          replyOnSameRow,
+          emojiMatches,
+        };
+      });
+
+      expect(touchAudit.coarseMatches).toBe(true);
+      expect(touchAudit.buttons.length).toBeGreaterThanOrEqual(5);
+      for (const b of touchAudit.buttons) {
+        expect(
+          b.visualW,
+          `[touch ${b.testId}] visualW=${b.visualW} < 40`,
+        ).toBeGreaterThanOrEqual(40);
+        expect(
+          b.visualH,
+          `[touch ${b.testId}] visualH=${b.visualH} < 40`,
+        ).toBeGreaterThanOrEqual(40);
+        expect(
+          b.hitW,
+          `[touch ${b.testId}] hitW=${b.hitW} < 44`,
+        ).toBeGreaterThanOrEqual(44);
+        expect(
+          b.hitH,
+          `[touch ${b.testId}] hitH=${b.hitH} < 44`,
+        ).toBeGreaterThanOrEqual(44);
+      }
+      expect(touchAudit.replyOnSameRow).toBe(true);
+      expect(touchAudit.emojiMatches).toEqual([]);
 
       // Scroll all the way up to message #1 inside .message-stream
       await page.evaluate(() => {

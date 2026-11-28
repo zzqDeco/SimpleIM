@@ -98,7 +98,7 @@ export const en = {
   "room.composer.removeStagedAria": "Remove attachment {name}",
   "room.composer.pasteHint": "Paste image or file",
   "room.msg.delivery.pending": "Sending…",
-  "room.msg.delivery.relayed": "✓ Cached",
+  "room.msg.delivery.relayed": "Cached",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "Retry",
   "room.jumpToLatest": "Latest",
@@ -127,8 +127,8 @@ export const en = {
   "room.files.previewAria": "Preview image {name}",
   "room.files.lightboxClose": "Close preview",
   "room.files.relay.uploading":
-    "☁️ Caching encrypted {percent}% (safe to close once done)",
-  "room.files.relay.cached": "☁️ Cached encrypted (24h offline ready)",
+    "Caching encrypted {percent}% (safe to close once done)",
+  "room.files.relay.cached": "Cached encrypted (24h offline ready)",
   "room.files.relay.tooLarge": "> 100 MB · Online P2P only",
   "room.files.relay.error": "Relay cache unavailable · Online P2P only",
 

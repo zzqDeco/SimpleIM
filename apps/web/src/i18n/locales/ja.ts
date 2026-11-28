@@ -98,7 +98,7 @@ export const ja = {
   "room.composer.removeStagedAria": "添付ファイル {name} を削除",
   "room.composer.pasteHint": "画像・ファイル貼付可",
   "room.msg.delivery.pending": "送信中…",
-  "room.msg.delivery.relayed": "✓ 一時保存済",
+  "room.msg.delivery.relayed": "一時保存済",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "再試行",
   "room.jumpToLatest": "最新へ",
@@ -127,8 +127,8 @@ export const ja = {
   "room.files.previewAria": "画像 {name} を拡大表示",
   "room.files.lightboxClose": "プレビューを閉じる",
   "room.files.relay.uploading":
-    "☁️ 暗号化一時キャッシュ中 {percent}%（完了後は画面を閉じても取得可）",
-  "room.files.relay.cached": "☁️ 暗号化キャッシュ済（24h オフライン取得可）",
+    "暗号化一時キャッシュ中 {percent}%（完了後は画面を閉じても取得可）",
+  "room.files.relay.cached": "暗号化キャッシュ済（24h オフライン取得可）",
   "room.files.relay.tooLarge": "100 MB 超 · オンライン P2P のみ",
   "room.files.relay.error": "一時キャッシュ未完了 · オンライン P2P のみ",
 

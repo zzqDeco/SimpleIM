@@ -17,7 +17,7 @@ import {
   validateAuthInput,
   type AuthMode,
 } from "../../state/validation.ts";
-import { PreferenceControls } from "../preferences/PreferenceControls.tsx";
+import { AppTopBar } from "../shell/AppTopBar.tsx";
 
 export interface AuthScreenProps {
   readonly onLogin: (params: {
@@ -90,15 +90,7 @@ export function AuthScreen({
 
   return (
     <div className="screen-shell">
-      <header className="top-bar">
-        <div className="brand-prompt">
-          <span className="brand-prompt-sigil" aria-hidden="true">
-            ❯
-          </span>
-          <span>{t("app.title")}</span>
-        </div>
-        <PreferenceControls />
-      </header>
+      <AppTopBar />
 
       <main className="centered-stage">
         <div className="dialog-column">
@@ -196,6 +188,8 @@ export function AuthScreen({
                 <Button
                   type="submit"
                   variant="primary"
+                  block
+                  loading={submitting}
                   testId="auth-submit"
                   disabled={submitting}
                 >

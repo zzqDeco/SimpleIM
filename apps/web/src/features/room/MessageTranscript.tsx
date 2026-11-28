@@ -13,7 +13,16 @@ import type {
   ChatDeliveryStatus,
   SwarmTransferProgress,
 } from "@simpleim/peer-core";
-import { Byline, StatusIcon, Subline } from "../../design-system/index.ts";
+import {
+  BrandMark,
+  Button,
+  Byline,
+  StatusDot,
+  Subline,
+  Tag,
+  Toast,
+  ToastRegion,
+} from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import {
   truncatePreview,
@@ -129,7 +138,6 @@ export function MessageTranscript({
   const programmaticScrollTopRef = useRef<number | null>(null);
   const hideDatePillTimerRef = useRef<number | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
-  const toastTimerRef = useRef<number | null>(null);
   const liveAnnounceTimerRef = useRef<number | null>(null);
   const liveAnnounceSeqRef = useRef(0);
 
@@ -139,7 +147,10 @@ export function MessageTranscript({
   const [highlightedItemKey, setHighlightedItemKey] = useState<string | null>(
     null,
   );
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastState, setToastState] = useState<{
+    readonly seq: number;
+    readonly message: string;
+  } | null>(null);
   const [liveAnnouncement, setLiveAnnouncement] = useState<{
     readonly seq: number;
     readonly text: string;
@@ -190,13 +201,6 @@ export function MessageTranscript({
     }
   }, []);
 
-  const clearToastTimer = useCallback((): void => {
-    if (toastTimerRef.current !== null) {
-      window.clearTimeout(toastTimerRef.current);
-      toastTimerRef.current = null;
-    }
-  }, []);
-
   const clearLiveAnnounceTimer = useCallback((): void => {
     if (liveAnnounceTimerRef.current !== null) {
       window.clearTimeout(liveAnnounceTimerRef.current);
@@ -208,14 +212,12 @@ export function MessageTranscript({
     return () => {
       clearHideDatePillTimer();
       clearHighlightTimer();
-      clearToastTimer();
       clearLiveAnnounceTimer();
     };
   }, [
     clearHideDatePillTimer,
     clearHighlightTimer,
     clearLiveAnnounceTimer,
-    clearToastTimer,
   ]);
 
   // Close lightbox automatically if the referenced file is no longer in the active room.
@@ -420,13 +422,12 @@ export function MessageTranscript({
     if (roomChanged) {
       setExpandedItemKey(null);
       setHighlightedItemKey(null);
-      setToastMessage(null);
+      setToastState(null);
       clearLiveAnnounceTimer();
       setLiveAnnouncement({ seq: 0, text: "" });
       setLightbox(null);
       clearHideDatePillTimer();
       clearHighlightTimer();
-      clearToastTimer();
       setFloatingDateVisible(false);
       setFloatingDateCreatedAt(null);
     }
@@ -483,7 +484,6 @@ export function MessageTranscript({
     clearHideDatePillTimer,
     clearHighlightTimer,
     clearLiveAnnounceTimer,
-    clearToastTimer,
     latestItem,
     latestItemIsSelf,
     latestItemKey,
@@ -563,19 +563,21 @@ export function MessageTranscript({
     setProgrammaticScrollTop(el, el.scrollHeight);
   }, [setProgrammaticScrollTop]);
 
+  const dismissToast = useCallback((): void => {
+    setToastState(null);
+  }, []);
+
   const handleQuoteJump = useCallback(
     (replyToMsgId: string): void => {
       const found = scrollToItemKey(`msg:${replyToMsgId}`);
       if (!found) {
-        clearToastTimer();
-        setToastMessage(t("room.quoteUnavailable"));
-        toastTimerRef.current = window.setTimeout(() => {
-          toastTimerRef.current = null;
-          setToastMessage(null);
-        }, TRANSCRIPT_TOAST_DURATION_MS);
+        setToastState((prev) => ({
+          seq: (prev?.seq ?? 0) + 1,
+          message: t("room.quoteUnavailable"),
+        }));
       }
     },
-    [clearToastTimer, scrollToItemKey, t],
+    [scrollToItemKey, t],
   );
 
   const handleOpenLightbox = useCallback(
@@ -601,23 +603,34 @@ export function MessageTranscript({
     }
     if (vm.deliveryStatus === "failed" && onRetryMessage) {
       return (
-        <button
-          type="button"
-          className="msg-delivery-tag msg-delivery-failed"
-          data-testid="msg-retry-button"
+        <Tag
+          tone="danger"
+          icon="rotate-ccw"
+          testId="msg-retry-button"
           onClick={() => onRetryMessage(vm.msgId)}
         >
           {t(vm.deliveryLabelKey)}
-        </button>
+        </Tag>
       );
     }
+    const tone =
+      vm.deliveryStatus === "pending"
+        ? "accent"
+        : vm.deliveryStatus === "relayed"
+          ? "success"
+          : vm.deliveryStatus === "failed"
+            ? "danger"
+            : "neutral";
+    const icon =
+      vm.deliveryStatus === "relayed"
+        ? "check"
+        : vm.deliveryStatus === "failed"
+          ? "triangle-alert"
+          : undefined;
     return (
-      <span
-        className={`msg-delivery-tag msg-delivery-${vm.deliveryStatus}`}
-        data-testid="msg-delivery-status"
-      >
+      <Tag tone={tone} icon={icon} testId="msg-delivery-status">
         {t(vm.deliveryLabelKey)}
-      </span>
+      </Tag>
     );
   };
 
@@ -708,19 +721,14 @@ export function MessageTranscript({
                       <div className="msg-author-line">
                         {item.isSelf ? (
                           <>
-                            <span
-                              className="msg-sigil-self"
-                              aria-hidden="true"
-                            >
-                              ❯
-                            </span>
+                            <BrandMark className="msg-sigil-self" />
                             <span className="msg-author-name">
                               {t("room.you")}
                             </span>
                           </>
                         ) : (
                           <>
-                            <StatusIcon
+                            <StatusDot
                               status={
                                 onlinePeerUserIds?.has(
                                   item.manifest.senderCert.payload.userId,
@@ -738,19 +746,18 @@ export function MessageTranscript({
                         <span className="msg-author-meta">
                           <Byline>
                             <span>@{item.authorUsername}</span>
-                            <span className="msg-runtime-tag">
-                              {item.runtimeTag}
-                            </span>
+                            <Tag tone="neutral">{item.runtimeTag}</Tag>
                           </Byline>
                         </span>
                       </div>
 
                       <div className="msg-tools">
                         {!isExpanded ? (
-                          <button
-                            type="button"
+                          <Button
+                            variant="ghost"
+                            size="sm"
                             className="msg-time-toggle msg-header-time-toggle"
-                            data-testid="msg-time-toggle"
+                            testId="msg-time-toggle"
                             aria-expanded={false}
                             aria-label={toggleTimeAria}
                             title={item.formattedDateTime}
@@ -759,7 +766,7 @@ export function MessageTranscript({
                             <time dateTime={item.createdAtIso}>
                               {item.formattedTime}
                             </time>
-                          </button>
+                          </Button>
                         ) : null}
                       </div>
                     </div>
@@ -783,10 +790,11 @@ export function MessageTranscript({
                         className="msg-time-drawer"
                         data-testid="msg-time-drawer"
                       >
-                        <button
-                          type="button"
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           className="msg-time-drawer-btn"
-                          data-testid="msg-time-toggle"
+                          testId="msg-time-toggle"
                           aria-expanded={true}
                           aria-label={toggleTimeAria}
                           onClick={() => toggleExpandedItem(item.itemKey)}
@@ -794,7 +802,7 @@ export function MessageTranscript({
                           <time dateTime={item.createdAtIso}>
                             {item.formattedDateTime}
                           </time>
-                        </button>
+                        </Button>
                       </div>
                     ) : null}
                   </article>
@@ -853,10 +861,11 @@ export function MessageTranscript({
                           className="msg-compact-hover-bar"
                           data-testid="msg-compact-hover-bar"
                         >
-                          <button
-                            type="button"
+                          <Button
+                            variant="ghost"
+                            size="sm"
                             className="msg-time-toggle"
-                            data-testid="msg-time-toggle"
+                            testId="msg-time-toggle"
                             aria-expanded={false}
                             aria-label={toggleTimeAria}
                             title={vm.formattedDateTime}
@@ -865,14 +874,16 @@ export function MessageTranscript({
                             <time dateTime={vm.createdAtIso}>
                               {vm.formattedTime}
                             </time>
-                          </button>
-                          <button
-                            type="button"
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            leadingIcon="reply"
                             className="msg-reply-trigger"
                             onClick={() => onReply(vm.envelope)}
                           >
                             {t("room.reply")}
-                          </button>
+                          </Button>
                         </div>
                       ) : null}
 
@@ -893,19 +904,14 @@ export function MessageTranscript({
                         <div className="msg-author-line">
                           {vm.isSelf ? (
                             <>
-                              <span
-                                className="msg-sigil-self"
-                                aria-hidden="true"
-                              >
-                                ❯
-                              </span>
+                              <BrandMark className="msg-sigil-self" />
                               <span className="msg-author-name">
                                 {t("room.you")}
                               </span>
                             </>
                           ) : (
                             <>
-                              <StatusIcon
+                              <StatusDot
                                 status={
                                   onlinePeerUserIds?.has(
                                     vm.envelope.authorCert.payload.userId,
@@ -923,9 +929,7 @@ export function MessageTranscript({
                           <span className="msg-author-meta">
                             <Byline>
                               <span>@{vm.authorUsername}</span>
-                              <span className="msg-runtime-tag">
-                                {vm.runtimeTag}
-                              </span>
+                              <Tag tone="neutral">{vm.runtimeTag}</Tag>
                             </Byline>
                           </span>
                         </div>
@@ -933,10 +937,11 @@ export function MessageTranscript({
                         <div className="msg-tools">
                           {deliveryBadge}
                           {!isExpanded ? (
-                            <button
-                              type="button"
+                            <Button
+                              variant="ghost"
+                              size="sm"
                               className="msg-time-toggle msg-header-time-toggle"
-                              data-testid="msg-time-toggle"
+                              testId="msg-time-toggle"
                               aria-expanded={false}
                               aria-label={toggleTimeAria}
                               title={vm.formattedDateTime}
@@ -945,23 +950,26 @@ export function MessageTranscript({
                               <time dateTime={vm.createdAtIso}>
                                 {vm.formattedTime}
                               </time>
-                            </button>
+                            </Button>
                           ) : null}
-                          <button
-                            type="button"
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            leadingIcon="reply"
                             className="msg-reply-trigger"
                             onClick={() => onReply(vm.envelope)}
                           >
                             {t("room.reply")}
-                          </button>
+                          </Button>
                         </div>
                       </div>
 
                       {vm.quote ? (
-                        <button
-                          type="button"
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           className="msg-quote-jump-btn"
-                          data-testid="msg-quote-jump"
+                          testId="msg-quote-jump"
                           aria-label={t("room.quoteJumpAria")}
                           onClick={() => handleQuoteJump(vm.quote!.replyToMsgId)}
                         >
@@ -972,7 +980,7 @@ export function MessageTranscript({
                             </span>
                             <span>{vm.quote.previewText}</span>
                           </Subline>
-                        </button>
+                        </Button>
                       ) : null}
 
                       <div className="msg-body">
@@ -986,10 +994,11 @@ export function MessageTranscript({
                       className="msg-time-drawer"
                       data-testid="msg-time-drawer"
                     >
-                      <button
-                        type="button"
+                      <Button
+                        variant="ghost"
+                        size="sm"
                         className="msg-time-drawer-btn"
-                        data-testid="msg-time-toggle"
+                        testId="msg-time-toggle"
                         aria-expanded={true}
                         aria-label={toggleTimeAria}
                         onClick={() => toggleExpandedItem(item.itemKey)}
@@ -997,15 +1006,17 @@ export function MessageTranscript({
                         <time dateTime={vm.createdAtIso}>
                           {vm.formattedDateTime}
                         </time>
-                      </button>
+                      </Button>
                       {item.isCompact ? (
-                        <button
-                          type="button"
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          leadingIcon="reply"
                           className="msg-reply-trigger"
                           onClick={() => onReply(vm.envelope)}
                         >
                           {t("room.reply")}
-                        </button>
+                        </Button>
                       ) : null}
                     </div>
                   ) : null}
@@ -1017,26 +1028,30 @@ export function MessageTranscript({
         </div>
       </div>
 
-      {toastMessage ? (
-        <div
-          className="transcript-toast"
-          data-testid="transcript-toast"
-          role="status"
-          aria-live="polite"
-        >
-          {toastMessage}
-        </div>
+      {toastState ? (
+        <ToastRegion placement="bottom-center" className="transcript-toast-region">
+          <Toast
+            key={toastState.seq}
+            tone="info"
+            message={toastState.message}
+            durationMs={TRANSCRIPT_TOAST_DURATION_MS}
+            onDismiss={dismissToast}
+            testId="transcript-toast"
+          />
+        </ToastRegion>
       ) : null}
 
       {showJumpToLatest ? (
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="sm"
+          leadingIcon="arrow-down"
           className="jump-to-latest-btn"
-          data-testid="jump-to-latest-button"
+          testId="jump-to-latest-button"
           onClick={scrollToBottom}
         >
-          ↓ {t("room.jumpToLatest")}
-        </button>
+          {t("room.jumpToLatest")}
+        </Button>
       ) : null}
 
       {lightbox ? (
