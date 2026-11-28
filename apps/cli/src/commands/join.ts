@@ -19,6 +19,7 @@ import {
   formatCliTimestamp,
   formatEtaSeconds,
   formatShortId,
+  formatUniqueFileSelector,
   InteractiveJoinTerminal,
   parseCliFilePathInput,
 } from "../terminal-io.ts";
@@ -132,7 +133,9 @@ function resolveTargetManifest(
   selector: string,
 ): FileManifest {
   const trimmed = selector.trim();
-  if (/^\d+$/.test(trimmed)) {
+  // Short 1-based list index (no leading zero, <= 4 digits) resolves directly by position;
+  // 8-char numeric-only UUIDv7 tails (e.g. "00000001" or "12345678") fall through to ID matching.
+  if (/^[1-9]\d{0,3}$/.test(trimmed)) {
     const idx = Number.parseInt(trimmed, 10);
     const byIndex = files[idx - 1];
     if (!byIndex) {
@@ -146,13 +149,15 @@ function resolveTargetManifest(
   const exact = files.find((f) => f.fileId === trimmed);
   if (exact) return exact;
 
-  const prefixMatches = files.filter((f) => f.fileId.startsWith(trimmed));
-  if (prefixMatches.length === 1 && prefixMatches[0]) {
-    return prefixMatches[0];
+  const idMatches = files.filter(
+    (f) => f.fileId.startsWith(trimmed) || f.fileId.endsWith(trimmed),
+  );
+  if (idMatches.length === 1 && idMatches[0]) {
+    return idMatches[0];
   }
-  if (prefixMatches.length > 1) {
+  if (idMatches.length > 1) {
     throw new Error(
-      `Ambiguous fileId prefix '${sanitizeTerminalSingleLine(trimmed)}'; run /files for IDs`,
+      `Ambiguous fileId '${sanitizeTerminalSingleLine(trimmed)}'; run /files for unique IDs or indices`,
     );
   }
   throw new Error(
@@ -174,17 +179,19 @@ function resolveTargetMessage(
   const cleanSelector = trimmed.startsWith("#") ? trimmed.slice(1) : trimmed;
   const exact = messages.find((m) => m.msgId === cleanSelector);
   if (exact) return exact;
-  const matches = messages.filter((m) => m.msgId.startsWith(cleanSelector));
+  const matches = messages.filter(
+    (m) => m.msgId.startsWith(cleanSelector) || m.msgId.endsWith(cleanSelector),
+  );
   if (matches.length === 1 && matches[0]) {
     return matches[0];
   }
   if (matches.length > 1) {
     throw new Error(
-      `Ambiguous message ID prefix '${sanitizeTerminalSingleLine(trimmed)}'`,
+      `Ambiguous message ID '${sanitizeTerminalSingleLine(trimmed)}'`,
     );
   }
   throw new Error(
-    `Unknown message '${sanitizeTerminalSingleLine(trimmed)}' (use a msgId prefix or 'last')`,
+    `Unknown message '${sanitizeTerminalSingleLine(trimmed)}' (use a msgId prefix/suffix or 'last')`,
   );
 }
 
@@ -241,10 +248,11 @@ export class JoinTransferProgressTracker {
   consume(
     progress: SwarmTransferProgress,
     nowMs: number = Date.now(),
+    allFileIds: readonly string[] = [],
   ): string[] {
     const lines: string[] = [];
     const safeName = sanitizeTerminalSingleLine(progress.fileName);
-    const shortId = formatShortId(progress.fileId, 8);
+    const shortId = formatUniqueFileSelector(progress.fileId, allFileIds, 8);
     const prev = this.states.get(progress.fileId);
 
     const downloadPct =
@@ -505,8 +513,9 @@ export async function executeJoinInputLine(params: {
           mimeType: manifest.mimeType,
         });
       } else {
+        const allIds = engine.getFiles().map((f) => f.fileId);
         stdout.write(
-          `[file] Announced '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}, ${manifest.totalChunks} chunks) id=${formatShortId(manifest.fileId, 8)}\n`,
+          `[file] Announced '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}, ${manifest.totalChunks} chunks) id=${formatUniqueFileSelector(manifest.fileId, allIds, 8)}\n`,
         );
       }
       return "continue";
@@ -539,6 +548,7 @@ export async function executeJoinInputLine(params: {
         stdout.write("No files announced in this room yet.\n");
         return "continue";
       }
+      const allIds = files.map((f) => f.fileId);
       stdout.write(`Room files (${files.length}):\n`);
       files.forEach((f, i) => {
         const prog = engine.getTransferProgress(f.fileId);
@@ -560,7 +570,7 @@ export async function executeJoinInputLine(params: {
           ? ` -> ${sanitizeTerminalSingleLine(savedPath)}`
           : "";
         stdout.write(
-          `  [${i + 1}] ${formatShortId(f.fileId, 8)}  ${sanitizeTerminalSingleLine(f.fileName)} (${formatHumanBytes(f.fileSize)}) from @${sanitizeTerminalSingleLine(f.senderCert.payload.username)} [${status}]${relaySuffix}${savedSuffix}\n`,
+          `  [${i + 1}] ${formatUniqueFileSelector(f.fileId, allIds, 8)}  ${sanitizeTerminalSingleLine(f.fileName)} (${formatHumanBytes(f.fileSize)}) from @${sanitizeTerminalSingleLine(f.senderCert.payload.username)} [${status}]${relaySuffix}${savedSuffix}\n`,
         );
       });
       return "continue";
@@ -610,8 +620,9 @@ export async function executeJoinInputLine(params: {
           fileName: target.fileName,
         });
       } else {
+        const allIds = engine.getFiles().map((f) => f.fileId);
         stdout.write(
-          `[file] Cancelled download for '${sanitizeTerminalSingleLine(target.fileName)}' (id=${formatShortId(target.fileId, 8)})\n`,
+          `[file] Cancelled download for '${sanitizeTerminalSingleLine(target.fileName)}' (id=${formatUniqueFileSelector(target.fileId, allIds, 8)})\n`,
         );
       }
       return "continue";
@@ -901,8 +912,10 @@ export async function runJoinCommand(
           });
           return;
         }
+        const allIds = engine.getFiles().map((f) => f.fileId);
+        const selector = formatUniqueFileSelector(manifest.fileId, allIds, 8);
         writeAsync(
-          `[file] @${sanitizeTerminalSingleLine(manifest.senderCert.payload.username)} shared '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}) — run '/get ${formatShortId(manifest.fileId, 8)}' or '/files'`,
+          `[file] @${sanitizeTerminalSingleLine(manifest.senderCert.payload.username)} shared '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}) — run '/get ${selector}' or '/files'`,
         );
       },
       onTransferProgress: (progress) => {
@@ -934,7 +947,11 @@ export async function runJoinCommand(
           });
           return;
         }
-        const updates = progressTracker.consume(progress);
+        const updates = progressTracker.consume(
+          progress,
+          Date.now(),
+          engine.getFiles().map((f) => f.fileId),
+        );
         for (const line of updates) {
           writeAsync(line);
         }

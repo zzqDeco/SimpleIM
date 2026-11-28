@@ -52,6 +52,7 @@ import {
   formatRenderedChatEvent,
   formatSeedQuotaHumanEvent,
   formatShortId,
+  formatUniqueFileSelector,
   InteractiveJoinTerminal,
   JoinTransferProgressTracker,
   parseCliFilePathInput,
@@ -2363,13 +2364,14 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     terminal.writeAsyncLine("[12:00:01] @bob: incoming ping!");
     await Bun.sleep(15);
 
-    expect(capturedOut).toContain("\r\x1b[2K[12:00:01] @bob: incoming ping!\n");
+    expect(capturedOut).toContain("[12:00:01] @bob: incoming ping!\n");
     // Prompt and buffered input were restored right after the incoming message
     const afterIncoming = capturedOut.slice(
       capturedOut.indexOf("incoming ping!\n") + "incoming ping!\n".length,
     );
     expect(afterIncoming).toContain("❯ ");
     expect(afterIncoming).toContain("hello wo");
+    expect(afterIncoming).not.toContain("\x1b[1A");
 
     // User finishes typing "rld" and presses Enter -> exact intact message submitted!
     ttyIn.write("rld\r");
@@ -2388,15 +2390,102 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     expect(exited).toBe(true);
     terminal.close();
 
-    // Tab completer completes slash commands and announced fileId prefixes
-    const completer = createJoinCompleter(() => [sampleManifest]);
+    // Tab completer completes slash commands and unambiguous fileId selectors
+    const secondSameBucketManifest = await createSignedManifestFixture({
+      roomId: "f".repeat(64),
+      fileName: "report-2.pdf",
+      bytes: new TextEncoder().encode("pdf2"),
+      fileId: "019a7777-0000-7000-8000-000000000002",
+    });
+    const completer = createJoinCompleter(() => [
+      sampleManifest,
+      secondSameBucketManifest,
+    ]);
     expect(completer("/pe")[0]).toEqual(["/peers"]);
     expect(completer("/ca")[0]).toEqual(["/cancel "]);
-    expect(completer("/get 019a")[0]).toEqual([
-      "/get 019a7777",
-      "/get 019a7777-0000-7000-8000-000000000001",
+    expect(completer("/get 0000000")[0]).toEqual([
+      "/get 00000001",
+      "/get 00000002",
     ]);
     expect(completer("/cancel 1")[0]).toEqual(["/cancel 1"]);
+
+    // Wrapped multi-row input (20-col TTY, 30 typed chars): async incoming output clears all
+    // wrapped rows and resets redraw tracking so _refreshLine NEVER moves up to erase the event!
+    const narrowIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const narrowOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 20,
+    });
+    let narrowBuf = "";
+    narrowOut.on("data", (c) => {
+      narrowBuf += c.toString("utf8");
+    });
+    const narrowTerm = new InteractiveJoinTerminal({
+      stdin: narrowIn,
+      stdout: narrowOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async () => "continue",
+    });
+    narrowTerm.startPrompt();
+    narrowIn.write("123456789012345678901234567890");
+    await Bun.sleep(15);
+
+    narrowBuf = "";
+    narrowTerm.writeAsyncLine("[12:00:05] @bob: FIRST_WRAPPED");
+    const afterFirst = narrowBuf.slice(
+      narrowBuf.indexOf("FIRST_WRAPPED\n") + "FIRST_WRAPPED\n".length,
+    );
+    expect(narrowBuf).toContain("\x1b[1A");
+    expect(afterFirst).not.toContain("\x1b[1A");
+    expect(afterFirst).toContain("❯ 123456789012345678901234567890");
+
+    narrowBuf = "";
+    narrowTerm.writeAsyncLine("[12:00:06] @bob: SECOND_WRAPPED");
+    const afterSecond = narrowBuf.slice(
+      narrowBuf.indexOf("SECOND_WRAPPED\n") + "SECOND_WRAPPED\n".length,
+    );
+    expect(afterSecond).not.toContain("\x1b[1A");
+    expect(afterSecond).toContain("❯ 123456789012345678901234567890");
+    narrowTerm.close();
+
+    // Piped stdin reaching immediate EOF drains ALL queued async commands (including /quit)
+    const pipedIn = new PassThrough();
+    const drained: string[] = [];
+    let pipedExited = false;
+    let pipedEof = false;
+    let resolvePipedDone!: () => void;
+    const pipedDone = new Promise<void>((r) => {
+      resolvePipedDone = r;
+    });
+    const pipedTerm = new InteractiveJoinTerminal({
+      stdin: pipedIn,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      onLine: async (line) => {
+        await Bun.sleep(15);
+        drained.push(line);
+        return line === "/quit" ? "exit" : "continue";
+      },
+      onExit: () => {
+        pipedExited = true;
+        resolvePipedDone();
+      },
+      onInputEof: () => {
+        pipedEof = true;
+      },
+    });
+    pipedIn.end("one\ntwo\n/quit\n");
+    await pipedDone;
+    expect(drained).toEqual(["one", "two", "/quit"]);
+    expect(pipedExited).toBe(true);
+    expect(pipedEof).toBe(false);
+    pipedTerm.close();
   });
 
   test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {
@@ -2439,6 +2528,7 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
 
     const files: FileManifest[] = [];
     const messages: ChatMessageEnvelope[] = [];
+    const downloadedIds: string[] = [];
     const cancelledIds: string[] = [];
     let retryCount = 0;
 
@@ -2484,7 +2574,9 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
         files.push(m);
         return m;
       },
-      downloadFile: async () => {},
+      downloadFile: async (fileId) => {
+        downloadedIds.push(fileId);
+      },
       cancelDownload: async (fileId) => {
         cancelledIds.push(fileId);
       },
@@ -2547,6 +2639,52 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       });
       expect(cancelledIds).toEqual([files[0]!.fileId]);
       expect(humanOut).toContain("Cancelled download for 'My Report (Final).pdf'");
+
+      // Two files sharing the exact same 65-second UUIDv7 timestamp prefix get unambiguous
+      // random-tail selectors (and numeric-only tails like "00000002" resolve by ID, not list index!)
+      const sameBucketA = await createSignedManifestFixture({
+        roomId,
+        fileName: "same-minute-a.bin",
+        bytes: new TextEncoder().encode("A"),
+        fileId: "019a8888-1111-7000-8000-000000000001",
+      });
+      const sameBucketB = await createSignedManifestFixture({
+        roomId,
+        fileName: "same-minute-b.bin",
+        bytes: new TextEncoder().encode("B"),
+        fileId: "019a8888-1111-7000-8000-000000000002",
+      });
+      files.push(sameBucketA, sameBucketB);
+      const selA = formatUniqueFileSelector(
+        sameBucketA.fileId,
+        files.map((f) => f.fileId),
+      );
+      const selB = formatUniqueFileSelector(
+        sameBucketB.fileId,
+        files.map((f) => f.fileId),
+      );
+      expect(selA).toBe("00000001");
+      expect(selB).toBe("00000002");
+      await executeJoinInputLine({
+        line: `/get ${selB}`,
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(downloadedIds).toEqual([sameBucketB.fileId]);
+      // Shared 8-char timestamp prefix is correctly flagged as ambiguous
+      await expect(
+        executeJoinInputLine({
+          line: "/get 019a8888",
+          engine: mockEngine,
+          chunkStorage,
+          sharedFiles,
+          stdout: humanStdout,
+          cwd: workDir,
+        }),
+      ).rejects.toThrow("Ambiguous fileId");
 
       // Chat + /reply renders reply quote context & /retry invokes engine.retryChatMessage
       await executeJoinInputLine({
@@ -2666,7 +2804,7 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       },
       2_000,
     );
-    expect(paused[0]).toContain("Paused 'archive.tar.gz' at 31% — run '/get 019a8888' to resume");
+    expect(paused[0]).toContain("Paused 'archive.tar.gz' at 31% — run '/get 00000099' to resume");
     expect(paused[1]).toContain("[relay] Caching 'archive.tar.gz' 12% (4/32 chunks)");
 
     const cached = tracker.consume(
@@ -2688,10 +2826,10 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     );
     expect(cached).toEqual(["[relay] Cached 'archive.tar.gz' for offline peers"]);
 
-    // Fingerprint matches Web `#xxxxxxxx`, short IDs stay compact, and old sync messages include YYYY-MM-DD
+    // Fingerprint matches Web `#xxxxxxxx`, short IDs use random tail, and old sync messages include YYYY-MM-DD
     expect(formatCliRoomFingerprint("D7276E1899aabbcc")).toBe("#d7276e18");
-    expect(formatShortId("peer_019a1234567890abcdef", 8)).toBe("peer_019a1234");
-    expect(formatShortId(fileId, 8)).toBe("019a8888");
+    expect(formatShortId("peer_019a1234567890abcdef", 8)).toBe("peer_90abcdef");
+    expect(formatShortId(fileId, 8)).toBe("00000099");
 
     const nowMs = new Date(2026, 10, 28, 15, 0, 0).getTime();
     const todayMs = new Date(2026, 10, 28, 9, 5, 4).getTime();
@@ -2720,7 +2858,7 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
         fileSize: 65_536,
         totalChunks: 1,
       }),
-    ).toBe("[seed] Caching file 019a8888 (64.0 KiB, 1 chunks)...");
+    ).toBe("[seed] Caching file 00000099 (64.0 KiB, 1 chunks)...");
   });
 
   test("register pre-validates username locally, prompts server/displayName/confirm-password on interactive TTY, and adds --server hint on network errors", async () => {

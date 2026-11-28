@@ -1,5 +1,11 @@
 import { homedir } from "node:os";
-import { createInterface, type Interface as ReadlineInterface } from "node:readline";
+import {
+  clearScreenDown,
+  createInterface,
+  cursorTo,
+  moveCursor,
+  type Interface as ReadlineInterface,
+} from "node:readline";
 import type { FileManifest } from "@simpleim/contracts";
 import { sanitizeTerminalSingleLine } from "./terminal-sanitize.ts";
 
@@ -59,18 +65,56 @@ export function createCliPalette(enabled: boolean): CliPalette {
 }
 
 /**
- * Formats an opaque ID compactly for 80-column terminal display while keeping
- * enough prefix entropy for unambiguous prefix selection.
+ * Formats an opaque UUIDv7-based ID compactly for 80-column display using its
+ * random tail (UUIDv7 places the 48-bit timestamp prefix at the front, so the
+ * trailing random hex characters avoid collisions within 65s timestamp buckets).
  */
-export function formatShortId(id: string, hexChars = 8): string {
+export function formatShortId(id: string, tailChars = 8): string {
   const safe = sanitizeTerminalSingleLine(id);
   const underscoreIdx = safe.indexOf("_");
   if (underscoreIdx > 0 && underscoreIdx <= 8) {
     const prefix = safe.slice(0, underscoreIdx + 1);
     const body = safe.slice(underscoreIdx + 1);
-    return body.length > hexChars ? `${prefix}${body.slice(0, hexChars)}` : safe;
+    return body.length > tailChars ? `${prefix}${body.slice(-tailChars)}` : safe;
   }
-  return safe.length > hexChars ? safe.slice(0, hexChars) : safe;
+  return safe.length > tailChars ? safe.slice(-tailChars) : safe;
+}
+
+/**
+ * Returns the shortest unambiguous suffix (>= minLen) for `fileId` across all
+ * known room file IDs (falling back to the full ID if needed). Because UUIDv7
+ * encodes randomness at the end, the random tail stays unambiguous even for
+ * files announced within the same millisecond or 65-second timestamp bucket.
+ */
+export function formatUniqueFileSelector(
+  fileId: string,
+  allFileIds: readonly string[],
+  minLen = 8,
+): string {
+  const safe = sanitizeTerminalSingleLine(fileId);
+  if (safe.length <= minLen) {
+    return safe;
+  }
+  const normalizedOthers = allFileIds
+    .map((id) => sanitizeTerminalSingleLine(id))
+    .filter((id) => id !== safe);
+
+  for (let len = minLen; len < safe.length; len++) {
+    const candidate = safe.slice(-len);
+    if (candidate.startsWith("-")) {
+      continue;
+    }
+    const collides = normalizedOthers.some(
+      (other) =>
+        other === candidate ||
+        other.startsWith(candidate) ||
+        other.endsWith(candidate),
+    );
+    if (!collides) {
+      return candidate;
+    }
+  }
+  return safe;
 }
 
 /**
@@ -237,10 +281,11 @@ export function createJoinCompleter(
       const prefix = fileCmdMatch[1]!;
       const partial = fileCmdMatch[2] ?? "";
       const files = getFiles();
+      const allIds = files.map((f) => f.fileId);
       const candidates: string[] = [];
       files.forEach((f, idx) => {
         candidates.push(String(idx + 1));
-        candidates.push(formatShortId(f.fileId, 8));
+        candidates.push(formatUniqueFileSelector(f.fileId, allIds, 8));
         candidates.push(f.fileId);
       });
       const unique = Array.from(new Set(candidates));
@@ -284,6 +329,11 @@ export interface InteractiveJoinTerminalOptions {
   readonly onInputEof?: () => void;
 }
 
+type InternalReadline = ReadlineInterface & {
+  _refreshLine?: () => void;
+  prevRows?: number;
+};
+
 /**
  * Coordinates readline interactive input with asynchronous incoming room output
  * so live P2P messages never corrupt the user's active prompt/input line on a TTY.
@@ -293,10 +343,10 @@ export class InteractiveJoinTerminal {
   readonly palette: CliPalette;
   private readonly stdout: NodeJS.WritableStream;
   private readonly stderr: NodeJS.WritableStream;
-  private readonly rl: ReadlineInterface;
+  private readonly rl: InternalReadline;
   private readonly promptVisualWidth = 2; // "❯ "
-  private closed = false;
-  private explicitExit = false;
+  private inputClosed = false;
+  private exited = false;
   private lineQueue: Promise<void> = Promise.resolve();
 
   constructor(options: InteractiveJoinTerminalOptions) {
@@ -326,10 +376,11 @@ export class InteractiveJoinTerminal {
       ...(this.isInteractive && options.getFiles
         ? { completer: createJoinCompleter(options.getFiles) }
         : {}),
-    });
+    }) as InternalReadline;
 
     this.rl.on("SIGINT", () => {
-      this.explicitExit = true;
+      if (this.exited) return;
+      this.exited = true;
       this.close();
       options.onExit?.();
     });
@@ -337,11 +388,11 @@ export class InteractiveJoinTerminal {
     this.rl.on("line", (rawLine) => {
       this.lineQueue = this.lineQueue
         .then(async () => {
-          if (this.closed) return;
+          if (this.exited) return;
           try {
             const action = await options.onLine(rawLine);
             if (action === "exit") {
-              this.explicitExit = true;
+              this.exited = true;
               this.close();
               options.onExit?.();
               return;
@@ -349,7 +400,7 @@ export class InteractiveJoinTerminal {
           } catch (err) {
             options.onLineError?.(err);
           }
-          if (!this.closed && this.isInteractive) {
+          if (!this.exited && !this.inputClosed && this.isInteractive) {
             this.rl.prompt();
           }
         })
@@ -357,15 +408,19 @@ export class InteractiveJoinTerminal {
     });
 
     this.rl.on("close", () => {
-      this.closed = true;
-      if (!this.explicitExit) {
-        options.onInputEof?.();
-      }
+      this.inputClosed = true;
+      // Drain all already-accepted queued lines before signaling EOF so piped
+      // commands (e.g. `one\ntwo\n/quit\n`) are never discarded on immediate EOF.
+      void this.lineQueue.then(() => {
+        if (!this.exited) {
+          options.onInputEof?.();
+        }
+      });
     });
   }
 
   startPrompt(): void {
-    if (!this.closed && this.isInteractive) {
+    if (!this.exited && !this.inputClosed && this.isInteractive) {
       this.rl.prompt();
     }
   }
@@ -375,7 +430,7 @@ export class InteractiveJoinTerminal {
    * formatted self-messages are not displayed twice.
    */
   eraseJustSubmittedSingleLineEcho(rawLine: string): void {
-    if (!this.isInteractive || this.closed) {
+    if (!this.isInteractive || this.exited || this.inputClosed) {
       return;
     }
     const cols = Math.max(
@@ -389,18 +444,27 @@ export class InteractiveJoinTerminal {
 
   /**
    * Safely prints an asynchronous line (incoming message, peer join, file event)
-   * without corrupting whatever the user is currently typing at the TTY prompt.
+   * without corrupting single- or multi-row wrapped input at the TTY prompt.
    */
   writeAsyncLine(text: string, stream: "stdout" | "stderr" = "stdout"): void {
     const target = stream === "stderr" ? this.stderr : this.stdout;
-    if (this.isInteractive && !this.closed) {
-      this.stdout.write("\r\x1b[2K");
+    if (this.isInteractive && !this.exited && !this.inputClosed) {
+      const pos =
+        typeof this.rl.getCursorPos === "function"
+          ? this.rl.getCursorPos()
+          : { rows: 0, cols: 0 };
+      if (pos.rows > 0) {
+        moveCursor(this.stdout, 0, -pos.rows);
+      }
+      cursorTo(this.stdout, 0);
+      clearScreenDown(this.stdout);
+      // Reset readline's tracked wrapped-row offset so redrawing starts below
+      // the newly printed event instead of moving upward and erasing it.
+      this.rl.prevRows = 0;
+
       target.write(`${text}\n`);
-      const refreshable = this.rl as ReadlineInterface & {
-        _refreshLine?: () => void;
-      };
-      if (typeof refreshable._refreshLine === "function") {
-        refreshable._refreshLine();
+      if (typeof this.rl._refreshLine === "function") {
+        this.rl._refreshLine();
       } else {
         this.rl.prompt(true);
       }
@@ -419,10 +483,19 @@ export class InteractiveJoinTerminal {
   }
 
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
+    this.exited = true;
+    if (this.inputClosed) return;
+    this.inputClosed = true;
     if (this.isInteractive) {
-      this.stdout.write("\r\x1b[2K");
+      const pos =
+        typeof this.rl.getCursorPos === "function"
+          ? this.rl.getCursorPos()
+          : { rows: 0, cols: 0 };
+      if (pos.rows > 0) {
+        moveCursor(this.stdout, 0, -pos.rows);
+      }
+      cursorTo(this.stdout, 0);
+      clearScreenDown(this.stdout);
     }
     this.rl.close();
   }
