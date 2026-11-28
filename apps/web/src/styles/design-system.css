@@ -95,18 +95,18 @@
   gap: var(--space-1-5);
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
-  padding: var(--space-2) var(--space-3);
-  font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-semibold);
+  padding: var(--space-1-5) var(--space-3);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
   line-height: var(--line-tight);
   cursor: pointer;
   white-space: nowrap;
   background: transparent;
   transition:
-    background-color var(--transition-fast),
-    border-color var(--transition-fast),
-    color var(--transition-fast),
-    opacity var(--transition-fast);
+    background-color var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard),
+    opacity var(--duration-fast) var(--ease-standard);
 }
 
 .ds-btn:disabled {
@@ -115,14 +115,14 @@
 }
 
 .ds-btn-primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-fill);
+  border-color: var(--accent-fill);
   color: var(--text-inverse);
 }
 
 .ds-btn-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: var(--accent-fill-hover);
+  border-color: var(--accent-fill-hover);
 }
 
 .ds-btn-secondary {
@@ -160,7 +160,7 @@
 }
 
 .ds-btn-sm {
-  padding: var(--space-1) var(--space-2-5);
+  padding: var(--space-1) var(--space-2);
   font-size: var(--font-size-sm);
   border-radius: var(--radius-xs);
 }
@@ -184,12 +184,12 @@
   padding: var(--space-1-5) var(--space-2-5);
   border-radius: var(--radius-xs);
   font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-semibold);
+  font-weight: var(--font-weight-medium);
   cursor: pointer;
   transition:
-    background-color var(--transition-fast),
-    color var(--transition-fast),
-    border-color var(--transition-fast);
+    background-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard);
 }
 
 .ds-tab:hover:not([aria-selected="true"]) {
@@ -206,7 +206,7 @@
 .ds-field {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1-5);
+  gap: var(--space-1);
 }
 
 .ds-field-header {
@@ -218,13 +218,13 @@
 
 .ds-field-label {
   font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-semibold);
+  font-weight: var(--font-weight-medium);
   color: var(--text-secondary);
 }
 
 .ds-field-hint {
   font-size: var(--font-size-xs);
-  color: var(--text-dim);
+  color: var(--text-muted);
 }
 
 .ds-field-control {
@@ -235,7 +235,7 @@
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   padding: 0 var(--space-2);
-  transition: border-color var(--transition-fast);
+  transition: border-color var(--duration-fast) var(--ease-standard);
 }
 
 .ds-field-control:focus-within {
@@ -261,7 +261,7 @@
 }
 
 .ds-field-input::placeholder {
-  color: var(--text-dim);
+  color: var(--text-muted);
 }
 
 /* NoticeBanner */
@@ -270,10 +270,10 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-2) var(--space-2-5);
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-subtle);
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-md);
 }
 
 .ds-notice-main {
@@ -315,7 +315,7 @@
   height: 100%;
   width: var(--ds-progress-pct, 0%);
   background: var(--accent);
-  transition: width var(--transition-base);
+  transition: width var(--duration-base) var(--ease-standard);
 }
 
 .ds-progress-fill-complete {

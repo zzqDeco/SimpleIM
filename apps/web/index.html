@@ -9,27 +9,7 @@
     <meta name="color-scheme" content="dark light" />
     <meta name="referrer" content="no-referrer" />
     <title>SimpleIM</title>
-    <script>
-      (function () {
-        var mode = null;
-        try {
-          mode = window.localStorage.getItem("simpleim.theme");
-        } catch (_err) {
-          // Ignore restricted storage contexts; fall back to OS preference.
-        }
-        var prefersDark =
-          mode === "dark" ||
-          (mode !== "light" &&
-            (typeof window.matchMedia !== "function" ||
-              window.matchMedia("(prefers-color-scheme: dark)").matches));
-        var resolved = prefersDark ? "dark" : "light";
-        document.documentElement.dataset.theme = resolved;
-        var meta = document.querySelector('meta[name="color-scheme"]');
-        if (meta) {
-          meta.setAttribute("content", resolved);
-        }
-      })();
-    </script>
+    <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="root"></div>

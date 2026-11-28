@@ -66,12 +66,12 @@ textarea {
 
 .md-inline-code {
   font-family: var(--font-mono);
-  font-size: 0.92em;
+  font-size: var(--font-size-code-inline);
   background: var(--bg-inline-code);
   border: 1px solid var(--border-subtle);
-  padding: var(--space-0-5) var(--space-1-5);
+  padding: 1px var(--space-1);
   border-radius: var(--radius-xs);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .md-code-block {
