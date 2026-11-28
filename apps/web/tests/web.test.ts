@@ -3290,11 +3290,11 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
       ),
     );
 
-    // aria-live must live on .sr-only announcer, NOT on .message-stream
+    // Dedicated .sr-only announcer handles polite announcements; role="log" transcript explicitly sets aria-live="off"
     expect(html).toContain(
       '<div class="sr-only" aria-live="polite" aria-atomic="true">',
     );
-    expect(html).not.toMatch(/class="message-stream"[^>]*aria-live/);
+    expect(html).toMatch(/class="message-stream"[^>]*aria-live="off"/);
     expect(html).toContain('data-testid="message-stream-inner"');
     // Bob is online (success dot), Carol is offline (muted dot)
     expect(html).toContain("ds-status-icon-success");

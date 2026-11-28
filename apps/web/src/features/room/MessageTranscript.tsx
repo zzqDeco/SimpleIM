@@ -616,6 +616,7 @@ export function MessageTranscript({
         ref={streamRef}
         className="message-stream"
         role="log"
+        aria-live="off"
         aria-label={t("room.streamAria")}
         onScroll={handleScroll}
       >
