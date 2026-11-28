@@ -2697,8 +2697,10 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       await wiredStorage.closeAll();
     }
 
-    // /get 1 + 30 wrapped type-ahead chars in one chunk + mid-command async progress:
-    // writeAsyncLine MUST NOT move upward after command output already hid the type-ahead!
+    // /get 1 + 30 wrapped type-ahead chars in one chunk -> announcement prints ->
+    // user types an extra 'b' -> mid-command async progress arrives:
+    // the buffered type-ahead is restored immediately after the announcement so 'b'
+    // stays synchronized and subsequent progress only clears the prompt, NEVER the announcement!
     const dlIn = Object.assign(new PassThrough(), {
       isTTY: true,
       setRawMode() {
@@ -2717,12 +2719,17 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       downloadDir: join(wiredWorkDir, "dl2"),
     });
     const dlShared = new LocalSharedFileRegistry();
+    let emitProgressGate!: () => void;
+    const progressGate = new Promise<void>((r) => {
+      emitProgressGate = r;
+    });
     const dlEngine = {
       roomId: "f".repeat(64),
       localPeerId: "peer_019a0000000070008000000000000099",
       getFiles: () => [sampleManifest],
       getMessages: () => [],
       downloadFile: async () => {
+        await progressGate;
         dlTerm.writeAsyncLine("[file] Downloading 'report.pdf' 25%");
       },
     } as unknown as RoomPeerEngine;
@@ -2746,13 +2753,28 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       dlTerm.startPrompt();
       dlBuf = "";
       dlIn.write(`/get 1\r${"a".repeat(30)}`);
-      await Bun.sleep(30);
+      await Bun.sleep(15);
+      // Announcement printed and wrapped type-ahead restored right below it
       const startIdx = dlBuf.indexOf("[file] Starting Swarm download");
       expect(startIdx).toBeGreaterThanOrEqual(0);
-      const afterStart = dlBuf.slice(startIdx);
-      expect(afterStart).not.toContain("\x1b[1A");
-      expect(afterStart).toContain("[file] Downloading 'report.pdf' 25%\n");
-      expect(afterStart).toContain(`❯ ${"a".repeat(30)}`);
+      const afterStartBeforeKey = dlBuf.slice(startIdx);
+      expect(afterStartBeforeKey).toContain(`❯ ${"a".repeat(30)}`);
+
+      // Now user types an additional 'b' BEFORE progress arrives
+      dlBuf = "";
+      dlIn.write("b");
+      await Bun.sleep(10);
+      emitProgressGate();
+      await Bun.sleep(25);
+      // Moving up 1 row erases only the 2-row prompt `❯ a...ab`, leaving the announcement intact
+      expect(dlBuf).toContain("\x1b[1A");
+      expect(dlBuf).not.toContain("\x1b[2A");
+      expect(dlBuf).toContain("[file] Downloading 'report.pdf' 25%\n");
+      const afterProgress = dlBuf.slice(
+        dlBuf.indexOf("[file] Downloading 'report.pdf' 25%\n"),
+      );
+      expect(afterProgress).not.toContain("\x1b[1A");
+      expect(afterProgress).toContain(`❯ ${"a".repeat(30)}b`);
     } finally {
       dlTerm.close();
       await dlShared.closeAll();

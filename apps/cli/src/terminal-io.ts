@@ -481,6 +481,7 @@ export class InteractiveJoinTerminal {
       !this.isInteractive ||
       this.exited ||
       this.inputClosed ||
+      this.rl.line.length > 0 ||
       this.activeLineEpoch === null ||
       this.activeLineEpoch !== this.outputEpoch
     ) {
@@ -579,6 +580,17 @@ export class InteractiveJoinTerminal {
       this.clearActiveInputRegion(this.promptDrawn);
     }
     target.write(chunk);
+    // Keep any buffered type-ahead visibly synchronized with readline's buffer
+    // so subsequent keystrokes or async events never miscalculate rendered rows.
+    if (
+      this.isInteractive &&
+      !this.exited &&
+      !this.inputClosed &&
+      this.rl.line.length > 0 &&
+      chunk.endsWith("\n")
+    ) {
+      this.redrawPromptPreservingCursor();
+    }
   }
 
   /**
