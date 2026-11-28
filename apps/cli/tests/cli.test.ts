@@ -2537,16 +2537,32 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     const docsDir = join(fakeHome, "Docs");
     await Bun.write(join(docsDir, "My Report (Final).pdf"), "PDF_CONTENT");
 
-    // Path parser handles ~, single quotes, double quotes, and backslash-escaped Finder paths
-    expect(parseCliFilePathInput("~/Docs/My\\ Report\\ \\(Final\\).pdf", fakeHome)).toBe(
-      join(docsDir, "My Report (Final).pdf"),
-    );
-    expect(parseCliFilePathInput(`'${join(docsDir, "My Report (Final).pdf")}'`, fakeHome)).toBe(
-      join(docsDir, "My Report (Final).pdf"),
-    );
-    expect(parseCliFilePathInput(`"${join(docsDir, "My Report (Final).pdf")}"`, fakeHome)).toBe(
-      join(docsDir, "My Report (Final).pdf"),
-    );
+    // Path parser handles ~, single quotes, double quotes, POSIX escaped Finder paths,
+    // AND preserves native Windows drive/UNC backslashes intact
+    expect(
+      parseCliFilePathInput("~/Docs/My\\ Report\\ \\(Final\\).pdf", fakeHome, "darwin"),
+    ).toBe(join(docsDir, "My Report (Final).pdf"));
+    expect(
+      parseCliFilePathInput(`'${join(docsDir, "My Report (Final).pdf")}'`, fakeHome, "darwin"),
+    ).toBe(join(docsDir, "My Report (Final).pdf"));
+    expect(
+      parseCliFilePathInput(`"${join(docsDir, "My Report (Final).pdf")}"`, fakeHome, "darwin"),
+    ).toBe(join(docsDir, "My Report (Final).pdf"));
+    expect(
+      parseCliFilePathInput("C:\\Users\\alice\\report.pdf", "C:\\Users\\alice", "win32"),
+    ).toBe("C:\\Users\\alice\\report.pdf");
+    expect(
+      parseCliFilePathInput('"C:\\Users\\alice\\My Report.pdf"', "C:\\Users\\alice", "win32"),
+    ).toBe("C:\\Users\\alice\\My Report.pdf");
+    expect(
+      parseCliFilePathInput("\\\\filesrv\\share\\bundle.zip", "C:\\Users\\alice", "win32"),
+    ).toBe("\\\\filesrv\\share\\bundle.zip");
+    expect(
+      parseCliFilePathInput("~\\Documents\\notes.txt", "C:\\Users\\alice", "win32"),
+    ).toBe("C:\\Users\\alice\\Documents\\notes.txt");
+    expect(
+      parseCliFilePathInput("relative\\path\\file.bin", "C:\\Users\\alice", "win32"),
+    ).toBe("relative\\path\\file.bin");
     expect(formatCliFsError({ code: "ENOENT" }, "/missing/file.bin")).toBe(
       "File not found: /missing/file.bin",
     );

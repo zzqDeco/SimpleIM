@@ -154,15 +154,19 @@ export function formatCliTimestamp(
   return `${yyyy}-${mo}-${dd} ${hh}:${mm}:${ss}`;
 }
 
+const WINDOWS_DRIVE_OR_UNC_RE = /^(?:[a-zA-Z]:[\\/]|\\\\)/;
+
 /**
  * Parses a user-entered file path for `/send`:
- * - Strips matching outer single or double quotes (e.g. `'/Users/x/My File.pdf'`)
- * - Unescapes POSIX backslash-escaped spaces/metacharacters from Finder drag-and-drop (`My\ File\ \(1\).pdf`)
- * - Expands leading `~` / `~/` to the user's home directory
+ * - Strips matching outer single or double quotes (e.g. `'/Users/x/My File.pdf'`, `"C:\Users\x\My File.pdf"`)
+ * - On POSIX paths, unescapes shell backslash-escaped spaces/metacharacters from Finder drag-and-drop (`My\ File\ \(1\).pdf`)
+ * - Preserves native Windows drive (`C:\...`) and UNC (`\\server\share\...`) separators intact
+ * - Expands leading `~` / `~/` (and `~\` on Windows) to the user's home directory
  */
 export function parseCliFilePathInput(
   rawInput: string,
   homeDirectory: string = homedir(),
+  platform: NodeJS.Platform = process.platform,
 ): string {
   const trimmed = rawInput.trim();
   if (trimmed.length === 0) {
@@ -177,18 +181,24 @@ export function parseCliFilePathInput(
     parsed = trimmed.slice(1, -1);
   } else if (trimmed.length >= 2 && first === '"' && last === '"') {
     const inner = trimmed.slice(1, -1);
-    for (let i = 0; i < inner.length; i++) {
-      const ch = inner[i]!;
-      if (ch === "\\" && i + 1 < inner.length) {
-        const next = inner[i + 1]!;
-        if (next === '"' || next === "\\" || next === "$" || next === "`") {
-          parsed += next;
-          i++;
-          continue;
+    if (platform === "win32" || WINDOWS_DRIVE_OR_UNC_RE.test(inner)) {
+      parsed = inner.replace(/\\"/g, '"');
+    } else {
+      for (let i = 0; i < inner.length; i++) {
+        const ch = inner[i]!;
+        if (ch === "\\" && i + 1 < inner.length) {
+          const next = inner[i + 1]!;
+          if (next === '"' || next === "\\" || next === "$" || next === "`") {
+            parsed += next;
+            i++;
+            continue;
+          }
         }
+        parsed += ch;
       }
-      parsed += ch;
     }
+  } else if (platform === "win32" || WINDOWS_DRIVE_OR_UNC_RE.test(trimmed)) {
+    parsed = trimmed;
   } else {
     for (let i = 0; i < trimmed.length; i++) {
       const ch = trimmed[i]!;
@@ -204,7 +214,10 @@ export function parseCliFilePathInput(
   if (parsed === "~") {
     return homeDirectory;
   }
-  if (parsed.startsWith("~/")) {
+  if (
+    parsed.startsWith("~/") ||
+    (platform === "win32" && parsed.startsWith("~\\"))
+  ) {
     return `${homeDirectory}${parsed.slice(1)}`;
   }
   return parsed;
