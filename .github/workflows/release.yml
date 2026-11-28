@@ -78,9 +78,15 @@ jobs:
           bun-version: "1.4.4"
 
       - name: Compile standalone Linux x64 CLI binary
+        env:
+          PUBLIC_ORIGIN: ${{ vars.PUBLIC_ORIGIN }}
         run: |
           bun install --frozen-lockfile
-          bun build --compile --target=bun-linux-x64 apps/cli/src/main.ts --outfile simpleim-linux-x64
+          DEFINE_ARGS=()
+          if [[ -n "$PUBLIC_ORIGIN" ]]; then
+            DEFINE_ARGS+=(--define "__SIMPLEIM_DEFAULT_SERVER_URL__=\"$PUBLIC_ORIGIN\"")
+          fi
+          bun build --compile --target=bun-linux-x64 "${DEFINE_ARGS[@]}" apps/cli/src/main.ts --outfile simpleim-linux-x64
           chmod +x simpleim-linux-x64
           ./simpleim-linux-x64 --help >/dev/null
           sha256sum simpleim-linux-x64 > simpleim-linux-x64.sha256

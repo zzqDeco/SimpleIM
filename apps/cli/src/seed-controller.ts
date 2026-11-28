@@ -2,11 +2,37 @@ import type { FileManifest } from "@simpleim/contracts";
 import type { FsChunkStorageAdapter } from "./fs-chunk-storage.ts";
 import type { StructuredLogger } from "./logger.ts";
 
+export type SeedQuotaEvent =
+  | {
+      readonly kind: "accepted";
+      readonly fileId: string;
+      readonly fileSize: number;
+      readonly totalChunks: number;
+    }
+  | {
+      readonly kind: "skipped_quota";
+      readonly fileId: string;
+      readonly fileSize: number;
+      readonly diskBytes: number;
+      readonly maxStorageBytes: number;
+    }
+  | {
+      readonly kind: "completed";
+      readonly fileId: string;
+      readonly fileSize: number;
+    }
+  | {
+      readonly kind: "download_failed";
+      readonly fileId: string;
+      readonly reason: string;
+    };
+
 export interface SeedQuotaControllerOptions {
   maxStorageBytes: number;
   storage: FsChunkStorageAdapter;
   downloadFile: (fileId: string) => Promise<void>;
   logger?: StructuredLogger;
+  onEvent?: (event: SeedQuotaEvent) => void;
   roomIdPrefix?: string;
 }
 
@@ -15,6 +41,7 @@ export class SeedQuotaController {
   private readonly storage: FsChunkStorageAdapter;
   private readonly downloadFile: (fileId: string) => Promise<void>;
   private readonly logger?: StructuredLogger;
+  private readonly onEvent?: (event: SeedQuotaEvent) => void;
   private readonly roomIdPrefix?: string;
 
   private readonly inFlightReservations = new Map<string, number>();
@@ -29,6 +56,7 @@ export class SeedQuotaController {
     this.storage = options.storage;
     this.downloadFile = options.downloadFile;
     this.logger = options.logger;
+    this.onEvent = options.onEvent;
     this.roomIdPrefix = options.roomIdPrefix;
   }
 
@@ -50,6 +78,11 @@ export class SeedQuotaController {
         fileSize: manifest.fileSize,
         totalChunks: manifest.totalChunks,
       },
+    });
+    this.onEvent?.({
+      kind: "completed",
+      fileId: manifest.fileId,
+      fileSize: manifest.fileSize,
     });
   }
 
@@ -87,6 +120,13 @@ export class SeedQuotaController {
           maxStorageBytes: this.maxStorageBytes,
         },
       });
+      this.onEvent?.({
+        kind: "skipped_quota",
+        fileId: manifest.fileId,
+        fileSize: manifest.fileSize,
+        diskBytes,
+        maxStorageBytes: this.maxStorageBytes,
+      });
       return false;
     }
 
@@ -101,6 +141,12 @@ export class SeedQuotaController {
         diskBytes,
         maxStorageBytes: this.maxStorageBytes,
       },
+    });
+    this.onEvent?.({
+      kind: "accepted",
+      fileId: manifest.fileId,
+      fileSize: manifest.fileSize,
+      totalChunks: manifest.totalChunks,
     });
 
     try {
@@ -126,14 +172,20 @@ export class SeedQuotaController {
       return true;
     } catch (err) {
       this.inFlightReservations.delete(manifest.fileId);
+      const reason = err instanceof Error ? err.message : "download_error";
       this.logger?.error("seed.file.download_failed", {
         roomIdPrefix: this.roomIdPrefix,
         durationMs: Date.now() - startedAt,
         errorCode: "internal_error",
         meta: {
           fileId: manifest.fileId,
-          reason: err instanceof Error ? err.message : "download_error",
+          reason,
         },
+      });
+      this.onEvent?.({
+        kind: "download_failed",
+        fileId: manifest.fileId,
+        reason,
       });
       return false;
     }

@@ -31,7 +31,7 @@ export async function runCli(
 
     switch (cmd.command) {
       case "help":
-        stdout.write(`${formatHelpText()}\n`);
+        stdout.write(`${formatHelpText(cmd.topic)}\n`);
         return 0;
       case "version":
         stdout.write(`simpleim ${CLI_VERSION}\n`);

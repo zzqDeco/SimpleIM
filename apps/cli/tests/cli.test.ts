@@ -40,12 +40,25 @@ import {
   CliSecurityError,
   CliSignalingClient,
   CliUsageError,
+  createJoinCompleter,
   CredentialStore,
   DtlsHandshakeReassembler,
   ensureWeriftDtlsFragmentReassemblyGuarded,
   formatCliChatMessage,
+  formatCliFsError,
+  formatCliRoomFingerprint,
+  formatCliTimestamp,
+  formatHelpText,
+  formatRenderedChatEvent,
+  formatSeedQuotaHumanEvent,
+  formatShortId,
+  formatUniqueFileSelector,
+  InteractiveJoinTerminal,
+  JoinTransferProgressTracker,
+  parseCliFilePathInput,
   sanitizeTerminalMultilineText,
   sanitizeTerminalSingleLine,
+  shouldUseColor,
   executeJoinInputLine,
   FsChunkStorageAdapter,
   isMdnsIceCandidate,
@@ -60,6 +73,7 @@ import {
   StorageQuotaExceededError,
   stripMdnsCandidatesFromSdp,
   StructuredLogger,
+  validateRegisterUsernameLocal,
   WeriftTransportFactory,
   type WeriftNetworkDiagnostic,
 } from "../src/main.ts";
@@ -2277,5 +2291,1069 @@ describe("CliApiClient BlindRelayClient", () => {
       await sharedFiles.closeAll();
       await rm(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Issue #37 CLI P1/P2 Interactive UX", () => {
+  test("pseudo-TTY interactive session preserves partial user input across async incoming messages, eliminates double-echo, supports Ctrl+C exit, and completes slash commands & fileIds", async () => {
+    const ttyIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode(mode: boolean) {
+        this.isRaw = mode;
+        return this;
+      },
+    });
+    const ttyOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 80,
+    });
+    const ttyErr = new PassThrough();
+
+    let capturedOut = "";
+    ttyOut.on("data", (chunk) => {
+      capturedOut += chunk.toString("utf8");
+    });
+
+    const submittedLines: string[] = [];
+    let exited = false;
+
+    const sampleManifest = await createSignedManifestFixture({
+      roomId: "f".repeat(64),
+      fileName: "report.pdf",
+      bytes: new TextEncoder().encode("pdf"),
+      fileId: "019a7777-0000-7000-8000-000000000001",
+    });
+
+    let resolveSecondLine!: () => void;
+    const secondLinePromise = new Promise<void>((r) => {
+      resolveSecondLine = r;
+    });
+
+    const terminal = new InteractiveJoinTerminal({
+      stdin: ttyIn,
+      stdout: ttyOut,
+      stderr: ttyErr,
+      env: { NO_COLOR: "1" },
+      getFiles: () => [sampleManifest],
+      onLine: async (line) => {
+        submittedLines.push(line);
+        if (submittedLines.length === 1) {
+          terminal.eraseJustSubmittedSingleLineEcho(line);
+          terminal.writeLine(`[12:00:02] @alice: ${line}`);
+        } else {
+          resolveSecondLine();
+        }
+        return "continue";
+      },
+      onExit: () => {
+        exited = true;
+      },
+    });
+
+    expect(terminal.isInteractive).toBe(true);
+    expect(terminal.palette.enabled).toBe(false); // NO_COLOR=1 honored
+    terminal.startPrompt();
+
+    // User starts typing a message WITHOUT pressing Enter yet
+    ttyIn.write("hello wo");
+    await Bun.sleep(15);
+
+    // Incoming remote chat message arrives mid-typing -> must clear active line,
+    // print incoming message cleanly, and redraw prompt + untouched partial input!
+    terminal.writeAsyncLine("[12:00:01] @bob: incoming ping!");
+    await Bun.sleep(15);
+
+    expect(capturedOut).toContain("[12:00:01] @bob: incoming ping!\n");
+    // Prompt and buffered input were restored right after the incoming message
+    const afterIncoming = capturedOut.slice(
+      capturedOut.indexOf("incoming ping!\n") + "incoming ping!\n".length,
+    );
+    expect(afterIncoming).toContain("❯ ");
+    expect(afterIncoming).toContain("hello wo");
+    expect(afterIncoming).not.toContain("\x1b[1A");
+
+    // User finishes typing "rld" and presses Enter -> exact intact message submitted!
+    ttyIn.write("rld\r");
+    await Bun.sleep(25);
+    expect(submittedLines).toEqual(["hello world"]);
+    // Single-line echo erasure sequence emitted before formatted self-line
+    expect(capturedOut).toContain("\x1b[1A\r\x1b[2K[12:00:02] @alice: hello world\n");
+
+    // Second line works cleanly, and Ctrl+C (\x03) triggers clean exit callback
+    ttyIn.write("/peers\r");
+    await secondLinePromise;
+    expect(submittedLines).toEqual(["hello world", "/peers"]);
+
+    ttyIn.write("\x03");
+    await Bun.sleep(15);
+    expect(exited).toBe(true);
+    terminal.close();
+
+    // Tab completer completes slash commands and unambiguous fileId selectors
+    const secondSameBucketManifest = await createSignedManifestFixture({
+      roomId: "f".repeat(64),
+      fileName: "report-2.pdf",
+      bytes: new TextEncoder().encode("pdf2"),
+      fileId: "019a7777-0000-7000-8000-000000000002",
+    });
+    const completer = createJoinCompleter(() => [
+      sampleManifest,
+      secondSameBucketManifest,
+    ]);
+    expect(completer("/pe")[0]).toEqual(["/peers"]);
+    expect(completer("/ca")[0]).toEqual(["/cancel "]);
+    expect(completer("/get 0000000")[0]).toEqual([
+      "/get 00000001",
+      "/get 00000002",
+    ]);
+    expect(completer("/cancel 1")[0]).toEqual(["/cancel 1"]);
+
+    // Wrapped multi-row input (20-col TTY, 30 typed chars): async incoming output clears all
+    // wrapped rows and resets redraw tracking so _refreshLine NEVER moves up to erase the event!
+    const narrowIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const narrowOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 20,
+    });
+    let narrowBuf = "";
+    narrowOut.on("data", (c) => {
+      narrowBuf += c.toString("utf8");
+    });
+    const narrowTerm = new InteractiveJoinTerminal({
+      stdin: narrowIn,
+      stdout: narrowOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async () => "continue",
+    });
+    narrowTerm.startPrompt();
+    narrowIn.write("123456789012345678901234567890");
+    await Bun.sleep(15);
+
+    narrowBuf = "";
+    narrowTerm.writeAsyncLine("[12:00:05] @bob: FIRST_WRAPPED");
+    const afterFirst = narrowBuf.slice(
+      narrowBuf.indexOf("FIRST_WRAPPED\n") + "FIRST_WRAPPED\n".length,
+    );
+    expect(narrowBuf).toContain("\x1b[1A");
+    expect(afterFirst).not.toContain("\x1b[1A");
+    expect(afterFirst).toContain("❯ 123456789012345678901234567890");
+
+    narrowBuf = "";
+    narrowTerm.writeAsyncLine("[12:00:06] @bob: SECOND_WRAPPED");
+    const afterSecond = narrowBuf.slice(
+      narrowBuf.indexOf("SECOND_WRAPPED\n") + "SECOND_WRAPPED\n".length,
+    );
+    expect(afterSecond).not.toContain("\x1b[1A");
+    expect(afterSecond).toContain("❯ 123456789012345678901234567890");
+    narrowTerm.close();
+
+    // Piped stdin reaching immediate EOF drains ALL queued async commands (including /quit)
+    const pipedIn = new PassThrough();
+    const drained: string[] = [];
+    let pipedExited = false;
+    let pipedEof = false;
+    let resolvePipedDone!: () => void;
+    const pipedDone = new Promise<void>((r) => {
+      resolvePipedDone = r;
+    });
+    const pipedTerm = new InteractiveJoinTerminal({
+      stdin: pipedIn,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      onLine: async (line) => {
+        await Bun.sleep(15);
+        drained.push(line);
+        return line === "/quit" ? "exit" : "continue";
+      },
+      onExit: () => {
+        pipedExited = true;
+        resolvePipedDone();
+      },
+      onInputEof: () => {
+        pipedEof = true;
+      },
+    });
+    pipedIn.end("one\ntwo\n/quit\n");
+    await pipedDone;
+    expect(drained).toEqual(["one", "two", "/quit"]);
+    expect(pipedExited).toBe(true);
+    expect(pipedEof).toBe(false);
+    pipedTerm.close();
+
+    // Pasting multiple lines ("one\rtwo\r") onto a TTY must NOT emit \x1b[1A and erase
+    // the formatted first message when rendering the second message!
+    const pasteIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const pasteOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 80,
+    });
+    let pasteBuf = "";
+    pasteOut.on("data", (c) => {
+      pasteBuf += c.toString("utf8");
+    });
+    let pasteCount = 0;
+    let resolvePasteDone!: () => void;
+    const pasteDone = new Promise<void>((r) => {
+      resolvePasteDone = r;
+    });
+    const pasteTerm = new InteractiveJoinTerminal({
+      stdin: pasteIn,
+      stdout: pasteOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async (line) => {
+        await Bun.sleep(10);
+        pasteTerm.eraseJustSubmittedSingleLineEcho(line);
+        pasteTerm.writeLine(`[12:00:10] @alice: ${line}`);
+        pasteCount += 1;
+        if (pasteCount === 2) resolvePasteDone();
+        return "continue";
+      },
+    });
+    pasteTerm.startPrompt();
+    pasteIn.write("one\rtwo\r");
+    await pasteDone;
+    expect(pasteBuf).toContain("[12:00:10] @alice: one\n");
+    expect(pasteBuf).toContain("[12:00:10] @alice: two\n");
+    expect(pasteBuf).not.toContain("\x1b[1A");
+    pasteTerm.close();
+
+    // Typing ahead while an async command handler is still running preserves cursor position
+    // (submitting "one", typing "partial" mid-flight, then "X\r" must yield "partialX", not "Xpartial")
+    const aheadIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const aheadOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 80,
+    });
+    const aheadLines: string[] = [];
+    let resolveAheadDone!: () => void;
+    const aheadDone = new Promise<void>((r) => {
+      resolveAheadDone = r;
+    });
+    const aheadTerm = new InteractiveJoinTerminal({
+      stdin: aheadIn,
+      stdout: aheadOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async (line) => {
+        aheadLines.push(line);
+        if (aheadLines.length === 1) {
+          await Bun.sleep(25);
+          aheadTerm.writeLine("[done] one");
+        } else {
+          resolveAheadDone();
+        }
+        return "continue";
+      },
+    });
+    aheadTerm.startPrompt();
+    aheadIn.write("one\r");
+    await Bun.sleep(5);
+    aheadIn.write("partial");
+    await Bun.sleep(35);
+    aheadIn.write("X\r");
+    await aheadDone;
+    expect(aheadLines).toEqual(["one", "partialX"]);
+    aheadTerm.close();
+
+    // Wrapped type-ahead (30 chars on 20-col TTY) during an async command retains
+    // readline's wrapped-row tracking so prompt restoration moves up before redrawing!
+    const wrappedAheadIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const wrappedAheadOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 20,
+    });
+    let wrappedAheadBuf = "";
+    wrappedAheadOut.on("data", (c) => {
+      wrappedAheadBuf += c.toString("utf8");
+    });
+    let resolveWrappedCmd!: () => void;
+    const wrappedCmdGate = new Promise<void>((r) => {
+      resolveWrappedCmd = r;
+    });
+    const wrappedAheadTerm = new InteractiveJoinTerminal({
+      stdin: wrappedAheadIn,
+      stdout: wrappedAheadOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async () => {
+        await wrappedCmdGate;
+        return "continue";
+      },
+    });
+    wrappedAheadTerm.startPrompt();
+    wrappedAheadIn.write("first\r");
+    await Bun.sleep(10);
+    wrappedAheadIn.write("123456789012345678901234567890");
+    await Bun.sleep(10);
+    wrappedAheadBuf = "";
+    resolveWrappedCmd();
+    await Bun.sleep(20);
+    expect(wrappedAheadBuf).toContain("\x1b[1A");
+    expect(wrappedAheadBuf).toContain("❯ 123456789012345678901234567890");
+    wrappedAheadTerm.close();
+
+    // Production wiring: executeJoinInputLine routed through createCommandOutputStream()
+    // on a 20-col TTY with 30 wrapped type-ahead chars clears the wrapped input BEFORE
+    // printing the command result and NEVER emits \x1b[1A after the result!
+    const wiredIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const wiredOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 20,
+    });
+    let wiredBuf = "";
+    wiredOut.on("data", (c) => {
+      wiredBuf += c.toString("utf8");
+    });
+    const wiredWorkDir = await makeTempDir("wired-tty");
+    const wiredFile = join(wiredWorkDir, "wired.txt");
+    await writeFile(wiredFile, "wired-data");
+    let releaseShare!: () => void;
+    const shareGate = new Promise<void>((r) => {
+      releaseShare = r;
+    });
+    const wiredFiles: FileManifest[] = [];
+    const wiredEngine = {
+      roomId: "f".repeat(64),
+      localPeerId: "peer_019a0000000070008000000000000099",
+      getFiles: () => wiredFiles,
+      getMessages: () => [],
+      shareFile: async () => {
+        await shareGate;
+        wiredFiles.push(sampleManifest);
+        return sampleManifest;
+      },
+    } as unknown as RoomPeerEngine;
+    const wiredStorage = new FsChunkStorageAdapter({
+      downloadDir: join(wiredWorkDir, "dl"),
+    });
+    const wiredShared = new LocalSharedFileRegistry();
+    const wiredTerm: InteractiveJoinTerminal = new InteractiveJoinTerminal({
+      stdin: wiredIn,
+      stdout: wiredOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      getFiles: () => wiredFiles,
+      onLine: async (rawLine): Promise<"continue" | "exit"> =>
+        executeJoinInputLine({
+          line: rawLine,
+          engine: wiredEngine,
+          chunkStorage: wiredStorage,
+          sharedFiles: wiredShared,
+          stdout: wiredTerm.createCommandOutputStream("stdout"),
+          cwd: wiredWorkDir,
+        }),
+    });
+    try {
+      wiredTerm.startPrompt();
+      wiredIn.write(`/send ${wiredFile}\r`);
+      await Bun.sleep(10);
+      // 30 single-cell accented characters ('é') on a 20-col TTY occupy exactly 2 rows
+      // (1 row up), NEVER 3 rows up (\x1b[3A) as a naive non-ASCII=2 estimate would emit!
+      wiredIn.write("é".repeat(30));
+      await Bun.sleep(10);
+      wiredBuf = "";
+      releaseShare();
+      await Bun.sleep(30);
+      expect(wiredBuf).toContain("\x1b[1A");
+      expect(wiredBuf).not.toContain("\x1b[2A");
+      expect(wiredBuf).not.toContain("\x1b[3A");
+      expect(wiredBuf).toContain("[file] Announced 'report.pdf'");
+      const afterAnnouncement = wiredBuf.slice(
+        wiredBuf.indexOf("[file] Announced 'report.pdf'"),
+      );
+      expect(afterAnnouncement).not.toContain("\x1b[1A");
+      expect(afterAnnouncement).toContain(`❯ ${"é".repeat(30)}`);
+    } finally {
+      wiredTerm.close();
+      await wiredShared.closeAll();
+      await wiredStorage.closeAll();
+    }
+
+    // /get 1 + 30 wrapped type-ahead chars in one chunk -> announcement prints ->
+    // user types an extra 'b' -> mid-command async progress arrives:
+    // the buffered type-ahead is restored immediately after the announcement so 'b'
+    // stays synchronized and subsequent progress only clears the prompt, NEVER the announcement!
+    const dlIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const dlOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 20,
+    });
+    let dlBuf = "";
+    dlOut.on("data", (c) => {
+      dlBuf += c.toString("utf8");
+    });
+    const dlStorage = new FsChunkStorageAdapter({
+      downloadDir: join(wiredWorkDir, "dl2"),
+    });
+    const dlShared = new LocalSharedFileRegistry();
+    let emitProgressGate!: () => void;
+    const progressGate = new Promise<void>((r) => {
+      emitProgressGate = r;
+    });
+    const dlEngine = {
+      roomId: "f".repeat(64),
+      localPeerId: "peer_019a0000000070008000000000000099",
+      getFiles: () => [sampleManifest],
+      getMessages: () => [],
+      downloadFile: async () => {
+        await progressGate;
+        dlTerm.writeAsyncLine("[file] Downloading 'report.pdf' 25%");
+      },
+    } as unknown as RoomPeerEngine;
+    const dlTerm: InteractiveJoinTerminal = new InteractiveJoinTerminal({
+      stdin: dlIn,
+      stdout: dlOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      getFiles: () => [sampleManifest],
+      onLine: async (rawLine): Promise<"continue" | "exit"> =>
+        executeJoinInputLine({
+          line: rawLine,
+          engine: dlEngine,
+          chunkStorage: dlStorage,
+          sharedFiles: dlShared,
+          stdout: dlTerm.createCommandOutputStream("stdout"),
+          cwd: wiredWorkDir,
+        }),
+    });
+    try {
+      dlTerm.startPrompt();
+      dlBuf = "";
+      dlIn.write(`/get 1\r${"a".repeat(30)}`);
+      await Bun.sleep(15);
+      // Announcement printed and wrapped type-ahead restored right below it
+      const startIdx = dlBuf.indexOf("[file] Starting Swarm download");
+      expect(startIdx).toBeGreaterThanOrEqual(0);
+      const afterStartBeforeKey = dlBuf.slice(startIdx);
+      expect(afterStartBeforeKey).toContain(`❯ ${"a".repeat(30)}`);
+
+      // Now user types an additional 'b' BEFORE progress arrives
+      dlBuf = "";
+      dlIn.write("b");
+      await Bun.sleep(10);
+      emitProgressGate();
+      await Bun.sleep(25);
+      // Moving up 1 row erases only the 2-row prompt `❯ a...ab`, leaving the announcement intact
+      expect(dlBuf).toContain("\x1b[1A");
+      expect(dlBuf).not.toContain("\x1b[2A");
+      expect(dlBuf).toContain("[file] Downloading 'report.pdf' 25%\n");
+      const afterProgress = dlBuf.slice(
+        dlBuf.indexOf("[file] Downloading 'report.pdf' 25%\n"),
+      );
+      expect(afterProgress).not.toContain("\x1b[1A");
+      expect(afterProgress).toContain(`❯ ${"a".repeat(30)}b`);
+    } finally {
+      dlTerm.close();
+      await dlShared.closeAll();
+      await dlStorage.closeAll();
+    }
+
+    // Async event arriving during a command with EMPTY next line draws an empty prompt;
+    // when the command later prints its result, it must clear that empty prompt first
+    // and then restore a fresh prompt below the result!
+    const midEventIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const midEventOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 80,
+    });
+    let midEventBuf = "";
+    midEventOut.on("data", (c) => {
+      midEventBuf += c.toString("utf8");
+    });
+    const midEventTerm: InteractiveJoinTerminal = new InteractiveJoinTerminal({
+      stdin: midEventIn,
+      stdout: midEventOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async () => {
+        midEventTerm.writeAsyncLine("[relay] Caching 'report.pdf' 50%");
+        midEventBuf = "";
+        midEventTerm.writeLine("[file] Announced 'report.pdf'");
+        return "continue";
+      },
+    });
+    midEventTerm.startPrompt();
+    midEventIn.write("/send report.pdf\r");
+    await Bun.sleep(25);
+    const annIdx = midEventBuf.indexOf("[file] Announced 'report.pdf'\n");
+    expect(annIdx).toBeGreaterThan(0);
+    // Cleared the empty prompt BEFORE writing the result, and restored a fresh prompt AFTER it
+    expect(midEventBuf.slice(0, annIdx)).toContain("\x1b[0J");
+    expect(midEventBuf.slice(annIdx + "[file] Announced 'report.pdf'\n".length)).toContain(
+      "❯ ",
+    );
+    midEventTerm.close();
+  });
+
+  test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {
+    const workDir = await makeTempDir("join-p1-ux");
+    const fakeHome = join(workDir, "home");
+    const docsDir = join(fakeHome, "Docs");
+    await Bun.write(join(docsDir, "My Report (Final).pdf"), "PDF_CONTENT");
+
+    // Path parser handles ~, single quotes, double quotes, POSIX escaped Finder paths,
+    // AND preserves native Windows drive/UNC backslashes intact
+    expect(
+      parseCliFilePathInput("~/Docs/My\\ Report\\ \\(Final\\).pdf", fakeHome, "darwin"),
+    ).toBe(join(docsDir, "My Report (Final).pdf"));
+    expect(
+      parseCliFilePathInput(`'${join(docsDir, "My Report (Final).pdf")}'`, fakeHome, "darwin"),
+    ).toBe(join(docsDir, "My Report (Final).pdf"));
+    expect(
+      parseCliFilePathInput(`"${join(docsDir, "My Report (Final).pdf")}"`, fakeHome, "darwin"),
+    ).toBe(join(docsDir, "My Report (Final).pdf"));
+    expect(
+      parseCliFilePathInput("C:\\Users\\alice\\report.pdf", "C:\\Users\\alice", "win32"),
+    ).toBe("C:\\Users\\alice\\report.pdf");
+    expect(
+      parseCliFilePathInput('"C:\\Users\\alice\\My Report.pdf"', "C:\\Users\\alice", "win32"),
+    ).toBe("C:\\Users\\alice\\My Report.pdf");
+    expect(
+      parseCliFilePathInput("\\\\filesrv\\share\\bundle.zip", "C:\\Users\\alice", "win32"),
+    ).toBe("\\\\filesrv\\share\\bundle.zip");
+    expect(
+      parseCliFilePathInput("~\\Documents\\notes.txt", "C:\\Users\\alice", "win32"),
+    ).toBe("C:\\Users\\alice\\Documents\\notes.txt");
+    expect(
+      parseCliFilePathInput("relative\\path\\file.bin", "C:\\Users\\alice", "win32"),
+    ).toBe("relative\\path\\file.bin");
+    expect(formatCliFsError({ code: "ENOENT" }, "/missing/file.bin")).toBe(
+      "File not found: /missing/file.bin",
+    );
+    expect(formatCliFsError({ code: "EISDIR" }, "/tmp")).toBe(
+      "Expected a file, but path is a directory: /tmp",
+    );
+
+    const roomId = "e".repeat(64);
+    const serverKeys = generateEd25519KeyPair();
+    const peerKeys = generateEd25519KeyPair();
+    const peerId = "peer_019a9999000070008000000000000001";
+    const cert = issuePeerIdentityCert({
+      serverKeyId: "srvk_01",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: generatePrefixedId("usr"),
+      username: "alice",
+      displayName: "Alice",
+      peerId,
+      peerSignPubKey: peerKeys.publicKeyBase64Url,
+      clientKind: "cli",
+    });
+
+    const files: FileManifest[] = [];
+    const messages: ChatMessageEnvelope[] = [];
+    const downloadedIds: string[] = [];
+    const cancelledIds: string[] = [];
+    const transferStatuses = new Map<
+      string,
+      "announced" | "downloading" | "seeding" | "paused" | "error"
+    >();
+    let retryCount = 0;
+
+    const mockEngine: RoomPeerEngine = {
+      roomId,
+      localPeerId: peerId,
+      start: async () => {},
+      stop: async () => {},
+      updateLocalCert: () => {},
+      isCenterConnected: () => true,
+      getSignalingPeerCount: () => 0,
+      getVerifiedPeers: () => [],
+      getMessages: () => messages,
+      getChatDeliveryStates: () => new Map(),
+      getFiles: () => files,
+      getTransferProgress: (fileId) => {
+        const manifest = files.find((f) => f.fileId === fileId);
+        const status = transferStatuses.get(fileId);
+        if (!manifest || !status) return undefined;
+        return {
+          fileId,
+          fileName: manifest.fileName,
+          fileSize: manifest.fileSize,
+          totalChunks: manifest.totalChunks,
+          completedChunks: status === "seeding" ? manifest.totalChunks : 0,
+          bytesCompleted: status === "seeding" ? manifest.fileSize : 0,
+          downloadSpeedBytesPerSec: 0,
+          availableSeeders: 1,
+          availablePeersWithChunks: 1,
+          status,
+        };
+      },
+      sendChatMessage: async (body, replyToMsgId) => {
+        const msg = signChatMessage({
+          roomId,
+          lamport: messages.length + 1,
+          body,
+          replyToMsgId: replyToMsgId ?? undefined,
+          authorCert: cert,
+          peerSignPrivKey: peerKeys.privateKeyBytes,
+        });
+        messages.push(msg);
+        return msg;
+      },
+      retryChatMessage: async () => {
+        retryCount += 1;
+      },
+      flushPendingRelayKeepalive: () => {},
+      shareFile: async (input) => {
+        const m = await createSignedFileManifestFromChunks({
+          roomId,
+          fileName: input.fileName,
+          fileSize: input.fileSize,
+          mimeType: input.mimeType,
+          readChunk: input.readChunk,
+          senderCert: cert,
+          peerSignPrivKey: peerKeys.privateKeyBytes,
+        });
+        files.push(m);
+        transferStatuses.set(m.fileId, "seeding");
+        return m;
+      },
+      downloadFile: async (fileId) => {
+        downloadedIds.push(fileId);
+        transferStatuses.set(fileId, "downloading");
+      },
+      cancelDownload: async (fileId) => {
+        cancelledIds.push(fileId);
+        transferStatuses.set(fileId, "paused");
+      },
+    };
+
+    const chunkStorage = new FsChunkStorageAdapter({
+      downloadDir: join(workDir, "dl"),
+    });
+    const sharedFiles = new LocalSharedFileRegistry();
+
+    const jsonLines: Record<string, unknown>[] = [];
+    const jsonStdout = new PassThrough();
+    jsonStdout.on("data", (c) => {
+      for (const l of c.toString("utf8").split("\n")) {
+        if (l.trim()) jsonLines.push(JSON.parse(l) as Record<string, unknown>);
+      }
+    });
+
+    let humanOut = "";
+    const humanStdout = new PassThrough();
+    humanStdout.on("data", (c) => {
+      humanOut += c.toString("utf8");
+    });
+
+    try {
+      // /send with Finder backslash-escaped spaces & tilde expansion
+      await executeJoinInputLine({
+        line: "/send ~/Docs/My\\ Report\\ \\(Final\\).pdf",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+        homeDir: fakeHome,
+      });
+      expect(files.length).toBe(1);
+      expect(files[0]!.fileName).toBe("My Report (Final).pdf");
+
+      // Missing file produces clean friendly error (no raw ENOENT stack noise)
+      await expect(
+        executeJoinInputLine({
+          line: "/send '/nonexistent/Ghost File.pdf'",
+          engine: mockEngine,
+          chunkStorage,
+          sharedFiles,
+          stdout: humanStdout,
+          cwd: workDir,
+          homeDir: fakeHome,
+        }),
+      ).rejects.toThrow("File not found: /nonexistent/Ghost File.pdf");
+
+      // /cancel refuses to destroy a locally shared (seeding) file
+      await executeJoinInputLine({
+        line: "/cancel 1",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(cancelledIds).toEqual([]);
+      expect(humanOut).toContain("already completed/seeding");
+
+      // Two files sharing the exact same 65-second UUIDv7 timestamp prefix get unambiguous
+      // random-tail selectors (and numeric-only tails like "00000002" resolve by ID, not list index!)
+      const sameBucketA = await createSignedManifestFixture({
+        roomId,
+        fileName: "same-minute-a.bin",
+        bytes: new TextEncoder().encode("A"),
+        fileId: "019a8888-1111-7000-8000-000000000001",
+      });
+      const sameBucketB = await createSignedManifestFixture({
+        roomId,
+        fileName: "same-minute-b.bin",
+        bytes: new TextEncoder().encode("B"),
+        fileId: "019a8888-1111-7000-8000-000000000002",
+      });
+      files.push(sameBucketA, sameBucketB);
+      const selA = formatUniqueFileSelector(
+        sameBucketA.fileId,
+        files.map((f) => f.fileId),
+      );
+      const selB = formatUniqueFileSelector(
+        sameBucketB.fileId,
+        files.map((f) => f.fileId),
+      );
+      expect(selA).toBe("00000001");
+      expect(selB).toBe("00000002");
+      await executeJoinInputLine({
+        line: `/get ${selB}`,
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(downloadedIds).toEqual([sameBucketB.fileId]);
+      // Now that sameBucketB is actively downloading, /cancel succeeds!
+      await executeJoinInputLine({
+        line: `/cancel ${selB}`,
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(cancelledIds).toEqual([sameBucketB.fileId]);
+      expect(humanOut).toContain("Cancelled download for 'same-minute-b.bin'");
+      // Shared 8-char timestamp prefix is correctly flagged as ambiguous
+      await expect(
+        executeJoinInputLine({
+          line: "/get 019a8888",
+          engine: mockEngine,
+          chunkStorage,
+          sharedFiles,
+          stdout: humanStdout,
+          cwd: workDir,
+        }),
+      ).rejects.toThrow("Ambiguous fileId");
+
+      // Chat + /reply renders reply quote context & /retry invokes engine.retryChatMessage
+      await executeJoinInputLine({
+        line: "Original statement",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      await executeJoinInputLine({
+        line: "/reply last Agreed!",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(humanOut).toContain("↳ replying to @alice: Original statement");
+      expect(messages[1]!.replyToMsgId).toBe(messages[0]!.msgId);
+
+      await executeJoinInputLine({
+        line: "/retry",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(retryCount).toBe(1);
+
+      // --json mode emits clean NDJSON objects for chat, /files, and /cancel
+      await executeJoinInputLine({
+        line: "JSON hello",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: jsonStdout,
+        cwd: workDir,
+        json: true,
+      });
+      await executeJoinInputLine({
+        line: "/files",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: jsonStdout,
+        cwd: workDir,
+        json: true,
+      });
+      expect(jsonLines.map((e) => e.type)).toEqual(["chat_sent", "files_snapshot"]);
+      expect(jsonLines[0]!.body).toBe("JSON hello");
+    } finally {
+      await sharedFiles.closeAll();
+      await chunkStorage.closeAll();
+    }
+  });
+
+  test("throttles download & relay progress with speed/ETA, formats Web-aligned fingerprints/timestamps/shortIds, and renders topic --help & seed human output", () => {
+    const tracker = new JoinTransferProgressTracker();
+    const fileId = "019a8888-1111-7000-8000-000000000099";
+
+    const first = tracker.consume(
+      {
+        fileId,
+        fileName: "archive.tar.gz",
+        fileSize: 2 * 1024 * 1024,
+        totalChunks: 32,
+        completedChunks: 8,
+        bytesCompleted: 512 * 1024,
+        downloadSpeedBytesPerSec: 512 * 1024,
+        availableSeeders: 2,
+        availablePeersWithChunks: 2,
+        status: "downloading",
+      },
+      1_000,
+    );
+    expect(first.length).toBe(1);
+    expect(first[0]).toContain("Downloading 'archive.tar.gz' 25%");
+    expect(first[0]).toContain("ETA 3s");
+    expect(first[0]).toContain("[peers: 2]");
+
+    // Rapid follow-up within 500ms is throttled
+    expect(
+      tracker.consume(
+        {
+          fileId,
+          fileName: "archive.tar.gz",
+          fileSize: 2 * 1024 * 1024,
+          totalChunks: 32,
+          completedChunks: 10,
+          bytesCompleted: 640 * 1024,
+          downloadSpeedBytesPerSec: 512 * 1024,
+          availableSeeders: 2,
+          availablePeersWithChunks: 2,
+          status: "downloading",
+        },
+        1_200,
+      ),
+    ).toEqual([]);
+
+    // Pause and relay caching transitions emit crisp updates
+    const paused = tracker.consume(
+      {
+        fileId,
+        fileName: "archive.tar.gz",
+        fileSize: 2 * 1024 * 1024,
+        totalChunks: 32,
+        completedChunks: 10,
+        bytesCompleted: 640 * 1024,
+        downloadSpeedBytesPerSec: 0,
+        availableSeeders: 1,
+        availablePeersWithChunks: 1,
+        status: "paused",
+        relayCacheState: "uploading",
+        relayCachedChunks: 4,
+      },
+      2_000,
+    );
+    expect(paused[0]).toContain("Paused 'archive.tar.gz' at 31% — run '/get 00000099' to resume");
+    expect(paused[1]).toContain("[relay] Caching 'archive.tar.gz' 12% (4/32 chunks)");
+
+    const cached = tracker.consume(
+      {
+        fileId,
+        fileName: "archive.tar.gz",
+        fileSize: 2 * 1024 * 1024,
+        totalChunks: 32,
+        completedChunks: 32,
+        bytesCompleted: 2 * 1024 * 1024,
+        downloadSpeedBytesPerSec: 0,
+        availableSeeders: 1,
+        availablePeersWithChunks: 1,
+        status: "seeding",
+        relayCacheState: "cached",
+        relayCachedChunks: 32,
+      },
+      3_000,
+    );
+    expect(cached).toEqual(["[relay] Cached 'archive.tar.gz' for offline peers"]);
+
+    // Fingerprint matches Web `#xxxxxxxx`, short IDs use random tail, and old sync messages include YYYY-MM-DD
+    expect(formatCliRoomFingerprint("D7276E1899aabbcc")).toBe("#d7276e18");
+    expect(formatShortId("peer_019a1234567890abcdef", 8)).toBe("peer_90abcdef");
+    expect(formatShortId(fileId, 8)).toBe("00000099");
+
+    const nowMs = new Date(2026, 10, 28, 15, 0, 0).getTime();
+    const todayMs = new Date(2026, 10, 28, 9, 5, 4).getTime();
+    const yesterdayMs = new Date(2026, 10, 27, 22, 10, 30).getTime();
+    expect(formatCliTimestamp(todayMs, nowMs)).toBe("09:05:04");
+    expect(formatCliTimestamp(yesterdayMs, nowMs)).toBe("2026-11-27 22:10:30");
+
+    // Color detection respects isTTY & NO_COLOR
+    expect(shouldUseColor({ isTTY: true }, {})).toBe(true);
+    expect(shouldUseColor({ isTTY: true }, { NO_COLOR: "1" })).toBe(false);
+    expect(shouldUseColor({ isTTY: false }, {})).toBe(false);
+
+    // Topic --help covers join slash commands, -u, ./downloads, and --passphrase-stdin
+    const joinHelp = formatHelpText("join");
+    expect(joinHelp).toContain("/cancel <fileId|index>");
+    expect(joinHelp).toContain("./downloads");
+    expect(joinHelp).toContain("--passphrase-stdin");
+    expect(formatHelpText("register")).toContain("-u, --username");
+    expect(formatHelpText("seed")).toContain("human-readable");
+
+    // Seed human event formatter omits filenames and stays readable
+    expect(
+      formatSeedQuotaHumanEvent({
+        kind: "accepted",
+        fileId,
+        fileSize: 65_536,
+        totalChunks: 1,
+      }),
+    ).toBe("[seed] Caching file 00000099 (64.0 KiB, 1 chunks)...");
+  });
+
+  test("register pre-validates username locally, prompts server/displayName/confirm-password on interactive TTY, and adds --server hint on network errors", async () => {
+    const configDir = await makeTempDir("reg-ux");
+    expect(() => validateRegisterUsernameLocal("ab")).toThrow("Invalid username");
+    expect(() => validateRegisterUsernameLocal("bad space")).toThrow("Invalid username");
+    expect(validateRegisterUsernameLocal("Alice_01")).toBe("alice_01");
+
+    // 1. Local username validation rejects BEFORE requesting password or hitting network
+    let networkCalls = 0;
+    const badUserStderr = new PassThrough();
+    let badUserErr = "";
+    badUserStderr.on("data", (c) => {
+      badUserErr += c.toString("utf8");
+    });
+    const badCode = await runCli(
+      ["register", "--server", "http://127.0.0.1:3999", "-u", "x", "--config-dir", configDir],
+      {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: badUserStderr,
+        fetchImpl: (async () => {
+          networkCalls += 1;
+          return Response.json({ ok: true });
+        }) as unknown as typeof fetch,
+      },
+    );
+    expect(badCode).toBe(1);
+    expect(networkCalls).toBe(0);
+    expect(badUserErr).toContain("Invalid username");
+
+    // 2. Network failure appends actionable --server hint
+    const netStdin = new PassThrough();
+    netStdin.end("ValidPass!123\n");
+    const netStderr = new PassThrough();
+    let netErr = "";
+    netStderr.on("data", (c) => {
+      netErr += c.toString("utf8");
+    });
+    const netCode = await runCli(
+      [
+        "register",
+        "-u",
+        "alice_net",
+        "--password-stdin",
+        "--config-dir",
+        configDir,
+      ],
+      {
+        stdin: netStdin,
+        stdout: new PassThrough(),
+        stderr: netStderr,
+        env: {},
+        fetchImpl: (async () => {
+          throw new Error("Connection refused");
+        }) as unknown as typeof fetch,
+      },
+    );
+    expect(netCode).toBe(1);
+    expect(netErr).toContain("Pass --server <url> or set SIMPLEIM_SERVER_URL");
+
+    // 3. Interactive TTY register prompts for server URL, display name, and password confirmation
+    const makeFakeTty = () => {
+      const stream = Object.assign(new PassThrough(), {
+        isTTY: true,
+        isRaw: false,
+        setRawMode(mode: boolean) {
+          this.isRaw = mode;
+          return this;
+        },
+      });
+      return stream;
+    };
+
+    const mismatchTty = makeFakeTty();
+    const mismatchErr = new PassThrough();
+    let mismatchText = "";
+    mismatchErr.on("data", (c) => {
+      mismatchText += c.toString("utf8");
+    });
+    const mismatchPromise = runCli(
+      ["register", "--config-dir", configDir],
+      {
+        stdin: mismatchTty,
+        stdout: new PassThrough(),
+        stderr: mismatchErr,
+        env: {},
+        fetchImpl: (async () => {
+          networkCalls += 1;
+          return Response.json({ ok: true });
+        }) as unknown as typeof fetch,
+      },
+    );
+    // Feed: server URL, username, display name, password, mismatched confirmation
+    await Bun.sleep(10);
+    mismatchTty.write("https://im.example.com\n");
+    await Bun.sleep(10);
+    mismatchTty.write("tty_alice\n");
+    await Bun.sleep(10);
+    mismatchTty.write("TTY Alice\n");
+    await Bun.sleep(10);
+    mismatchTty.write("CorrectPass!99\r");
+    await Bun.sleep(10);
+    mismatchTty.write("WrongPass!99\r");
+
+    expect(await mismatchPromise).toBe(1);
+    expect(networkCalls).toBe(0);
+    expect(mismatchText).toContain("Server URL [");
+    expect(mismatchText).toContain("Display name (optional");
+    expect(mismatchText).toContain("Confirm password:");
+    expect(mismatchText).toContain("Passwords do not match");
   });
 });
