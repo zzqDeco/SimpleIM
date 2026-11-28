@@ -5,6 +5,7 @@ Before changing behavior, cryptography, or wire protocols, read:
 - [`docs/architecture/overview.md`](docs/architecture/overview.md) — hybrid-P2P topology, trust boundaries, and delivery guarantees
 - [`docs/contracts/signaling-v1.md`](docs/contracts/signaling-v1.md) — central HTTP identity & ephemeral WebSocket signaling contracts
 - [`docs/contracts/p2p-v1.md`](docs/contracts/p2p-v1.md) — client KDF, DTLS-bound `HELLO_AUTH`, chat sync, and binary Swarm file contracts
+- [`docs/design/design-language.md`](docs/design/design-language.md) — Web design tokens, WCAG AA contrast rules, vendored Lucide icons, and `design-system/` component conventions
 
 ---
 
@@ -45,6 +46,7 @@ src/main.ts ──► adapter/{http,ws} ──► app ──► domain ◄──
 
 - **Zero Room/Chat Persistence**: `infra/sqlite` migrations may define only `schema_migrations`, `users`, and `sessions`. Persisting room hashes, membership history, chat messages, or file metadata on the server is strictly prohibited.
 - **Architecture Gate (`arch.test.ts`)**: AST import checks fail `bun test` whenever any workspace package or `apps/server` layer violates its allowed import boundary.
+- **Web Design-System Gate (`design-tokens.test.ts` & `arch.test.ts`)**: All new UI in `apps/web` must use tokens from `apps/web/src/styles/tokens.css` and primitives from `apps/web/src/design-system/` (see [`docs/design/design-language.md`](docs/design/design-language.md); native `<button>` in `features/` and raw style values outside `tokens.css` fail `bun run lint`).
 
 ---
 

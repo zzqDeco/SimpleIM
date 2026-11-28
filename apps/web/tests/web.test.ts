@@ -80,6 +80,7 @@ import {
 import { I18nProvider } from "../src/i18n/I18nProvider.tsx";
 import { MessageTranscript } from "../src/features/room/MessageTranscript.tsx";
 import { RoomTopBar } from "../src/features/room/RoomTopBar.tsx";
+import { Gallery } from "../src/preview/Gallery.tsx";
 import { ThemeProvider } from "../src/theme/ThemeProvider.tsx";
 import { deriveMessageViewModel } from "../src/state/message-vm.ts";
 import {
@@ -3418,5 +3419,46 @@ describe("Issue #41 Pre-Paint Theme Init Parity", () => {
     expect(
       indexHtml.indexOf('<script src="/theme-init.js"></script>'),
     ).toBeLessThan(indexHtml.indexOf('<script type="module"'));
+  });
+
+  test("dev-only design-system preview Gallery SSR-renders every section with zero color emojis and is excluded from Vite production config", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        ThemeProvider,
+        null,
+        createElement(I18nProvider, null, createElement(Gallery)),
+      ),
+    );
+
+    const expectedSections = [
+      "preview-section-palette",
+      "preview-section-scales",
+      "preview-section-icons",
+      "preview-section-buttons",
+      "preview-section-inputs",
+      "preview-section-feedback",
+      "preview-section-overlays",
+    ] as const;
+
+    for (const sectionId of expectedSections) {
+      expect(
+        html,
+        `Gallery missing required section ${sectionId}`,
+      ).toContain(`data-testid="${sectionId}"`);
+    }
+    expect(html).not.toMatch(/\p{Extended_Pictographic}/u);
+
+    const previewHtml = readFileSync(
+      join(import.meta.dir, "../preview.html"),
+      "utf8",
+    );
+    expect(previewHtml).toContain('<script src="/theme-init.js"></script>');
+    expect(previewHtml).toContain('/src/preview/main.tsx');
+
+    const viteConfig = readFileSync(
+      join(import.meta.dir, "../vite.config.ts"),
+      "utf8",
+    );
+    expect(viteConfig).not.toContain("preview.html");
   });
 });

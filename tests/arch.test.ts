@@ -206,12 +206,37 @@ describe("Workspace & Clean Architecture Import Boundaries", () => {
       const rel = relative(webSrc, file).split(sep).join("/");
       const specs = extractImportSpecifiers(file);
 
+      if (!rel.startsWith("preview/")) {
+        for (const spec of specs) {
+          expect(
+            spec.includes("/preview") || spec === "./preview",
+            `production web source apps/web/src/${rel} must never import dev-only preview ('${spec}')`,
+          ).toBe(false);
+        }
+      }
+
       if (rel.startsWith("design-system/")) {
         for (const spec of specs) {
           const allowed = spec === "react" || spec.startsWith("./");
           expect(
             allowed,
             `design-system must remain pure UI (apps/web/src/${rel} imported '${spec}')`,
+          ).toBe(true);
+        }
+      } else if (rel.startsWith("preview/")) {
+        for (const spec of specs) {
+          const allowed =
+            spec === "react" ||
+            spec === "react-dom" ||
+            spec === "react-dom/client" ||
+            spec.startsWith("./") ||
+            spec.startsWith("../design-system/") ||
+            spec.startsWith("../theme/") ||
+            spec.startsWith("../i18n/") ||
+            spec.startsWith("../styles/");
+          expect(
+            allowed,
+            `preview layer may only import design-system, theme, i18n, styles, react, or react-dom (apps/web/src/${rel} imported '${spec}')`,
           ).toBe(true);
         }
       } else if (rel.startsWith("state/")) {
@@ -266,7 +291,8 @@ describe("Workspace & Clean Architecture Import Boundaries", () => {
             spec.includes("/api/") ||
             spec.includes("/crypto/") ||
             spec.includes("/storage/") ||
-            spec.includes("/transport/");
+            spec.includes("/transport/") ||
+            spec.includes("/preview/");
           expect(
             touchesLowLevelAdapters,
             `feature view must use hooks/state instead of low-level adapters in apps/web/src/${rel}: '${spec}'`,
