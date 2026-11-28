@@ -80,6 +80,9 @@ export interface TranslationSchema {
   "room.wipeConfirmTitle": string;
   "room.wipeConfirmAction": string;
   "room.wipeCancel": string;
+  "room.leaveConfirmTitle": string;
+  "room.leaveConfirmAction": string;
+  "room.leaveCancel": string;
   "room.railAria": string;
   "room.rail.heading": string;
   "room.rail.addButton": string;

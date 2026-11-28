@@ -1,4 +1,10 @@
-import { useState, type FormEvent, type ReactElement } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactElement,
+} from "react";
 import type { UserProfile } from "@simpleim/contracts";
 import {
   Button,
@@ -9,6 +15,7 @@ import {
 import type { JoinPhase } from "../../hooks/useRoomSession.ts";
 import {
   formatAppFailure,
+  toAppFailure,
   type AppFailure,
 } from "../../i18n/error-catalog.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
@@ -42,9 +49,52 @@ export function JoinRoomScreen({
   const [alias, setAlias] = useState("");
   const [showPassphrase, setShowPassphrase] = useState(false);
   const [localFailure, setLocalFailure] = useState<AppFailure | null>(null);
+  const [confirmingWipe, setConfirmingWipe] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
+  const wipeMenuRef = useRef<HTMLDivElement | null>(null);
 
-  const busy = joinPhase !== "idle";
+  const busy = joinPhase !== "idle" || actionBusy;
   const activeFailure = localFailure ?? joinFailure;
+
+  useEffect(() => {
+    if (!confirmingWipe) return;
+    const handlePointerDown = (ev: PointerEvent): void => {
+      const target = ev.target as Node | null;
+      if (
+        wipeMenuRef.current &&
+        target &&
+        !wipeMenuRef.current.contains(target)
+      ) {
+        setConfirmingWipe(false);
+      }
+    };
+    const handleKeyDown = (ev: KeyboardEvent): void => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        setConfirmingWipe(false);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [confirmingWipe]);
+
+  const runAccountAction = async (fn: () => Promise<void>): Promise<void> => {
+    if (busy) return;
+    setActionBusy(true);
+    setLocalFailure(null);
+    try {
+      await fn();
+      setConfirmingWipe(false);
+    } catch (err) {
+      setLocalFailure(toAppFailure(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
 
   const handleSubmit = async (ev: FormEvent<HTMLFormElement>): Promise<void> => {
     ev.preventDefault();
@@ -84,20 +134,59 @@ export function JoinRoomScreen({
             variant="secondary"
             size="sm"
             testId="sign-out-button"
-            onClick={() => void onSignOut()}
+            onClick={() => void runAccountAction(onSignOut)}
             disabled={busy}
           >
             {t("lobby.signOut")}
           </Button>
-          <Button
-            variant="danger"
-            size="sm"
-            testId="wipe-vault-button"
-            onClick={() => void onWipeAndSignOut()}
-            disabled={busy}
-          >
-            {t("lobby.wipeSignOut")}
-          </Button>
+          <div ref={wipeMenuRef} className="more-menu-root">
+            <Button
+              variant="danger"
+              size="sm"
+              testId="wipe-vault-button"
+              aria-expanded={confirmingWipe}
+              onClick={() => setConfirmingWipe((v) => !v)}
+              disabled={busy}
+            >
+              {t("lobby.wipeSignOut")}
+            </Button>
+            {confirmingWipe ? (
+              <div
+                className="more-menu-popover"
+                role="dialog"
+                aria-label={t("lobby.wipeSignOut")}
+              >
+                <div
+                  className="more-menu-wipe-confirm"
+                  data-testid="wipe-vault-confirm-panel"
+                >
+                  <p className="more-menu-wipe-warning">
+                    {t("room.wipeConfirmTitle")}
+                  </p>
+                  <div className="more-menu-wipe-buttons">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      testId="wipe-vault-cancel-button"
+                      disabled={busy}
+                      onClick={() => setConfirmingWipe(false)}
+                    >
+                      {t("room.wipeCancel")}
+                    </Button>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      testId="wipe-vault-confirm-button"
+                      disabled={busy}
+                      onClick={() => void runAccountAction(onWipeAndSignOut)}
+                    >
+                      {t("room.wipeConfirmAction")}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+          </div>
         </div>
       </header>
 

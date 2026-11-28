@@ -61,6 +61,10 @@ export const es = {
     "¿Borrar todas las claves y el historial local y salir?",
   "room.wipeConfirmAction": "Confirmar borrado",
   "room.wipeCancel": "Cancelar",
+  "room.leaveConfirmTitle":
+    "Se eliminarán {count} mensajes locales y las claves de esta sala. Deberás volver a introducir la frase clave para entrar. ¿Salir?",
+  "room.leaveConfirmAction": "Confirmar salida",
+  "room.leaveCancel": "Cancelar",
   "room.railAria": "Lista de salas unidas",
   "room.rail.heading": "Salas",
   "room.rail.addButton": "+ Unirse / Nueva",

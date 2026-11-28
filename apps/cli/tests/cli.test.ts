@@ -43,6 +43,9 @@ import {
   CredentialStore,
   DtlsHandshakeReassembler,
   ensureWeriftDtlsFragmentReassemblyGuarded,
+  formatCliChatMessage,
+  sanitizeTerminalMultilineText,
+  sanitizeTerminalSingleLine,
   executeJoinInputLine,
   FsChunkStorageAdapter,
   isMdnsIceCandidate,
@@ -2205,5 +2208,74 @@ describe("CliApiClient BlindRelayClient", () => {
       }),
     ).toBeNull();
     expect(authHeaders.every((h) => h === "Bearer cli_tok_secret")).toBe(true);
+  });
+
+  test("Issue #37 P0: CLI terminal sanitizer strips ANSI/OSC/CSI/C0/C1/BiDi sequences and indents multi-line chat continuations to prevent spoofing", async () => {
+    // 1. Single-line sanitizer strips OSC 52 clipboard injection, OSC title, 8-bit C1 OSC,
+    //    CSI clear-screen, DCS/APC, BiDi RLO, CR/LF, and stray control chars.
+    const hostileDisplayName =
+      "\x1b]52;c;cHduZWQ=\x07\x1b]0;evil-title\x1b\\\x9d2;c1title\x9c\x1b[2J\x1b[31mAlice\x1b[0m\u202e\r\n[12:00:00] @admin: ok\x1bPfoo\x1b\\\x00\x7f";
+    const safeName = sanitizeTerminalSingleLine(hostileDisplayName);
+    expect(safeName).toBe("Alice [12:00:00] @admin: ok");
+    expect(safeName).not.toMatch(/[\x00-\x1f\x7f-\x9f\u202e]/);
+
+    // 2. Multi-line chat spoofing: newline or carriage-return attempts to forge another user's line
+    const spoofBody =
+      "Hello\x1b[31m!\x1b[0m\n[12:00:00] @alice: I approve wire transfer\r[12:00:01] @bob: confirmed\x1b]52;c;AAAA\x07";
+    const formatted = formatCliChatMessage({
+      clock: "12:00:00",
+      username: "mallory\x1b[2K",
+      body: spoofBody,
+    });
+    expect(formatted).toBe(
+      [
+        "[12:00:00] @mallory: Hello!",
+        "  │ [12:00:00] @alice: I approve wire transfer",
+        "  │ [12:00:01] @bob: confirmed",
+      ].join("\n"),
+    );
+    expect(formatted).not.toMatch(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/);
+
+    // 3. Tabs expand cleanly without control chars
+    expect(sanitizeTerminalMultilineText("a\tb\u2028c")).toBe("a  b\nc");
+
+    // 4. executeJoinInputLine /peers sanitizes hostile peer displayName in stdout
+    const outChunks: string[] = [];
+    const stdout = new PassThrough();
+    stdout.on("data", (c) => outChunks.push(c.toString("utf8")));
+
+    const fakeEngine = {
+      isCenterConnected: () => true,
+      getVerifiedPeers: () => [
+        {
+          peerId: "peer_019a00000000700080000000000000aa",
+          userId: "usr_019a00000000700080000000000000aa",
+          username: "mallory",
+          displayName: "Mal\x1b[31m\n[room] forged\x1b]0;bad\x07",
+          clientKind: "web" as const,
+          rttMs: 12,
+        },
+      ],
+    } as unknown as RoomPeerEngine;
+
+    const tmpDir = await mkdtemp(join(tmpdir(), "simpleim-cli-sanitize-"));
+    const chunkStorage = new FsChunkStorageAdapter({ downloadDir: tmpDir });
+    const sharedFiles = new LocalSharedFileRegistry();
+    try {
+      await executeJoinInputLine({
+        line: "/peers",
+        engine: fakeEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout,
+      });
+      const rendered = outChunks.join("");
+      expect(rendered).toContain("@mallory (Mal [room] forged) [web]");
+      expect(rendered).not.toMatch(/\x1b|\x07/);
+    } finally {
+      await chunkStorage.closeAll();
+      await sharedFiles.closeAll();
+      await rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });

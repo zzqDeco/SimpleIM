@@ -61,6 +61,10 @@ export const en = {
     "Wipe all local room keys & chat history and sign out?",
   "room.wipeConfirmAction": "Confirm Wipe",
   "room.wipeCancel": "Cancel",
+  "room.leaveConfirmTitle":
+    "This deletes {count} local message(s) and keys for this room. You must re-enter the passphrase to rejoin. Leave room?",
+  "room.leaveConfirmAction": "Confirm Leave",
+  "room.leaveCancel": "Cancel",
   "room.railAria": "Joined rooms",
   "room.rail.heading": "Rooms",
   "room.rail.addButton": "+ Join / New",

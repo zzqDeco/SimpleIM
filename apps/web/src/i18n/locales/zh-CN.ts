@@ -60,6 +60,10 @@ export const zhCN = {
   "room.wipeConfirmTitle": "确认清除本地全部房间密钥与聊天记录并退出？",
   "room.wipeConfirmAction": "确认清除",
   "room.wipeCancel": "取消",
+  "room.leaveConfirmTitle":
+    "将永久删除本机该群的 {count} 条消息与密钥，需重新输入口令才能再次加入。确认退出该群？",
+  "room.leaveConfirmAction": "确认退出该群",
+  "room.leaveCancel": "取消",
   "room.railAria": "已加入的群聊列表",
   "room.rail.heading": "已加入群聊",
   "room.rail.addButton": "+ 加入/新建",

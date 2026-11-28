@@ -61,6 +61,10 @@ export const ko = {
     "기기의 모든 방 키와 대화 기록을 삭제하고 로그아웃할까요?",
   "room.wipeConfirmAction": "삭제 후 로그아웃",
   "room.wipeCancel": "취소",
+  "room.leaveConfirmTitle":
+    "이 기기의 메시지 {count}개와 방 키가 영구 삭제되며, 다시 참여하려면 암호 구문을 다시 입력해야 합니다. 나가시겠습니까?",
+  "room.leaveConfirmAction": "나가기 확인",
+  "room.leaveCancel": "취소",
   "room.railAria": "참여한 대화방 목록",
   "room.rail.heading": "대화방",
   "room.rail.addButton": "+ 참여/추가",

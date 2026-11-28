@@ -61,6 +61,10 @@ export const ja = {
     "端末内の全ルーム鍵と履歴を削除してログアウトしますか？",
   "room.wipeConfirmAction": "削除して退出",
   "room.wipeCancel": "キャンセル",
+  "room.leaveConfirmTitle":
+    "端末内のこのルームのメッセージ {count} 件と鍵が完全削除され、再参加には合言葉の再入力が必要です。退出しますか？",
+  "room.leaveConfirmAction": "退出を確定",
+  "room.leaveCancel": "キャンセル",
   "room.railAria": "参加済みルーム一覧",
   "room.rail.heading": "参加ルーム",
   "room.rail.addButton": "+ 参加/新規",

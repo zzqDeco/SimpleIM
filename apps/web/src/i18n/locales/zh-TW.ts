@@ -60,6 +60,10 @@ export const zhTW = {
   "room.wipeConfirmTitle": "確認清除本機全部房間金鑰與聊天紀錄並登出？",
   "room.wipeConfirmAction": "確認清除",
   "room.wipeCancel": "取消",
+  "room.leaveConfirmTitle":
+    "將永久刪除本機該群的 {count} 則訊息與金鑰，需重新輸入口令才能再次加入。確認退出該群？",
+  "room.leaveConfirmAction": "確認退出該群",
+  "room.leaveCancel": "取消",
   "room.railAria": "已加入的群聊列表",
   "room.rail.heading": "已加入群聊",
   "room.rail.addButton": "+ 加入/新建",

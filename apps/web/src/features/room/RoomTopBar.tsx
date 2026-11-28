@@ -15,6 +15,7 @@ export interface RoomTopBarProps {
   readonly totalUnreadCount: number;
   readonly peerCount: number;
   readonly fileCount: number;
+  readonly messageCount: number;
   readonly railOpen: boolean;
   readonly sidebarExpanded: boolean;
   readonly moreMenuOpen: boolean;
@@ -37,6 +38,7 @@ export function RoomTopBar({
   totalUnreadCount,
   peerCount,
   fileCount,
+  messageCount,
   railOpen,
   sidebarExpanded,
   moreMenuOpen,
@@ -140,6 +142,7 @@ export function RoomTopBar({
         <RoomMoreMenu
           open={moreMenuOpen}
           username={username}
+          messageCount={messageCount}
           onOpenChange={onMoreMenuOpenChange}
           onLeaveRoom={onLeaveRoom}
           onSignOut={onSignOut}

@@ -6,6 +6,7 @@ import { PreferenceControls } from "../preferences/PreferenceControls.tsx";
 export interface RoomMoreMenuProps {
   readonly open: boolean;
   readonly username: string;
+  readonly messageCount: number;
   readonly onOpenChange: (next: boolean) => void;
   readonly onLeaveRoom: () => Promise<void>;
   readonly onSignOut: () => Promise<void>;
@@ -13,9 +14,12 @@ export interface RoomMoreMenuProps {
   readonly onActionError?: (err: unknown) => void;
 }
 
+type PendingDestructiveConfirm = "none" | "leave" | "wipe";
+
 export function RoomMoreMenu({
   open,
   username,
+  messageCount,
   onOpenChange,
   onLeaveRoom,
   onSignOut,
@@ -24,12 +28,13 @@ export function RoomMoreMenu({
 }: RoomMoreMenuProps): ReactElement {
   const { t } = useI18n();
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const [confirmingWipe, setConfirmingWipe] = useState(false);
+  const [pendingConfirm, setPendingConfirm] =
+    useState<PendingDestructiveConfirm>("none");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!open) {
-      setConfirmingWipe(false);
+      setPendingConfirm("none");
       return;
     }
 
@@ -98,16 +103,47 @@ export function RoomMoreMenu({
           <div className="more-menu-divider" role="separator" />
 
           <div className="more-menu-actions">
-            <Button
-              variant="secondary"
-              size="sm"
-              className="more-menu-action-btn"
-              testId="leave-room-button"
-              disabled={busy}
-              onClick={() => void runAction(onLeaveRoom)}
-            >
-              {t("room.leave")}
-            </Button>
+            {pendingConfirm === "leave" ? (
+              <div
+                className="more-menu-wipe-confirm"
+                data-testid="leave-room-confirm-panel"
+              >
+                <p className="more-menu-wipe-warning">
+                  {t("room.leaveConfirmTitle", { count: messageCount })}
+                </p>
+                <div className="more-menu-wipe-buttons">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    testId="leave-room-cancel-button"
+                    disabled={busy}
+                    onClick={() => setPendingConfirm("none")}
+                  >
+                    {t("room.leaveCancel")}
+                  </Button>
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    testId="leave-room-confirm-button"
+                    disabled={busy}
+                    onClick={() => void runAction(onLeaveRoom)}
+                  >
+                    {t("room.leaveConfirmAction")}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <Button
+                variant="secondary"
+                size="sm"
+                className="more-menu-action-btn"
+                testId="leave-room-button"
+                disabled={busy}
+                onClick={() => setPendingConfirm("leave")}
+              >
+                {t("room.leave")}
+              </Button>
+            )}
 
             <Button
               variant="secondary"
@@ -123,7 +159,7 @@ export function RoomMoreMenu({
 
           <div className="more-menu-divider" role="separator" />
 
-          {confirmingWipe ? (
+          {pendingConfirm === "wipe" ? (
             <div
               className="more-menu-wipe-confirm"
               data-testid="wipe-vault-confirm-panel"
@@ -137,7 +173,7 @@ export function RoomMoreMenu({
                   size="sm"
                   testId="wipe-vault-cancel-button"
                   disabled={busy}
-                  onClick={() => setConfirmingWipe(false)}
+                  onClick={() => setPendingConfirm("none")}
                 >
                   {t("room.wipeCancel")}
                 </Button>
@@ -159,7 +195,7 @@ export function RoomMoreMenu({
               className="more-menu-action-btn"
               testId="wipe-vault-button"
               disabled={busy}
-              onClick={() => setConfirmingWipe(true)}
+              onClick={() => setPendingConfirm("wipe")}
             >
               {t("room.wipeSignOut")}
             </Button>
