@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createElement } from "react";
 import { describe, expect, test } from "bun:test";
@@ -3335,5 +3335,322 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(barHtml).toContain("top-bar-btn-icon");
     expect(barHtml).toContain("top-bar-btn-count");
     expect(barHtml).toContain('aria-label="');
+  });
+});
+
+function stripCssComments(css: string): string {
+  return css.replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+function parseCssCustomProperties(blockBody: string): Record<string, string> {
+  const vars: Record<string, string> = {};
+  const declRe = /(--[a-z0-9-]+)\s*:\s*([^;]+);/gi;
+  let match: RegExpExecArray | null;
+  while ((match = declRe.exec(blockBody)) !== null) {
+    vars[match[1]!] = match[2]!.trim();
+  }
+  return vars;
+}
+
+function parseHexRgb(hex: string): [number, number, number] {
+  const clean = hex.trim().replace(/^#/, "");
+  if (clean.length === 3) {
+    return [
+      Number.parseInt(clean[0]! + clean[0]!, 16),
+      Number.parseInt(clean[1]! + clean[1]!, 16),
+      Number.parseInt(clean[2]! + clean[2]!, 16),
+    ];
+  }
+  if (clean.length !== 6) {
+    throw new Error(`Unsupported hex color: ${hex}`);
+  }
+  return [
+    Number.parseInt(clean.slice(0, 2), 16),
+    Number.parseInt(clean.slice(2, 4), 16),
+    Number.parseInt(clean.slice(4, 6), 16),
+  ];
+}
+
+function compositeRgbaOverHex(
+  rgba: string,
+  bgHex: string,
+): [number, number, number] {
+  const m = rgba
+    .trim()
+    .match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)$/i);
+  if (!m) {
+    throw new Error(`Unsupported rgba color: ${rgba}`);
+  }
+  const r = Number(m[1]);
+  const g = Number(m[2]);
+  const b = Number(m[3]);
+  const alpha = m[4] !== undefined ? Number(m[4]) : 1;
+  const [br, bg, bb] = parseHexRgb(bgHex);
+  return [
+    r * alpha + br * (1 - alpha),
+    g * alpha + bg * (1 - alpha),
+    b * alpha + bb * (1 - alpha),
+  ];
+}
+
+function relativeLuminance([r, g, b]: [number, number, number]): number {
+  const linearize = (channel: number): number => {
+    const s = channel / 255;
+    return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b);
+}
+
+function contrastRatio(
+  c1: [number, number, number],
+  c2: [number, number, number],
+): number {
+  const l1 = relativeLuminance(c1);
+  const l2 = relativeLuminance(c2);
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+}
+
+function extractThemeBlock(
+  cssWithoutComments: string,
+  selectorPattern: RegExp,
+): string {
+  const m = selectorPattern.exec(cssWithoutComments);
+  expect(
+    m,
+    `Missing CSS block matching ${selectorPattern.source}`,
+  ).not.toBeNull();
+  const idx = m!.index;
+  const openBrace = cssWithoutComments.indexOf("{", idx);
+  expect(openBrace).toBeGreaterThan(idx);
+  let depth = 0;
+  for (let i = openBrace; i < cssWithoutComments.length; i++) {
+    const ch = cssWithoutComments[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return cssWithoutComments.slice(openBrace + 1, i);
+      }
+    }
+  }
+  throw new Error(`Unterminated CSS block matching ${selectorPattern.source}`);
+}
+
+describe("Issue #41 Design System Tokens, Single-Source Theme & WCAG AA Contrast", () => {
+  test("all non-token stylesheets use typography, spacing, z-index, and motion tokens exclusively and handle prefers-reduced-motion", () => {
+    const stylesDir = join(import.meta.dir, "../src/styles");
+    const cssFiles = readdirSync(stylesDir)
+      .filter((name) => name.endsWith(".css"))
+      .sort();
+    expect(cssFiles).toContain("tokens.css");
+
+    for (const cssFile of cssFiles) {
+      if (cssFile === "tokens.css") continue;
+      const raw = readFileSync(join(stylesDir, cssFile), "utf8");
+      const content = stripCssComments(raw);
+
+      // 1. Zero raw font-size in px
+      const rawFontSize = content.match(
+        /\bfont-size\s*:\s*[^;]*\b\d+(?:\.\d+)?px\b/g,
+      );
+      expect(
+        rawFontSize,
+        `${cssFile} has raw px font-size: ${rawFontSize?.join(", ")}`,
+      ).toBeNull();
+
+      // 2. Zero raw numeric line-height
+      const rawLineHeight = content.match(
+        /\bline-height\s*:\s*\d+(?:\.\d+)?(?:px|rem|em)?\s*[;}]/g,
+      );
+      expect(
+        rawLineHeight,
+        `${cssFile} has raw numeric line-height: ${rawLineHeight?.join(", ")}`,
+      ).toBeNull();
+
+      // 3. Zero raw numeric font-weight
+      const rawFontWeight = content.match(/\bfont-weight\s*:\s*\d{3}\s*[;}]/g);
+      expect(
+        rawFontWeight,
+        `${cssFile} has raw numeric font-weight: ${rawFontWeight?.join(", ")}`,
+      ).toBeNull();
+
+      // 4. Zero raw numeric z-index
+      const rawZIndex = content.match(/\bz-index\s*:\s*-?\d+\s*[;}]/g);
+      expect(
+        rawZIndex,
+        `${cssFile} has raw numeric z-index: ${rawZIndex?.join(", ")}`,
+      ).toBeNull();
+
+      // 5. Zero raw millisecond durations (or non-zero second durations)
+      const rawMs = content.match(/\b\d+(?:\.\d+)?ms\b/g);
+      expect(
+        rawMs,
+        `${cssFile} has raw ms duration: ${rawMs?.join(", ")}`,
+      ).toBeNull();
+      const rawNonZeroSeconds = content.match(
+        /\b(?:[1-9]\d*(?:\.\d+)?|0\.\d+)s\b/g,
+      );
+      expect(
+        rawNonZeroSeconds,
+        `${cssFile} has raw non-zero second duration: ${rawNonZeroSeconds?.join(", ")}`,
+      ).toBeNull();
+
+      // 6. Zero raw px in padding / margin / gap (whitelist: 0px, ±1px hairlines/sr-only, and env(..., 0px) fallbacks)
+      const spacingViolations: string[] = [];
+      const spacingRe =
+        /\b((?:padding|margin|gap|row-gap|column-gap)(?:-[a-z-]+)?)\s*:\s*([^;}]+)[;}]/gi;
+      let match: RegExpExecArray | null;
+      while ((match = spacingRe.exec(content)) !== null) {
+        const prop = match[1]!;
+        const val = match[2]!.trim();
+        const withoutEnv = val.replace(/env\([^)]*\)/g, "");
+        const pxLiterals = withoutEnv.match(/-?\d+(?:\.\d+)?px\b/g) ?? [];
+        for (const px of pxLiterals) {
+          if (px !== "0px" && px !== "1px" && px !== "-1px") {
+            spacingViolations.push(`${prop}: ${val} (raw ${px})`);
+          }
+        }
+      }
+      expect(
+        spacingViolations,
+        `${cssFile} has raw px spacing values:\n${spacingViolations.join("\n")}`,
+      ).toEqual([]);
+
+      // 7. --text-decorative must only be used on non-text decorative glyphs
+      const decorativeMatches = content.match(/var\(--text-decorative\)/g) ?? [];
+      if (cssFile !== "design-system.css") {
+        expect(
+          decorativeMatches.length,
+          `${cssFile} must not use --text-decorative for text copy`,
+        ).toBe(0);
+      } else {
+        expect(decorativeMatches.length).toBeLessThanOrEqual(2);
+      }
+    }
+
+    // Verify prefers-reduced-motion handling in both tokens.css and base.css
+    const tokensCss = stripCssComments(
+      readFileSync(join(stylesDir, "tokens.css"), "utf8"),
+    );
+    const baseCss = stripCssComments(
+      readFileSync(join(stylesDir, "base.css"), "utf8"),
+    );
+    expect(tokensCss).toContain("@media (prefers-reduced-motion: reduce)");
+    expect(baseCss).toContain("@media (prefers-reduced-motion: reduce)");
+
+    // Verify single-source light theme (defined once, zero @media prefers-color-scheme duplication)
+    expect(tokensCss).not.toContain("@media (prefers-color-scheme: light)");
+    const lightSelectorMatches =
+      tokensCss.match(/:root\[data-theme="light"\]/g) ?? [];
+    expect(lightSelectorMatches.length).toBe(1);
+    const bgCanvasMatches = tokensCss.match(/--bg-canvas\s*:/g) ?? [];
+    expect(bgCanvasMatches.length).toBe(2); // Once for dark, once for light
+
+    // Verify pre-paint theme script in index.html sets data-theme without writing localStorage
+    const indexHtml = readFileSync(
+      join(import.meta.dir, "../index.html"),
+      "utf8",
+    );
+    expect(indexHtml).toContain('localStorage.getItem("simpleim.theme")');
+    expect(indexHtml).toContain("document.documentElement.dataset.theme");
+    expect(indexHtml).not.toContain("localStorage.setItem");
+  });
+
+  test("dark and light theme palettes in tokens.css meet WCAG AA (>= 4.5:1) across all body text, primary button, and soft-badge surfaces", () => {
+    const tokensPath = join(import.meta.dir, "../src/styles/tokens.css");
+    const tokensCss = stripCssComments(readFileSync(tokensPath, "utf8"));
+
+    const darkVars = parseCssCustomProperties(
+      extractThemeBlock(tokensCss, /:root\s*,\s*:root\[data-theme="dark"\]/),
+    );
+    const lightVars = parseCssCustomProperties(
+      extractThemeBlock(tokensCss, /:root\[data-theme="light"\]/),
+    );
+
+    const opaqueSurfaces = [
+      "--bg-canvas",
+      "--bg-panel",
+      "--bg-elevated",
+      "--bg-input",
+      "--bg-user-msg",
+      "--bg-code",
+      "--bg-inline-code",
+    ] as const;
+
+    const textTokens = [
+      "--text-primary",
+      "--text-secondary",
+      "--text-muted",
+      "--text-dim",
+      "--accent",
+      "--interactive",
+      "--status-success",
+      "--status-warning",
+      "--status-danger",
+    ] as const;
+
+    const softBadgePairs: readonly (readonly [string, string])[] = [
+      ["--accent", "--accent-soft"],
+      ["--status-success", "--status-success-soft"],
+      ["--status-warning", "--status-warning-soft"],
+      ["--status-danger", "--status-danger-soft"],
+    ];
+
+    const badgeHostSurfaces = [
+      "--bg-canvas",
+      "--bg-panel",
+      "--bg-elevated",
+      "--bg-user-msg",
+    ] as const;
+
+    for (const [themeName, vars] of [
+      ["dark", darkVars],
+      ["light", lightVars],
+    ] as const) {
+      expect(
+        vars["--text-decorative"],
+        `${themeName} must define --text-decorative for non-text glyphs`,
+      ).toBeTruthy();
+
+      for (const fgToken of textTokens) {
+        const fgHex = vars[fgToken];
+        expect(fgHex, `${themeName} missing ${fgToken}`).toBeTruthy();
+        const fgRgb = parseHexRgb(fgHex!);
+
+        for (const bgToken of opaqueSurfaces) {
+          const bgHex = vars[bgToken];
+          expect(bgHex, `${themeName} missing ${bgToken}`).toBeTruthy();
+          const ratio = contrastRatio(fgRgb, parseHexRgb(bgHex!));
+          expect(
+            ratio,
+            `${themeName} ${fgToken} (${fgHex}) on ${bgToken} (${bgHex}) = ${ratio.toFixed(2)}:1 (< 4.5:1)`,
+          ).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+
+      // Primary button text (--text-inverse on --accent and --accent-hover)
+      const invRgb = parseHexRgb(vars["--text-inverse"]!);
+      for (const btnBg of ["--accent", "--accent-hover"] as const) {
+        const ratio = contrastRatio(invRgb, parseHexRgb(vars[btnBg]!));
+        expect(
+          ratio,
+          `${themeName} primary button --text-inverse on ${btnBg} = ${ratio.toFixed(2)}:1 (< 4.5:1)`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+
+      // Soft status/delivery/relay tag contrast composited over every container surface
+      for (const [fgToken, softBgToken] of softBadgePairs) {
+        const fgRgb = parseHexRgb(vars[fgToken]!);
+        const softRgba = vars[softBgToken]!;
+        for (const hostBg of badgeHostSurfaces) {
+          const composited = compositeRgbaOverHex(softRgba, vars[hostBg]!);
+          const ratio = contrastRatio(fgRgb, composited);
+          expect(
+            ratio,
+            `${themeName} ${fgToken} on ${softBgToken} over ${hostBg} = ${ratio.toFixed(2)}:1 (< 4.5:1)`,
+          ).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    }
   });
 });
