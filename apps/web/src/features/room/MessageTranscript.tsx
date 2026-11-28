@@ -130,6 +130,8 @@ export function MessageTranscript({
   const hideDatePillTimerRef = useRef<number | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const liveAnnounceTimerRef = useRef<number | null>(null);
+  const liveAnnounceSeqRef = useRef(0);
 
   const [liveNowMs, setLiveNowMs] = useState<number>(() => nowMs ?? Date.now());
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
@@ -138,7 +140,10 @@ export function MessageTranscript({
     null,
   );
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [liveAnnouncement, setLiveAnnouncement] = useState("");
+  const [liveAnnouncement, setLiveAnnouncement] = useState<{
+    readonly seq: number;
+    readonly text: string;
+  }>({ seq: 0, text: "" });
   const [floatingDateCreatedAt, setFloatingDateCreatedAt] = useState<
     number | null
   >(null);
@@ -192,13 +197,26 @@ export function MessageTranscript({
     }
   }, []);
 
+  const clearLiveAnnounceTimer = useCallback((): void => {
+    if (liveAnnounceTimerRef.current !== null) {
+      window.clearTimeout(liveAnnounceTimerRef.current);
+      liveAnnounceTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     return () => {
       clearHideDatePillTimer();
       clearHighlightTimer();
       clearToastTimer();
+      clearLiveAnnounceTimer();
     };
-  }, [clearHideDatePillTimer, clearHighlightTimer, clearToastTimer]);
+  }, [
+    clearHideDatePillTimer,
+    clearHighlightTimer,
+    clearLiveAnnounceTimer,
+    clearToastTimer,
+  ]);
 
   // Close lightbox automatically if the referenced file is no longer in the active room.
   useEffect(() => {
@@ -403,7 +421,8 @@ export function MessageTranscript({
       setExpandedItemKey(null);
       setHighlightedItemKey(null);
       setToastMessage(null);
-      setLiveAnnouncement("");
+      clearLiveAnnounceTimer();
+      setLiveAnnouncement({ seq: 0, text: "" });
       setLightbox(null);
       clearHideDatePillTimer();
       clearHighlightTimer();
@@ -420,7 +439,7 @@ export function MessageTranscript({
       latestItem &&
       !latestItem.isSelf
     ) {
-      setLiveAnnouncement(
+      const nextText =
         latestItem.kind === "message"
           ? t("room.srNewMessage", {
               author: latestItem.vm.authorDisplayName,
@@ -429,8 +448,16 @@ export function MessageTranscript({
           : t("room.srNewFile", {
               author: latestItem.authorDisplayName,
               name: latestItem.manifest.fileName,
-            }),
-      );
+            });
+      const nextSeq = ++liveAnnounceSeqRef.current;
+      clearLiveAnnounceTimer();
+      // Clear first, then repopulate on the next task so repeated identical summaries
+      // still mutate the static aria-live region and trigger a screen-reader announcement.
+      setLiveAnnouncement({ seq: nextSeq, text: "" });
+      liveAnnounceTimerRef.current = window.setTimeout(() => {
+        liveAnnounceTimerRef.current = null;
+        setLiveAnnouncement({ seq: nextSeq, text: nextText });
+      }, 0);
     }
 
     if (roomChanged && latestItemKey === null) {
@@ -455,6 +482,7 @@ export function MessageTranscript({
   }, [
     clearHideDatePillTimer,
     clearHighlightTimer,
+    clearLiveAnnounceTimer,
     clearToastTimer,
     latestItem,
     latestItemIsSelf,
@@ -612,7 +640,9 @@ export function MessageTranscript({
       ) : null}
 
       <div className="sr-only" aria-live="polite" aria-atomic="true">
-        {liveAnnouncement}
+        {liveAnnouncement.text ? (
+          <span key={liveAnnouncement.seq}>{liveAnnouncement.text}</span>
+        ) : null}
       </div>
 
       <div
