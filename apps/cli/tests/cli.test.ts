@@ -2758,6 +2758,47 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       await dlShared.closeAll();
       await dlStorage.closeAll();
     }
+
+    // Async event arriving during a command with EMPTY next line draws an empty prompt;
+    // when the command later prints its result, it must clear that empty prompt first
+    // and then restore a fresh prompt below the result!
+    const midEventIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const midEventOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 80,
+    });
+    let midEventBuf = "";
+    midEventOut.on("data", (c) => {
+      midEventBuf += c.toString("utf8");
+    });
+    const midEventTerm: InteractiveJoinTerminal = new InteractiveJoinTerminal({
+      stdin: midEventIn,
+      stdout: midEventOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async () => {
+        midEventTerm.writeAsyncLine("[relay] Caching 'report.pdf' 50%");
+        midEventBuf = "";
+        midEventTerm.writeLine("[file] Announced 'report.pdf'");
+        return "continue";
+      },
+    });
+    midEventTerm.startPrompt();
+    midEventIn.write("/send report.pdf\r");
+    await Bun.sleep(25);
+    const annIdx = midEventBuf.indexOf("[file] Announced 'report.pdf'\n");
+    expect(annIdx).toBeGreaterThan(0);
+    // Cleared the empty prompt BEFORE writing the result, and restored a fresh prompt AFTER it
+    expect(midEventBuf.slice(0, annIdx)).toContain("\x1b[0J");
+    expect(midEventBuf.slice(annIdx + "[file] Announced 'report.pdf'\n".length)).toContain(
+      "❯ ",
+    );
+    midEventTerm.close();
   });
 
   test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {

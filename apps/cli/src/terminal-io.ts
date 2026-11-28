@@ -574,8 +574,7 @@ export class InteractiveJoinTerminal {
       this.isInteractive &&
       !this.exited &&
       !this.inputClosed &&
-      this.typeAheadVisibleOnScreen &&
-      this.rl.line.length > 0
+      (this.promptDrawn || this.typeAheadVisibleOnScreen)
     ) {
       this.clearActiveInputRegion(this.promptDrawn);
     }
