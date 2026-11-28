@@ -1,9 +1,12 @@
 import { open, stat, type FileHandle } from "node:fs/promises";
 import { basename, extname, resolve } from "node:path";
-import { createInterface } from "node:readline";
-import type { FileManifest } from "@simpleim/contracts";
+import type { ChatMessageEnvelope, FileManifest } from "@simpleim/contracts";
 import { deriveRoomKeys, wipeRoomKeys } from "@simpleim/crypto";
-import { createRoomPeerEngine, type RoomPeerEngine } from "@simpleim/peer-core";
+import {
+  createRoomPeerEngine,
+  type RoomPeerEngine,
+  type SwarmTransferProgress,
+} from "@simpleim/peer-core";
 import { CliApiClient } from "../api-client.ts";
 import type { ParsedCliCommand } from "../args.ts";
 import { CredentialStore } from "../credentials.ts";
@@ -11,11 +14,24 @@ import { FsChunkStorageAdapter } from "../fs-chunk-storage.ts";
 import { readPassphrase } from "../passphrase.ts";
 import { CliSignalingClient } from "../signaling-client.ts";
 import {
+  formatCliFsError,
+  formatCliRoomFingerprint,
+  formatCliTimestamp,
+  formatEtaSeconds,
+  formatShortId,
+  InteractiveJoinTerminal,
+  parseCliFilePathInput,
+} from "../terminal-io.ts";
+import {
   formatCliChatMessage,
   sanitizeTerminalSingleLine,
 } from "../terminal-sanitize.ts";
 import { WeriftTransportFactory } from "../werift-transport.ts";
-import { requireValidCredentials, type CommandIo } from "./auth.ts";
+import {
+  requireValidCredentials,
+  withNetworkServerHint,
+  type CommandIo,
+} from "./auth.ts";
 
 export function formatHumanBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -24,14 +40,6 @@ export function formatHumanBytes(bytes: number): string {
     return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
   }
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
-}
-
-function formatClock(epochMs: number): string {
-  const d = new Date(epochMs);
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
 }
 
 function guessMimeType(filePath: string): string {
@@ -107,12 +115,15 @@ export class LocalSharedFileRegistry {
 export function formatJoinSlashHelp(): string {
   return [
     "Commands:",
-    "  /peers                 List verified room peers and signaling state",
-    "  /send <filepath>       Announce and seed a local file via 64 KiB P2P Swarm",
-    "  /files                 List announced files in the room and transfer status",
-    "  /get <fileId|index>    Download an announced file into download directory",
-    "  /help                  Show this command reference",
-    "  /leave, /quit          Disconnect from room and wipe keys",
+    "  /peers                       List verified room peers and signaling state",
+    "  /send <filepath>             Share a local file (supports ~, quotes, escaped spaces)",
+    "  /files                       List announced files and transfer/relay status",
+    "  /get <fileId|index>          Download or resume an announced file into download dir",
+    "  /cancel <fileId|index>       Cancel an in-progress download",
+    "  /reply <msgId|last> <text>   Reply quoting an earlier message",
+    "  /retry                       Retry pending offline-relay chat messages",
+    "  /help                        Show this command reference",
+    "  /leave, /quit                Disconnect from room and wipe keys",
   ].join("\n");
 }
 
@@ -140,9 +151,216 @@ function resolveTargetManifest(
     return prefixMatches[0];
   }
   if (prefixMatches.length > 1) {
-    throw new Error(`Ambiguous fileId prefix '${trimmed}'; run /files for full IDs`);
+    throw new Error(
+      `Ambiguous fileId prefix '${sanitizeTerminalSingleLine(trimmed)}'; run /files for IDs`,
+    );
   }
-  throw new Error(`Unknown file '${trimmed}'; run /files to list available files`);
+  throw new Error(
+    `Unknown file '${sanitizeTerminalSingleLine(trimmed)}'; run /files to list available files`,
+  );
+}
+
+function resolveTargetMessage(
+  messages: readonly ChatMessageEnvelope[],
+  selector: string,
+): ChatMessageEnvelope {
+  const trimmed = selector.trim();
+  if (messages.length === 0) {
+    throw new Error("No messages in this room to reply to yet.");
+  }
+  if (trimmed.toLowerCase() === "last") {
+    return messages[messages.length - 1]!;
+  }
+  const cleanSelector = trimmed.startsWith("#") ? trimmed.slice(1) : trimmed;
+  const exact = messages.find((m) => m.msgId === cleanSelector);
+  if (exact) return exact;
+  const matches = messages.filter((m) => m.msgId.startsWith(cleanSelector));
+  if (matches.length === 1 && matches[0]) {
+    return matches[0];
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      `Ambiguous message ID prefix '${sanitizeTerminalSingleLine(trimmed)}'`,
+    );
+  }
+  throw new Error(
+    `Unknown message '${sanitizeTerminalSingleLine(trimmed)}' (use a msgId prefix or 'last')`,
+  );
+}
+
+export function formatCliReplyQuote(
+  replyToMsgId: string | null | undefined,
+  messages: readonly ChatMessageEnvelope[],
+): string | null {
+  if (!replyToMsgId) {
+    return null;
+  }
+  const target = messages.find((m) => m.msgId === replyToMsgId);
+  if (!target) {
+    return `  ↳ replying to #${formatShortId(replyToMsgId, 8)}`;
+  }
+  const author = sanitizeTerminalSingleLine(target.authorCert.payload.username);
+  const snippet = sanitizeTerminalSingleLine(target.body);
+  const clipped =
+    snippet.length > 72 ? `${snippet.slice(0, 71)}…` : snippet;
+  return `  ↳ replying to @${author}: ${clipped}`;
+}
+
+export function formatRenderedChatEvent(params: {
+  readonly msg: ChatMessageEnvelope;
+  readonly isSync?: boolean;
+  readonly messages: readonly ChatMessageEnvelope[];
+  readonly nowMs?: number;
+}): string {
+  const quoteLine = formatCliReplyQuote(params.msg.replyToMsgId, params.messages);
+  const chatLine = formatCliChatMessage({
+    prefix: params.isSync ? "[sync] " : "",
+    clock: formatCliTimestamp(params.msg.createdAt, params.nowMs),
+    username: params.msg.authorCert.payload.username,
+    body: params.msg.body,
+  });
+  return quoteLine ? `${quoteLine}\n${chatLine}` : chatLine;
+}
+
+interface TransferProgressSnapshot {
+  status: SwarmTransferProgress["status"];
+  downloadPct: number;
+  downloadEmitAt: number;
+  relayState: NonNullable<SwarmTransferProgress["relayCacheState"]>;
+  relayPct: number;
+  relayEmitAt: number;
+}
+
+/**
+ * Throttles verbose SwarmTransferProgress updates into concise human-readable
+ * status lines (download percentage, speed, ETA, pause, error, and relay caching).
+ */
+export class JoinTransferProgressTracker {
+  private readonly states = new Map<string, TransferProgressSnapshot>();
+
+  consume(
+    progress: SwarmTransferProgress,
+    nowMs: number = Date.now(),
+  ): string[] {
+    const lines: string[] = [];
+    const safeName = sanitizeTerminalSingleLine(progress.fileName);
+    const shortId = formatShortId(progress.fileId, 8);
+    const prev = this.states.get(progress.fileId);
+
+    const downloadPct =
+      progress.totalChunks === 0
+        ? 100
+        : Math.min(
+            100,
+            Math.floor((progress.completedChunks / progress.totalChunks) * 100),
+          );
+    const relayState = progress.relayCacheState ?? "none";
+    const relayPct =
+      progress.totalChunks === 0
+        ? 100
+        : Math.min(
+            100,
+            Math.floor(
+              ((progress.relayCachedChunks ?? 0) / progress.totalChunks) * 100,
+            ),
+          );
+
+    const next: TransferProgressSnapshot = prev
+      ? { ...prev }
+      : {
+          status: "announced",
+          downloadPct: -1,
+          downloadEmitAt: 0,
+          relayState: "none",
+          relayPct: -1,
+          relayEmitAt: 0,
+        };
+
+    // 1. Download lifecycle feedback
+    if (progress.status === "downloading") {
+      const statusChanged = prev?.status !== "downloading";
+      const pctJump = downloadPct - next.downloadPct >= 10;
+      const timeElapsed = nowMs - next.downloadEmitAt >= 500;
+      const heartbeatElapsed =
+        nowMs - next.downloadEmitAt >= 2000 && downloadPct !== next.downloadPct;
+      if (
+        (statusChanged && progress.completedChunks > 0) ||
+        (pctJump && timeElapsed) ||
+        heartbeatElapsed
+      ) {
+        const speedBytes = Math.max(0, progress.downloadSpeedBytesPerSec);
+        const remainingBytes = Math.max(
+          0,
+          progress.fileSize - progress.bytesCompleted,
+        );
+        const etaStr =
+          speedBytes > 0
+            ? formatEtaSeconds(remainingBytes / speedBytes)
+            : "--";
+        const speedStr = `${formatHumanBytes(Math.round(speedBytes))}/s`;
+        const peerCount = Math.max(
+          progress.availableSeeders,
+          progress.availablePeersWithChunks,
+        );
+        lines.push(
+          `[file] Downloading '${safeName}' ${downloadPct}% (${formatHumanBytes(progress.bytesCompleted)} / ${formatHumanBytes(progress.fileSize)}, ${speedStr}, ETA ${etaStr}) [peers: ${peerCount}]`,
+        );
+        next.downloadPct = downloadPct;
+        next.downloadEmitAt = nowMs;
+      }
+      next.status = "downloading";
+    } else if (progress.status === "paused" && prev?.status !== "paused") {
+      lines.push(
+        `[file] Paused '${safeName}' at ${downloadPct}% — run '/get ${shortId}' to resume`,
+      );
+      next.status = "paused";
+      next.downloadPct = downloadPct;
+      next.downloadEmitAt = nowMs;
+    } else if (progress.status === "error" && prev?.status !== "error") {
+      const reason = sanitizeTerminalSingleLine(
+        progress.errorMessage ?? "transfer failed",
+      );
+      lines.push(`[file] Transfer failed for '${safeName}': ${reason}`);
+      next.status = "error";
+      next.downloadEmitAt = nowMs;
+    } else {
+      next.status = progress.status;
+    }
+
+    // 2. Blind relay upload feedback (especially after /send)
+    if (relayState === "uploading") {
+      const stateChanged = next.relayState !== "uploading";
+      const pctJump = relayPct - next.relayPct >= 25;
+      const timeElapsed = nowMs - next.relayEmitAt >= 500;
+      if (stateChanged || (pctJump && timeElapsed)) {
+        lines.push(
+          `[relay] Caching '${safeName}' ${relayPct}% (${progress.relayCachedChunks ?? 0}/${progress.totalChunks} chunks)`,
+        );
+        next.relayPct = relayPct;
+        next.relayEmitAt = nowMs;
+      }
+    } else if (relayState === "cached" && next.relayState !== "cached") {
+      if (prev?.relayState === "uploading") {
+        lines.push(`[relay] Cached '${safeName}' for offline peers`);
+      }
+      next.relayPct = 100;
+      next.relayEmitAt = nowMs;
+    } else if (relayState === "too_large" && next.relayState !== "too_large") {
+      lines.push(
+        `[relay] '${safeName}' exceeds offline relay limit (direct P2P seeding remains active)`,
+      );
+      next.relayEmitAt = nowMs;
+    } else if (relayState === "error" && next.relayState !== "error") {
+      lines.push(
+        `[relay] Offline relay cache failed for '${safeName}' (direct P2P seeding remains active)`,
+      );
+      next.relayEmitAt = nowMs;
+    }
+    next.relayState = relayState;
+
+    this.states.set(progress.fileId, next);
+    return lines;
+  }
 }
 
 export async function executeJoinInputLine(params: {
@@ -152,23 +370,48 @@ export async function executeJoinInputLine(params: {
   sharedFiles: LocalSharedFileRegistry;
   stdout: NodeJS.WritableStream;
   cwd?: string;
+  homeDir?: string;
+  json?: boolean;
+  nowMs?: number;
+  onBeforeSelfChatPrint?: () => void;
 }): Promise<"continue" | "exit"> {
-  const { line, engine, chunkStorage, sharedFiles, stdout } = params;
+  const { line, engine, chunkStorage, sharedFiles, stdout, json = false } = params;
   const trimmed = line.trim();
   if (trimmed.length === 0) {
     return "continue";
   }
 
+  const emitJson = (payload: Record<string, unknown>): void => {
+    stdout.write(`${JSON.stringify(payload)}\n`);
+  };
+
   if (!trimmed.startsWith("/")) {
     const sent = await engine.sendChatMessage(trimmed);
-    const author = sent.authorCert.payload;
-    stdout.write(
-      `${formatCliChatMessage({
-        clock: formatClock(sent.createdAt),
-        username: author.username,
+    if (json) {
+      emitJson({
+        type: "chat_sent",
+        msgId: sent.msgId,
+        lamport: sent.lamport,
+        createdAt: sent.createdAt,
+        replyToMsgId: sent.replyToMsgId ?? null,
+        author: {
+          userId: sent.authorCert.payload.userId,
+          username: sent.authorCert.payload.username,
+          displayName: sent.authorCert.payload.displayName,
+          clientKind: sent.authorCert.payload.clientKind,
+        },
         body: sent.body,
-      })}\n`,
-    );
+      });
+    } else {
+      params.onBeforeSelfChatPrint?.();
+      stdout.write(
+        `${formatRenderedChatEvent({
+          msg: sent,
+          messages: engine.getMessages(),
+          nowMs: params.nowMs,
+        })}\n`,
+      );
+    }
     return "continue";
   }
 
@@ -182,14 +425,34 @@ export async function executeJoinInputLine(params: {
       return "exit";
 
     case "/help":
-      stdout.write(`${formatJoinSlashHelp()}\n`);
+      if (json) {
+        emitJson({ type: "help", text: formatJoinSlashHelp() });
+      } else {
+        stdout.write(`${formatJoinSlashHelp()}\n`);
+      }
       return "continue";
 
     case "/peers": {
-      const centerStatus = engine.isCenterConnected()
+      const connected = engine.isCenterConnected();
+      const peers = engine.getVerifiedPeers();
+      if (json) {
+        emitJson({
+          type: "peers_snapshot",
+          centerConnected: connected,
+          peers: peers.map((p) => ({
+            peerId: p.peerId,
+            userId: p.userId,
+            username: p.username,
+            displayName: p.displayName,
+            clientKind: p.clientKind,
+            rttMs: p.rttMs,
+          })),
+        });
+        return "continue";
+      }
+      const centerStatus = connected
         ? "connected"
         : "detached (P2P channels active)";
-      const peers = engine.getVerifiedPeers();
       stdout.write(`Signaling server: ${centerStatus}\n`);
       if (peers.length === 0) {
         stdout.write("Verified P2P peers: (none)\n");
@@ -198,7 +461,7 @@ export async function executeJoinInputLine(params: {
         for (const p of peers) {
           const rttLabel = p.rttMs !== null ? `${p.rttMs}ms` : "n/a";
           stdout.write(
-            `  - @${sanitizeTerminalSingleLine(p.username)} (${sanitizeTerminalSingleLine(p.displayName)}) [${sanitizeTerminalSingleLine(p.clientKind)}] ${sanitizeTerminalSingleLine(p.peerId)} rtt=${rttLabel}\n`,
+            `  - @${sanitizeTerminalSingleLine(p.username)} (${sanitizeTerminalSingleLine(p.displayName)}) [${sanitizeTerminalSingleLine(p.clientKind)}] ${formatShortId(p.peerId, 8)} rtt=${rttLabel}\n`,
           );
         }
       }
@@ -207,11 +470,21 @@ export async function executeJoinInputLine(params: {
 
     case "/send": {
       if (!rest) {
-        stdout.write("Usage: /send <filepath>\n");
+        if (json) {
+          emitJson({ type: "error", message: "Usage: /send <filepath>" });
+        } else {
+          stdout.write("Usage: /send <filepath>\n");
+        }
         return "continue";
       }
-      const targetPath = resolve(params.cwd ?? process.cwd(), rest);
-      const st = await stat(targetPath);
+      const unquoted = parseCliFilePathInput(rest, params.homeDir);
+      const targetPath = resolve(params.cwd ?? process.cwd(), unquoted);
+      let st;
+      try {
+        st = await stat(targetPath);
+      } catch (err) {
+        throw new Error(formatCliFsError(err, targetPath));
+      }
       if (!st.isFile()) {
         throw new Error(`Not a regular file: ${targetPath}`);
       }
@@ -222,14 +495,46 @@ export async function executeJoinInputLine(params: {
         mimeType: guessMimeType(targetPath),
         readChunk,
       });
-      stdout.write(
-        `[file] Announced '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}, ${manifest.totalChunks} chunks) id=${sanitizeTerminalSingleLine(manifest.fileId)}\n`,
-      );
+      if (json) {
+        emitJson({
+          type: "file_shared",
+          fileId: manifest.fileId,
+          fileName: manifest.fileName,
+          fileSize: manifest.fileSize,
+          totalChunks: manifest.totalChunks,
+          mimeType: manifest.mimeType,
+        });
+      } else {
+        stdout.write(
+          `[file] Announced '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}, ${manifest.totalChunks} chunks) id=${formatShortId(manifest.fileId, 8)}\n`,
+        );
+      }
       return "continue";
     }
 
     case "/files": {
       const files = engine.getFiles();
+      if (json) {
+        emitJson({
+          type: "files_snapshot",
+          files: files.map((f, i) => {
+            const prog = engine.getTransferProgress(f.fileId);
+            return {
+              index: i + 1,
+              fileId: f.fileId,
+              fileName: f.fileName,
+              fileSize: f.fileSize,
+              totalChunks: f.totalChunks,
+              senderUsername: f.senderCert.payload.username,
+              status: prog?.status ?? "announced",
+              completedChunks: prog?.completedChunks ?? 0,
+              relayCacheState: prog?.relayCacheState ?? "none",
+              savedPath: chunkStorage.getCompletedFilePath(f.fileId) ?? null,
+            };
+          }),
+        });
+        return "continue";
+      }
       if (files.length === 0) {
         stdout.write("No files announced in this room yet.\n");
         return "continue";
@@ -255,7 +560,7 @@ export async function executeJoinInputLine(params: {
           ? ` -> ${sanitizeTerminalSingleLine(savedPath)}`
           : "";
         stdout.write(
-          `  [${i + 1}] ${sanitizeTerminalSingleLine(f.fileId)}  ${sanitizeTerminalSingleLine(f.fileName)} (${formatHumanBytes(f.fileSize)}) from @${sanitizeTerminalSingleLine(f.senderCert.payload.username)} [${status}]${relaySuffix}${savedSuffix}\n`,
+          `  [${i + 1}] ${formatShortId(f.fileId, 8)}  ${sanitizeTerminalSingleLine(f.fileName)} (${formatHumanBytes(f.fileSize)}) from @${sanitizeTerminalSingleLine(f.senderCert.payload.username)} [${status}]${relaySuffix}${savedSuffix}\n`,
         );
       });
       return "continue";
@@ -263,21 +568,132 @@ export async function executeJoinInputLine(params: {
 
     case "/get": {
       if (!rest) {
-        stdout.write("Usage: /get <fileId|index>\n");
+        if (json) {
+          emitJson({ type: "error", message: "Usage: /get <fileId|index>" });
+        } else {
+          stdout.write("Usage: /get <fileId|index>\n");
+        }
         return "continue";
       }
       const target = resolveTargetManifest(engine.getFiles(), rest);
-      stdout.write(
-        `[file] Starting Swarm download for '${sanitizeTerminalSingleLine(target.fileName)}' (${formatHumanBytes(target.fileSize)})...\n`,
-      );
+      if (json) {
+        emitJson({
+          type: "download_started",
+          fileId: target.fileId,
+          fileName: target.fileName,
+          fileSize: target.fileSize,
+        });
+      } else {
+        stdout.write(
+          `[file] Starting Swarm download for '${sanitizeTerminalSingleLine(target.fileName)}' (${formatHumanBytes(target.fileSize)})...\n`,
+        );
+      }
       await engine.downloadFile(target.fileId);
       return "continue";
     }
 
+    case "/cancel": {
+      if (!rest) {
+        if (json) {
+          emitJson({ type: "error", message: "Usage: /cancel <fileId|index>" });
+        } else {
+          stdout.write("Usage: /cancel <fileId|index>\n");
+        }
+        return "continue";
+      }
+      const target = resolveTargetManifest(engine.getFiles(), rest);
+      await engine.cancelDownload(target.fileId);
+      if (json) {
+        emitJson({
+          type: "download_cancelled",
+          fileId: target.fileId,
+          fileName: target.fileName,
+        });
+      } else {
+        stdout.write(
+          `[file] Cancelled download for '${sanitizeTerminalSingleLine(target.fileName)}' (id=${formatShortId(target.fileId, 8)})\n`,
+        );
+      }
+      return "continue";
+    }
+
+    case "/reply": {
+      const replySpace = rest.indexOf(" ");
+      if (replySpace < 0) {
+        if (json) {
+          emitJson({
+            type: "error",
+            message: "Usage: /reply <msgId|last> <message>",
+          });
+        } else {
+          stdout.write("Usage: /reply <msgId|last> <message>\n");
+        }
+        return "continue";
+      }
+      const targetSelector = rest.slice(0, replySpace).trim();
+      const replyBody = rest.slice(replySpace + 1).trim();
+      if (!targetSelector || !replyBody) {
+        if (json) {
+          emitJson({
+            type: "error",
+            message: "Usage: /reply <msgId|last> <message>",
+          });
+        } else {
+          stdout.write("Usage: /reply <msgId|last> <message>\n");
+        }
+        return "continue";
+      }
+      const targetMsg = resolveTargetMessage(engine.getMessages(), targetSelector);
+      const sent = await engine.sendChatMessage(replyBody, targetMsg.msgId);
+      if (json) {
+        emitJson({
+          type: "chat_sent",
+          msgId: sent.msgId,
+          lamport: sent.lamport,
+          createdAt: sent.createdAt,
+          replyToMsgId: sent.replyToMsgId ?? null,
+          author: {
+            userId: sent.authorCert.payload.userId,
+            username: sent.authorCert.payload.username,
+            displayName: sent.authorCert.payload.displayName,
+            clientKind: sent.authorCert.payload.clientKind,
+          },
+          body: sent.body,
+        });
+      } else {
+        params.onBeforeSelfChatPrint?.();
+        stdout.write(
+          `${formatRenderedChatEvent({
+            msg: sent,
+            messages: engine.getMessages(),
+            nowMs: params.nowMs,
+          })}\n`,
+        );
+      }
+      return "continue";
+    }
+
+    case "/retry": {
+      await engine.retryChatMessage();
+      if (json) {
+        emitJson({ type: "chat_retry_requested" });
+      } else {
+        stdout.write("[delivery] Retrying pending offline-relay messages...\n");
+      }
+      return "continue";
+    }
+
     default:
-      stdout.write(
-        `Unknown slash command '${sanitizeTerminalSingleLine(verb)}'. Type /help for commands.\n`,
-      );
+      if (json) {
+        emitJson({
+          type: "error",
+          message: `Unknown slash command '${sanitizeTerminalSingleLine(verb)}'`,
+        });
+      } else {
+        stdout.write(
+          `Unknown slash command '${sanitizeTerminalSingleLine(verb)}'. Type /help for commands.\n`,
+        );
+      }
       return "continue";
   }
 }
@@ -299,18 +715,45 @@ export async function runJoinCommand(
     stderr,
   });
 
-  stderr.write("Deriving E2EE room keys (Argon2id 64 MiB)...\n");
+  if (!cmd.json) {
+    stderr.write("Deriving E2EE room keys (Argon2id 64 MiB)...\n");
+  }
   const roomKeys = deriveRoomKeys(passphrase);
 
   const api = new CliApiClient({
     serverUrl: creds.serverUrl,
     fetchImpl: io.fetchImpl,
   });
-  const meta = await api.getMeta(creds.sessionToken);
-  const { peerId, keyPair, cert } = await api.requestFreshPeerIdentity({
-    sessionToken: creds.sessionToken,
-    userId: creds.user.id,
-  });
+  let meta;
+  let identity;
+  try {
+    meta = await api.getMeta(creds.sessionToken);
+    identity = await api.requestFreshPeerIdentity({
+      sessionToken: creds.sessionToken,
+      userId: creds.user.id,
+    });
+  } catch (err) {
+    wipeRoomKeys(roomKeys);
+    throw withNetworkServerHint(err, api.serverUrl);
+  }
+  const { peerId, keyPair, cert } = identity;
+
+  let terminal: InteractiveJoinTerminal | null = null;
+  const writeAsync = (
+    text: string,
+    target: "stdout" | "stderr" = "stdout",
+  ): void => {
+    if (terminal) {
+      terminal.writeAsyncLine(text, target);
+    } else {
+      (target === "stderr" ? stderr : stdout).write(`${text}\n`);
+    }
+  };
+  const writeJsonEvent = (event: Record<string, unknown>): void => {
+    stdout.write(`${JSON.stringify(event)}\n`);
+  };
+
+  const progressTracker = new JoinTransferProgressTracker();
 
   const signaling = new CliSignalingClient({
     serverUrl: api.serverUrl,
@@ -320,7 +763,18 @@ export async function runJoinCommand(
   });
   const transportFactory = new WeriftTransportFactory({
     onNetworkDiagnostic: (diag) => {
-      stderr.write(`[network] ${diag.message}\n`);
+      if (cmd.json) {
+        writeJsonEvent({
+          type: "network_diagnostic",
+          code: diag.code,
+          message: diag.message,
+        });
+      } else {
+        writeAsync(
+          `[network] ${sanitizeTerminalSingleLine(diag.message)}`,
+          "stderr",
+        );
+      }
     },
   });
   const chunkStorage = new FsChunkStorageAdapter({
@@ -346,113 +800,255 @@ export async function runJoinCommand(
     relayClient,
     events: {
       onCenterConnectionChange: (connected) => {
-        stdout.write(
-          connected
-            ? "[signal] Connected to signaling relay\n"
-            : "[signal] Signaling relay disconnected (active P2P channels remain alive)\n",
+        if (cmd.json) {
+          writeJsonEvent({ type: "signal", connected });
+          return;
+        }
+        const palette = terminal?.palette;
+        const msg = connected
+          ? "[signal] Connected to signaling relay"
+          : "[signal] Signaling relay disconnected (active P2P channels remain alive)";
+        writeAsync(
+          palette
+            ? connected
+              ? palette.green(msg)
+              : palette.yellow(msg)
+            : msg,
         );
       },
       onPeersChange: (peers) => {
+        if (cmd.json) {
+          writeJsonEvent({
+            type: "peers",
+            peers: peers.map((p) => ({
+              peerId: p.peerId,
+              userId: p.userId,
+              username: p.username,
+              displayName: p.displayName,
+              clientKind: p.clientKind,
+              rttMs: p.rttMs,
+            })),
+          });
+          return;
+        }
         const names = peers
           .map((p) => `@${sanitizeTerminalSingleLine(p.username)}`)
           .join(", ");
-        stdout.write(
-          `[room] Verified peers (${peers.length}): ${names || "none"}\n`,
-        );
+        writeAsync(`[room] Verified peers (${peers.length}): ${names || "none"}`);
       },
       onPeerAuthRejected: (remotePeerId, reason) => {
-        stderr.write(
-          `[security] Quarantined peer ${sanitizeTerminalSingleLine(remotePeerId)} rejected (${sanitizeTerminalSingleLine(reason)})\n`,
+        if (cmd.json) {
+          writeJsonEvent({
+            type: "peer_auth_rejected",
+            remotePeerId,
+            reason,
+          });
+          return;
+        }
+        writeAsync(
+          `[security] Quarantined peer ${formatShortId(remotePeerId, 8)} rejected (${sanitizeTerminalSingleLine(reason)})`,
+          "stderr",
         );
       },
       onChatMessage: (msg, isSync) => {
-        stdout.write(
-          `${formatCliChatMessage({
-            prefix: isSync ? "[sync] " : "",
-            clock: formatClock(msg.createdAt),
-            username: msg.authorCert.payload.username,
+        if (cmd.json) {
+          writeJsonEvent({
+            type: "chat",
+            msgId: msg.msgId,
+            lamport: msg.lamport,
+            createdAt: msg.createdAt,
+            isSync,
+            replyToMsgId: msg.replyToMsgId ?? null,
+            author: {
+              userId: msg.authorCert.payload.userId,
+              username: msg.authorCert.payload.username,
+              displayName: msg.authorCert.payload.displayName,
+              clientKind: msg.authorCert.payload.clientKind,
+            },
             body: msg.body,
-          })}\n`,
+          });
+          return;
+        }
+        writeAsync(
+          formatRenderedChatEvent({
+            msg,
+            isSync,
+            messages: engine.getMessages(),
+          }),
         );
+      },
+      onChatDeliveryChange: (msgId, status) => {
+        if (cmd.json) {
+          writeJsonEvent({ type: "chat_delivery", msgId, status });
+          return;
+        }
+        if (status === "failed") {
+          const msg = `[delivery] Offline relay failed for message #${formatShortId(msgId, 8)} — run /retry`;
+          writeAsync(terminal ? terminal.palette.yellow(msg) : msg, "stderr");
+        }
       },
       onFileAnnounced: (manifest) => {
         if (manifest.senderCert.payload.peerId === peerId) return;
-        stdout.write(
-          `[file] @${sanitizeTerminalSingleLine(manifest.senderCert.payload.username)} shared '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}) — run '/get ${sanitizeTerminalSingleLine(manifest.fileId)}' or '/files'\n`,
+        if (cmd.json) {
+          writeJsonEvent({
+            type: "file_announced",
+            fileId: manifest.fileId,
+            fileName: manifest.fileName,
+            fileSize: manifest.fileSize,
+            totalChunks: manifest.totalChunks,
+            mimeType: manifest.mimeType,
+            senderUsername: manifest.senderCert.payload.username,
+          });
+          return;
+        }
+        writeAsync(
+          `[file] @${sanitizeTerminalSingleLine(manifest.senderCert.payload.username)} shared '${sanitizeTerminalSingleLine(manifest.fileName)}' (${formatHumanBytes(manifest.fileSize)}) — run '/get ${formatShortId(manifest.fileId, 8)}' or '/files'`,
         );
+      },
+      onTransferProgress: (progress) => {
+        if (cmd.json) {
+          const remaining = Math.max(
+            0,
+            progress.fileSize - progress.bytesCompleted,
+          );
+          const etaSeconds =
+            progress.downloadSpeedBytesPerSec > 0
+              ? Math.ceil(remaining / progress.downloadSpeedBytesPerSec)
+              : null;
+          writeJsonEvent({
+            type: "transfer_progress",
+            fileId: progress.fileId,
+            fileName: progress.fileName,
+            status: progress.status,
+            completedChunks: progress.completedChunks,
+            totalChunks: progress.totalChunks,
+            bytesCompleted: progress.bytesCompleted,
+            fileSize: progress.fileSize,
+            downloadSpeedBytesPerSec: progress.downloadSpeedBytesPerSec,
+            etaSeconds,
+            relayCacheState: progress.relayCacheState ?? "none",
+            relayCachedChunks: progress.relayCachedChunks ?? 0,
+            ...(progress.errorMessage
+              ? { errorMessage: progress.errorMessage }
+              : {}),
+          });
+          return;
+        }
+        const updates = progressTracker.consume(progress);
+        for (const line of updates) {
+          writeAsync(line);
+        }
       },
       onTransferCompleted: (manifest) => {
         const finalPath = chunkStorage.getCompletedFilePath(manifest.fileId);
-        stdout.write(
-          `[file] Completed '${sanitizeTerminalSingleLine(manifest.fileName)}' -> ${sanitizeTerminalSingleLine(finalPath ?? cmd.downloadDir)} (seeding)\n`,
+        if (cmd.json) {
+          writeJsonEvent({
+            type: "transfer_completed",
+            fileId: manifest.fileId,
+            fileName: manifest.fileName,
+            savedPath: finalPath ?? cmd.downloadDir,
+          });
+          return;
+        }
+        writeAsync(
+          `[file] Completed '${sanitizeTerminalSingleLine(manifest.fileName)}' -> ${sanitizeTerminalSingleLine(finalPath ?? cmd.downloadDir)} (seeding)`,
         );
       },
       onError: (err) => {
-        stderr.write(`[error] ${sanitizeTerminalSingleLine(err.message)}\n`);
+        if (cmd.json) {
+          writeJsonEvent({ type: "error", message: err.message });
+          return;
+        }
+        const msg = `[error] ${sanitizeTerminalSingleLine(err.message)}`;
+        writeAsync(terminal ? terminal.palette.red(msg) : msg, "stderr");
       },
     },
   });
 
   try {
     await engine.start();
-    stdout.write(
-      `Joined room [${roomKeys.roomIdPrefix}] as @${creds.user.username} (${peerId}). Downloads: ${cmd.downloadDir}\nType a message to chat, or /help for commands.\n`,
-    );
+    const fingerprint = formatCliRoomFingerprint(roomKeys.roomIdPrefix);
+
+    if (cmd.json) {
+      writeJsonEvent({
+        type: "joined",
+        roomIdPrefix: roomKeys.roomIdPrefix,
+        fingerprint,
+        peerId,
+        username: creds.user.username,
+        displayName: creds.user.displayName,
+        downloadDir: cmd.downloadDir,
+      });
+    } else {
+      stdout.write(
+        `Joined room ${fingerprint} as @${sanitizeTerminalSingleLine(creds.user.username)} (${sanitizeTerminalSingleLine(creds.user.displayName)}, ${formatShortId(peerId, 8)}). Downloads: ${cmd.downloadDir}\nType a message to chat, or /help for commands.\n`,
+      );
+    }
 
     await new Promise<void>((resolveLoop) => {
       let closing = false;
+      const onSignal = () => finish();
       const finish = () => {
         if (closing) return;
         closing = true;
-        rl.close();
+        process.removeListener("SIGINT", onSignal);
+        process.removeListener("SIGTERM", onSignal);
+        io.abortSignal?.removeEventListener("abort", onSignal);
+        terminal?.close();
         resolveLoop();
       };
 
-      const onSignal = () => finish();
+      if (io.abortSignal?.aborted) {
+        finish();
+        return;
+      }
+
       process.once("SIGINT", onSignal);
       process.once("SIGTERM", onSignal);
       io.abortSignal?.addEventListener("abort", onSignal, { once: true });
 
-      if ("resume" in stdin && typeof stdin.resume === "function") {
-        stdin.resume();
-      }
-      const rl = createInterface({
-        input: stdin,
-        terminal: false,
+      terminal = new InteractiveJoinTerminal({
+        stdin,
+        stdout,
+        stderr,
+        jsonMode: cmd.json,
+        env: io.env,
+        getFiles: () => engine.getFiles(),
+        onLine: async (rawLine) =>
+          executeJoinInputLine({
+            line: rawLine,
+            engine,
+            chunkStorage,
+            sharedFiles,
+            stdout,
+            json: cmd.json,
+            onBeforeSelfChatPrint: () => {
+              terminal?.eraseJustSubmittedSingleLineEcho(rawLine);
+            },
+          }),
+        onLineError: (err) => {
+          const message = sanitizeTerminalSingleLine(
+            err instanceof Error ? err.message : String(err),
+          );
+          if (cmd.json) {
+            writeJsonEvent({ type: "error", message });
+          } else {
+            stderr.write(`[command error] ${message}\n`);
+          }
+        },
+        onExit: () => finish(),
+        onInputEof: () => {
+          if (closing) return;
+          if (!cmd.passphraseStdin) {
+            finish();
+          } else if (!cmd.json) {
+            stderr.write(
+              "[info] stdin closed (--passphrase-stdin mode); staying connected to room. Press Ctrl+C to leave.\n",
+            );
+          }
+        },
       });
-
-      let lineQueue: Promise<void> = Promise.resolve();
-      rl.on("line", (rawLine) => {
-        lineQueue = lineQueue
-          .then(async () => {
-            if (closing) return;
-            try {
-              const action = await executeJoinInputLine({
-                line: rawLine,
-                engine,
-                chunkStorage,
-                sharedFiles,
-                stdout,
-              });
-              if (action === "exit") {
-                finish();
-              }
-            } catch (err) {
-              stderr.write(
-                `[command error] ${sanitizeTerminalSingleLine(err instanceof Error ? err.message : String(err))}\n`,
-              );
-            }
-          })
-          .catch(() => {});
-      });
-
-      rl.on("close", () => {
-        process.removeListener("SIGINT", onSignal);
-        process.removeListener("SIGTERM", onSignal);
-        if (!cmd.passphraseStdin) {
-          finish();
-        }
-      });
+      terminal.startPrompt();
     });
   } finally {
     await engine.stop().catch(() => {});

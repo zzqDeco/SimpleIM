@@ -73,7 +73,13 @@ export type ParsedCliCommand =
       json: boolean;
     };
 
-export const DEFAULT_SERVER_URL = "http://127.0.0.1:3000";
+declare const __SIMPLEIM_DEFAULT_SERVER_URL__: string | undefined;
+
+export const DEFAULT_SERVER_URL =
+  typeof __SIMPLEIM_DEFAULT_SERVER_URL__ === "string" &&
+  __SIMPLEIM_DEFAULT_SERVER_URL__.trim().length > 0
+    ? __SIMPLEIM_DEFAULT_SERVER_URL__.trim()
+    : "http://127.0.0.1:3000";
 export const DEFAULT_MAX_STORAGE_MB = 1024;
 
 function assertNoPlaintextSecretFlags(argv: readonly string[]): void {
@@ -350,28 +356,134 @@ export function parseCliArgs(
   }
 }
 
-export function formatHelpText(): string {
-  return [
-    "SimpleIM CLI — E2EE Peer-to-Peer Chat & Swarm File Transfer",
-    "",
-    "Usage:",
-    "  simpleim register [--server <url>] [--username <u>] [--display-name <d>]",
-    "  simpleim login    [--server <url>] [--username <u>]",
-    "  simpleim logout   [--server <url>]",
-    "  simpleim whoami   [--server <url>]",
-    "  simpleim join     [--server <url>] [--download-dir <dir>] [--passphrase-stdin]",
-    "  simpleim seed     [--server <url>] [--storage-dir <dir>] [--max-storage-mb <N>] [--passphrase-stdin]",
-    "",
-    "Global Options:",
-    "  --server <url>         Central auth & signaling server URL (or SIMPLEIM_SERVER_URL)",
-    "  --config-dir <dir>     Credential directory (default: ~/.config/simpleim or SIMPLEIM_CONFIG_DIR)",
-    "  --json                 Emit machine-readable JSON output",
-    "  -h, --help             Show this help message",
-    "  -v, --version          Show CLI version",
-    "",
-    "Security Note:",
-    "  Plaintext --passphrase / -p flags are strictly forbidden to prevent leaking",
-    "  secrets in OS process tables. Enter passphrases via interactive hidden prompt",
-    "  or pipe them via --passphrase-stdin.",
-  ].join("\n");
+export function formatHelpText(topic?: string): string {
+  const normalizedTopic = topic?.trim().toLowerCase();
+
+  switch (normalizedTopic) {
+    case "register":
+      return [
+        "Usage: simpleim register [options]",
+        "",
+        "Register a new SimpleIM account and save session credentials locally.",
+        "",
+        "Options:",
+        "  --server <url>         Central server URL (prompted on first TTY run if unset)",
+        "  -u, --username <name>  Username (3..24 chars: [a-z0-9_-])",
+        "  --display-name <name>  Optional display name shown to room peers",
+        "  --password-stdin       Read password from stdin instead of hidden TTY prompt",
+        "  --config-dir <dir>     Credential directory (default: ~/.config/simpleim)",
+        "  --json                 Emit machine-readable JSON output",
+        "",
+        "Security Note:",
+        "  Plaintext --password flags are forbidden. On a TTY, password is entered",
+        "  with hidden echo and confirmed twice.",
+      ].join("\n");
+
+    case "login":
+      return [
+        "Usage: simpleim login [options]",
+        "",
+        "Sign in to an existing SimpleIM account and save session credentials locally.",
+        "",
+        "Options:",
+        "  --server <url>         Central server URL (prompted on first TTY run if unset)",
+        "  -u, --username <name>  Account username",
+        "  --password-stdin       Read password from stdin instead of hidden TTY prompt",
+        "  --config-dir <dir>     Credential directory (default: ~/.config/simpleim)",
+        "  --json                 Emit machine-readable JSON output",
+      ].join("\n");
+
+    case "logout":
+      return [
+        "Usage: simpleim logout [options]",
+        "",
+        "Revoke the current session on the server and remove saved local credentials.",
+        "",
+        "Options:",
+        "  --server <url>         Verify server URL matches stored credentials",
+        "  --config-dir <dir>     Credential directory (default: ~/.config/simpleim)",
+        "  --json                 Emit machine-readable JSON output",
+      ].join("\n");
+
+    case "whoami":
+      return [
+        "Usage: simpleim whoami [options]",
+        "",
+        "Verify saved session credentials against the server and show account info.",
+        "",
+        "Options:",
+        "  --server <url>         Verify server URL matches stored credentials",
+        "  --config-dir <dir>     Credential directory (default: ~/.config/simpleim)",
+        "  --json                 Emit machine-readable JSON output",
+      ].join("\n");
+
+    case "join":
+      return [
+        "Usage: simpleim join [options]",
+        "",
+        "Derive E2EE room keys locally from a shared passphrase and join a P2P room.",
+        "",
+        "Options:",
+        "  --server <url>         Central signaling server URL (or SIMPLEIM_SERVER_URL)",
+        "  --download-dir <dir>   Download folder (default: ./downloads, relative to cwd)",
+        "  --passphrase-stdin     Read passphrase from stdin (stays connected on EOF until Ctrl+C)",
+        "  --config-dir <dir>     Credential directory (default: ~/.config/simpleim)",
+        "  --json                 Emit newline-delimited JSON (NDJSON) events to stdout",
+        "",
+        "In-Room Slash Commands:",
+        "  /peers                       List verified P2P peers and signaling state",
+        "  /send <filepath>             Share a local file (supports ~, quotes, and escaped spaces)",
+        "  /files                       List announced files and transfer/relay progress",
+        "  /get <fileId|index>          Download or resume an announced file",
+        "  /cancel <fileId|index>       Cancel an in-progress download",
+        "  /reply <msgId|last> <text>   Reply quoting an earlier message",
+        "  /retry                       Retry pending offline-relay chat messages",
+        "  /help                        Show in-room command reference",
+        "  /leave, /quit                Disconnect from room and wipe room keys",
+      ].join("\n");
+
+    case "seed":
+      return [
+        "Usage: simpleim seed [options]",
+        "",
+        "Run a headless P2P seed peer that caches signed chat & files within a disk quota.",
+        "",
+        "Options:",
+        "  --server <url>         Central signaling server URL (or SIMPLEIM_SERVER_URL)",
+        "  --storage-dir <dir>    Seed storage directory (default: ./seed-storage, relative to cwd)",
+        "  --max-storage-mb <N>   Maximum disk quota in MiB (default: 1024)",
+        "  --passphrase-stdin     Read passphrase from stdin",
+        "  --config-dir <dir>     Credential directory (default: ~/.config/simpleim)",
+        "  --json                 Emit structured NDJSON logs to stdout (default: human-readable)",
+      ].join("\n");
+
+    default:
+      return [
+        "SimpleIM CLI — E2EE Peer-to-Peer Chat & Swarm File Transfer",
+        "",
+        "Usage:",
+        "  simpleim register [--server <url>] [-u|--username <u>] [--display-name <d>]",
+        "  simpleim login    [--server <url>] [-u|--username <u>]",
+        "  simpleim logout   [--server <url>]",
+        "  simpleim whoami   [--server <url>]",
+        "  simpleim join     [--server <url>] [--download-dir <dir>] [--passphrase-stdin]",
+        "  simpleim seed     [--server <url>] [--storage-dir <dir>] [--max-storage-mb <N>] [--passphrase-stdin]",
+        "",
+        "Global Options:",
+        "  --server <url>         Central auth & signaling server URL (or SIMPLEIM_SERVER_URL)",
+        "  --config-dir <dir>     Credential directory (default: ~/.config/simpleim or SIMPLEIM_CONFIG_DIR)",
+        "  --json                 Emit machine-readable JSON / NDJSON output",
+        "  -h, --help             Show help (run 'simpleim <command> --help' for command details)",
+        "  -v, --version          Show CLI version",
+        "",
+        "Defaults & Environment:",
+        "  Downloads default to ./downloads (relative to current working directory).",
+        "  Set NO_COLOR=1 to disable ANSI color output.",
+        "",
+        "Security Note:",
+        "  Plaintext --passphrase / -p and --password flags are strictly forbidden to",
+        "  prevent leaking secrets in OS process tables. Enter secrets interactively",
+        "  with hidden echo or pipe them via --passphrase-stdin / --password-stdin.",
+      ].join("\n");
+  }
 }

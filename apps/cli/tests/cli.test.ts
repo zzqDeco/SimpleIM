@@ -40,12 +40,24 @@ import {
   CliSecurityError,
   CliSignalingClient,
   CliUsageError,
+  createJoinCompleter,
   CredentialStore,
   DtlsHandshakeReassembler,
   ensureWeriftDtlsFragmentReassemblyGuarded,
   formatCliChatMessage,
+  formatCliFsError,
+  formatCliRoomFingerprint,
+  formatCliTimestamp,
+  formatHelpText,
+  formatRenderedChatEvent,
+  formatSeedQuotaHumanEvent,
+  formatShortId,
+  InteractiveJoinTerminal,
+  JoinTransferProgressTracker,
+  parseCliFilePathInput,
   sanitizeTerminalMultilineText,
   sanitizeTerminalSingleLine,
+  shouldUseColor,
   executeJoinInputLine,
   FsChunkStorageAdapter,
   isMdnsIceCandidate,
@@ -60,6 +72,7 @@ import {
   StorageQuotaExceededError,
   stripMdnsCandidatesFromSdp,
   StructuredLogger,
+  validateRegisterUsernameLocal,
   WeriftTransportFactory,
   type WeriftNetworkDiagnostic,
 } from "../src/main.ts";
@@ -2277,5 +2290,547 @@ describe("CliApiClient BlindRelayClient", () => {
       await sharedFiles.closeAll();
       await rm(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Issue #37 CLI P1/P2 Interactive UX", () => {
+  test("pseudo-TTY interactive session preserves partial user input across async incoming messages, eliminates double-echo, supports Ctrl+C exit, and completes slash commands & fileIds", async () => {
+    const ttyIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      isRaw: false,
+      setRawMode(mode: boolean) {
+        this.isRaw = mode;
+        return this;
+      },
+    });
+    const ttyOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 80,
+    });
+    const ttyErr = new PassThrough();
+
+    let capturedOut = "";
+    ttyOut.on("data", (chunk) => {
+      capturedOut += chunk.toString("utf8");
+    });
+
+    const submittedLines: string[] = [];
+    let exited = false;
+
+    const sampleManifest = await createSignedManifestFixture({
+      roomId: "f".repeat(64),
+      fileName: "report.pdf",
+      bytes: new TextEncoder().encode("pdf"),
+      fileId: "019a7777-0000-7000-8000-000000000001",
+    });
+
+    let resolveSecondLine!: () => void;
+    const secondLinePromise = new Promise<void>((r) => {
+      resolveSecondLine = r;
+    });
+
+    const terminal = new InteractiveJoinTerminal({
+      stdin: ttyIn,
+      stdout: ttyOut,
+      stderr: ttyErr,
+      env: { NO_COLOR: "1" },
+      getFiles: () => [sampleManifest],
+      onLine: async (line) => {
+        submittedLines.push(line);
+        if (submittedLines.length === 1) {
+          terminal.eraseJustSubmittedSingleLineEcho(line);
+          terminal.writeLine(`[12:00:02] @alice: ${line}`);
+        } else {
+          resolveSecondLine();
+        }
+        return "continue";
+      },
+      onExit: () => {
+        exited = true;
+      },
+    });
+
+    expect(terminal.isInteractive).toBe(true);
+    expect(terminal.palette.enabled).toBe(false); // NO_COLOR=1 honored
+    terminal.startPrompt();
+
+    // User starts typing a message WITHOUT pressing Enter yet
+    ttyIn.write("hello wo");
+    await Bun.sleep(15);
+
+    // Incoming remote chat message arrives mid-typing -> must clear active line,
+    // print incoming message cleanly, and redraw prompt + untouched partial input!
+    terminal.writeAsyncLine("[12:00:01] @bob: incoming ping!");
+    await Bun.sleep(15);
+
+    expect(capturedOut).toContain("\r\x1b[2K[12:00:01] @bob: incoming ping!\n");
+    // Prompt and buffered input were restored right after the incoming message
+    const afterIncoming = capturedOut.slice(
+      capturedOut.indexOf("incoming ping!\n") + "incoming ping!\n".length,
+    );
+    expect(afterIncoming).toContain("❯ ");
+    expect(afterIncoming).toContain("hello wo");
+
+    // User finishes typing "rld" and presses Enter -> exact intact message submitted!
+    ttyIn.write("rld\r");
+    await Bun.sleep(25);
+    expect(submittedLines).toEqual(["hello world"]);
+    // Single-line echo erasure sequence emitted before formatted self-line
+    expect(capturedOut).toContain("\x1b[1A\r\x1b[2K[12:00:02] @alice: hello world\n");
+
+    // Second line works cleanly, and Ctrl+C (\x03) triggers clean exit callback
+    ttyIn.write("/peers\r");
+    await secondLinePromise;
+    expect(submittedLines).toEqual(["hello world", "/peers"]);
+
+    ttyIn.write("\x03");
+    await Bun.sleep(15);
+    expect(exited).toBe(true);
+    terminal.close();
+
+    // Tab completer completes slash commands and announced fileId prefixes
+    const completer = createJoinCompleter(() => [sampleManifest]);
+    expect(completer("/pe")[0]).toEqual(["/peers"]);
+    expect(completer("/ca")[0]).toEqual(["/cancel "]);
+    expect(completer("/get 019a")[0]).toEqual([
+      "/get 019a7777",
+      "/get 019a7777-0000-7000-8000-000000000001",
+    ]);
+    expect(completer("/cancel 1")[0]).toEqual(["/cancel 1"]);
+  });
+
+  test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {
+    const workDir = await makeTempDir("join-p1-ux");
+    const fakeHome = join(workDir, "home");
+    const docsDir = join(fakeHome, "Docs");
+    await Bun.write(join(docsDir, "My Report (Final).pdf"), "PDF_CONTENT");
+
+    // Path parser handles ~, single quotes, double quotes, and backslash-escaped Finder paths
+    expect(parseCliFilePathInput("~/Docs/My\\ Report\\ \\(Final\\).pdf", fakeHome)).toBe(
+      join(docsDir, "My Report (Final).pdf"),
+    );
+    expect(parseCliFilePathInput(`'${join(docsDir, "My Report (Final).pdf")}'`, fakeHome)).toBe(
+      join(docsDir, "My Report (Final).pdf"),
+    );
+    expect(parseCliFilePathInput(`"${join(docsDir, "My Report (Final).pdf")}"`, fakeHome)).toBe(
+      join(docsDir, "My Report (Final).pdf"),
+    );
+    expect(formatCliFsError({ code: "ENOENT" }, "/missing/file.bin")).toBe(
+      "File not found: /missing/file.bin",
+    );
+    expect(formatCliFsError({ code: "EISDIR" }, "/tmp")).toBe(
+      "Expected a file, but path is a directory: /tmp",
+    );
+
+    const roomId = "e".repeat(64);
+    const serverKeys = generateEd25519KeyPair();
+    const peerKeys = generateEd25519KeyPair();
+    const peerId = "peer_019a9999000070008000000000000001";
+    const cert = issuePeerIdentityCert({
+      serverKeyId: "srvk_01",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: generatePrefixedId("usr"),
+      username: "alice",
+      displayName: "Alice",
+      peerId,
+      peerSignPubKey: peerKeys.publicKeyBase64Url,
+      clientKind: "cli",
+    });
+
+    const files: FileManifest[] = [];
+    const messages: ChatMessageEnvelope[] = [];
+    const cancelledIds: string[] = [];
+    let retryCount = 0;
+
+    const mockEngine: RoomPeerEngine = {
+      roomId,
+      localPeerId: peerId,
+      start: async () => {},
+      stop: async () => {},
+      updateLocalCert: () => {},
+      isCenterConnected: () => true,
+      getSignalingPeerCount: () => 0,
+      getVerifiedPeers: () => [],
+      getMessages: () => messages,
+      getChatDeliveryStates: () => new Map(),
+      getFiles: () => files,
+      getTransferProgress: () => undefined,
+      sendChatMessage: async (body, replyToMsgId) => {
+        const msg = signChatMessage({
+          roomId,
+          lamport: messages.length + 1,
+          body,
+          replyToMsgId: replyToMsgId ?? undefined,
+          authorCert: cert,
+          peerSignPrivKey: peerKeys.privateKeyBytes,
+        });
+        messages.push(msg);
+        return msg;
+      },
+      retryChatMessage: async () => {
+        retryCount += 1;
+      },
+      flushPendingRelayKeepalive: () => {},
+      shareFile: async (input) => {
+        const m = await createSignedFileManifestFromChunks({
+          roomId,
+          fileName: input.fileName,
+          fileSize: input.fileSize,
+          mimeType: input.mimeType,
+          readChunk: input.readChunk,
+          senderCert: cert,
+          peerSignPrivKey: peerKeys.privateKeyBytes,
+        });
+        files.push(m);
+        return m;
+      },
+      downloadFile: async () => {},
+      cancelDownload: async (fileId) => {
+        cancelledIds.push(fileId);
+      },
+    };
+
+    const chunkStorage = new FsChunkStorageAdapter({
+      downloadDir: join(workDir, "dl"),
+    });
+    const sharedFiles = new LocalSharedFileRegistry();
+
+    const jsonLines: Record<string, unknown>[] = [];
+    const jsonStdout = new PassThrough();
+    jsonStdout.on("data", (c) => {
+      for (const l of c.toString("utf8").split("\n")) {
+        if (l.trim()) jsonLines.push(JSON.parse(l) as Record<string, unknown>);
+      }
+    });
+
+    let humanOut = "";
+    const humanStdout = new PassThrough();
+    humanStdout.on("data", (c) => {
+      humanOut += c.toString("utf8");
+    });
+
+    try {
+      // /send with Finder backslash-escaped spaces & tilde expansion
+      await executeJoinInputLine({
+        line: "/send ~/Docs/My\\ Report\\ \\(Final\\).pdf",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+        homeDir: fakeHome,
+      });
+      expect(files.length).toBe(1);
+      expect(files[0]!.fileName).toBe("My Report (Final).pdf");
+
+      // Missing file produces clean friendly error (no raw ENOENT stack noise)
+      await expect(
+        executeJoinInputLine({
+          line: "/send '/nonexistent/Ghost File.pdf'",
+          engine: mockEngine,
+          chunkStorage,
+          sharedFiles,
+          stdout: humanStdout,
+          cwd: workDir,
+          homeDir: fakeHome,
+        }),
+      ).rejects.toThrow("File not found: /nonexistent/Ghost File.pdf");
+
+      // /cancel resolves by index and calls engine.cancelDownload
+      await executeJoinInputLine({
+        line: "/cancel 1",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(cancelledIds).toEqual([files[0]!.fileId]);
+      expect(humanOut).toContain("Cancelled download for 'My Report (Final).pdf'");
+
+      // Chat + /reply renders reply quote context & /retry invokes engine.retryChatMessage
+      await executeJoinInputLine({
+        line: "Original statement",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      await executeJoinInputLine({
+        line: "/reply last Agreed!",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(humanOut).toContain("↳ replying to @alice: Original statement");
+      expect(messages[1]!.replyToMsgId).toBe(messages[0]!.msgId);
+
+      await executeJoinInputLine({
+        line: "/retry",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(retryCount).toBe(1);
+
+      // --json mode emits clean NDJSON objects for chat, /files, and /cancel
+      await executeJoinInputLine({
+        line: "JSON hello",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: jsonStdout,
+        cwd: workDir,
+        json: true,
+      });
+      await executeJoinInputLine({
+        line: "/files",
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: jsonStdout,
+        cwd: workDir,
+        json: true,
+      });
+      expect(jsonLines.map((e) => e.type)).toEqual(["chat_sent", "files_snapshot"]);
+      expect(jsonLines[0]!.body).toBe("JSON hello");
+    } finally {
+      await sharedFiles.closeAll();
+      await chunkStorage.closeAll();
+    }
+  });
+
+  test("throttles download & relay progress with speed/ETA, formats Web-aligned fingerprints/timestamps/shortIds, and renders topic --help & seed human output", () => {
+    const tracker = new JoinTransferProgressTracker();
+    const fileId = "019a8888-1111-7000-8000-000000000099";
+
+    const first = tracker.consume(
+      {
+        fileId,
+        fileName: "archive.tar.gz",
+        fileSize: 2 * 1024 * 1024,
+        totalChunks: 32,
+        completedChunks: 8,
+        bytesCompleted: 512 * 1024,
+        downloadSpeedBytesPerSec: 512 * 1024,
+        availableSeeders: 2,
+        availablePeersWithChunks: 2,
+        status: "downloading",
+      },
+      1_000,
+    );
+    expect(first.length).toBe(1);
+    expect(first[0]).toContain("Downloading 'archive.tar.gz' 25%");
+    expect(first[0]).toContain("ETA 3s");
+    expect(first[0]).toContain("[peers: 2]");
+
+    // Rapid follow-up within 500ms is throttled
+    expect(
+      tracker.consume(
+        {
+          fileId,
+          fileName: "archive.tar.gz",
+          fileSize: 2 * 1024 * 1024,
+          totalChunks: 32,
+          completedChunks: 10,
+          bytesCompleted: 640 * 1024,
+          downloadSpeedBytesPerSec: 512 * 1024,
+          availableSeeders: 2,
+          availablePeersWithChunks: 2,
+          status: "downloading",
+        },
+        1_200,
+      ),
+    ).toEqual([]);
+
+    // Pause and relay caching transitions emit crisp updates
+    const paused = tracker.consume(
+      {
+        fileId,
+        fileName: "archive.tar.gz",
+        fileSize: 2 * 1024 * 1024,
+        totalChunks: 32,
+        completedChunks: 10,
+        bytesCompleted: 640 * 1024,
+        downloadSpeedBytesPerSec: 0,
+        availableSeeders: 1,
+        availablePeersWithChunks: 1,
+        status: "paused",
+        relayCacheState: "uploading",
+        relayCachedChunks: 4,
+      },
+      2_000,
+    );
+    expect(paused[0]).toContain("Paused 'archive.tar.gz' at 31% — run '/get 019a8888' to resume");
+    expect(paused[1]).toContain("[relay] Caching 'archive.tar.gz' 12% (4/32 chunks)");
+
+    const cached = tracker.consume(
+      {
+        fileId,
+        fileName: "archive.tar.gz",
+        fileSize: 2 * 1024 * 1024,
+        totalChunks: 32,
+        completedChunks: 32,
+        bytesCompleted: 2 * 1024 * 1024,
+        downloadSpeedBytesPerSec: 0,
+        availableSeeders: 1,
+        availablePeersWithChunks: 1,
+        status: "seeding",
+        relayCacheState: "cached",
+        relayCachedChunks: 32,
+      },
+      3_000,
+    );
+    expect(cached).toEqual(["[relay] Cached 'archive.tar.gz' for offline peers"]);
+
+    // Fingerprint matches Web `#xxxxxxxx`, short IDs stay compact, and old sync messages include YYYY-MM-DD
+    expect(formatCliRoomFingerprint("D7276E1899aabbcc")).toBe("#d7276e18");
+    expect(formatShortId("peer_019a1234567890abcdef", 8)).toBe("peer_019a1234");
+    expect(formatShortId(fileId, 8)).toBe("019a8888");
+
+    const nowMs = new Date(2026, 10, 28, 15, 0, 0).getTime();
+    const todayMs = new Date(2026, 10, 28, 9, 5, 4).getTime();
+    const yesterdayMs = new Date(2026, 10, 27, 22, 10, 30).getTime();
+    expect(formatCliTimestamp(todayMs, nowMs)).toBe("09:05:04");
+    expect(formatCliTimestamp(yesterdayMs, nowMs)).toBe("2026-11-27 22:10:30");
+
+    // Color detection respects isTTY & NO_COLOR
+    expect(shouldUseColor({ isTTY: true }, {})).toBe(true);
+    expect(shouldUseColor({ isTTY: true }, { NO_COLOR: "1" })).toBe(false);
+    expect(shouldUseColor({ isTTY: false }, {})).toBe(false);
+
+    // Topic --help covers join slash commands, -u, ./downloads, and --passphrase-stdin
+    const joinHelp = formatHelpText("join");
+    expect(joinHelp).toContain("/cancel <fileId|index>");
+    expect(joinHelp).toContain("./downloads");
+    expect(joinHelp).toContain("--passphrase-stdin");
+    expect(formatHelpText("register")).toContain("-u, --username");
+    expect(formatHelpText("seed")).toContain("human-readable");
+
+    // Seed human event formatter omits filenames and stays readable
+    expect(
+      formatSeedQuotaHumanEvent({
+        kind: "accepted",
+        fileId,
+        fileSize: 65_536,
+        totalChunks: 1,
+      }),
+    ).toBe("[seed] Caching file 019a8888 (64.0 KiB, 1 chunks)...");
+  });
+
+  test("register pre-validates username locally, prompts server/displayName/confirm-password on interactive TTY, and adds --server hint on network errors", async () => {
+    const configDir = await makeTempDir("reg-ux");
+    expect(() => validateRegisterUsernameLocal("ab")).toThrow("Invalid username");
+    expect(() => validateRegisterUsernameLocal("bad space")).toThrow("Invalid username");
+    expect(validateRegisterUsernameLocal("Alice_01")).toBe("alice_01");
+
+    // 1. Local username validation rejects BEFORE requesting password or hitting network
+    let networkCalls = 0;
+    const badUserStderr = new PassThrough();
+    let badUserErr = "";
+    badUserStderr.on("data", (c) => {
+      badUserErr += c.toString("utf8");
+    });
+    const badCode = await runCli(
+      ["register", "--server", "http://127.0.0.1:3999", "-u", "x", "--config-dir", configDir],
+      {
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+        stderr: badUserStderr,
+        fetchImpl: (async () => {
+          networkCalls += 1;
+          return Response.json({ ok: true });
+        }) as unknown as typeof fetch,
+      },
+    );
+    expect(badCode).toBe(1);
+    expect(networkCalls).toBe(0);
+    expect(badUserErr).toContain("Invalid username");
+
+    // 2. Network failure appends actionable --server hint
+    const netStdin = new PassThrough();
+    netStdin.end("ValidPass!123\n");
+    const netStderr = new PassThrough();
+    let netErr = "";
+    netStderr.on("data", (c) => {
+      netErr += c.toString("utf8");
+    });
+    const netCode = await runCli(
+      [
+        "register",
+        "-u",
+        "alice_net",
+        "--password-stdin",
+        "--config-dir",
+        configDir,
+      ],
+      {
+        stdin: netStdin,
+        stdout: new PassThrough(),
+        stderr: netStderr,
+        env: {},
+        fetchImpl: (async () => {
+          throw new Error("Connection refused");
+        }) as unknown as typeof fetch,
+      },
+    );
+    expect(netCode).toBe(1);
+    expect(netErr).toContain("Pass --server <url> or set SIMPLEIM_SERVER_URL");
+
+    // 3. Interactive TTY register prompts for server URL, display name, and password confirmation
+    const makeFakeTty = () => {
+      const stream = Object.assign(new PassThrough(), {
+        isTTY: true,
+        isRaw: false,
+        setRawMode(mode: boolean) {
+          this.isRaw = mode;
+          return this;
+        },
+      });
+      return stream;
+    };
+
+    const mismatchTty = makeFakeTty();
+    const mismatchErr = new PassThrough();
+    let mismatchText = "";
+    mismatchErr.on("data", (c) => {
+      mismatchText += c.toString("utf8");
+    });
+    const mismatchPromise = runCli(
+      ["register", "--config-dir", configDir],
+      {
+        stdin: mismatchTty,
+        stdout: new PassThrough(),
+        stderr: mismatchErr,
+        env: {},
+        fetchImpl: (async () => {
+          networkCalls += 1;
+          return Response.json({ ok: true });
+        }) as unknown as typeof fetch,
+      },
+    );
+    // Feed: server URL, username, display name, password, mismatched confirmation
+    await Bun.sleep(10);
+    mismatchTty.write("https://im.example.com\n");
+    await Bun.sleep(10);
+    mismatchTty.write("tty_alice\n");
+    await Bun.sleep(10);
+    mismatchTty.write("TTY Alice\n");
+    await Bun.sleep(10);
+    mismatchTty.write("CorrectPass!99\r");
+    await Bun.sleep(10);
+    mismatchTty.write("WrongPass!99\r");
+
+    expect(await mismatchPromise).toBe(1);
+    expect(networkCalls).toBe(0);
+    expect(mismatchText).toContain("Server URL [");
+    expect(mismatchText).toContain("Display name (optional");
+    expect(mismatchText).toContain("Confirm password:");
+    expect(mismatchText).toContain("Passwords do not match");
   });
 });
