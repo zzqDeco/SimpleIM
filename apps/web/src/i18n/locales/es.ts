@@ -160,4 +160,17 @@ export const es = {
   "error.chunk_hash_mismatch": "Falló la suma SHA-256 de un fragmento.",
   "error.network": "Error de red. Comprueba tu conexión.",
   "error.room_inactive": "No hay una sesión de sala activa.",
+  "room.rail.renameCancel": "Cancelar",
+  "room.inputStandbyPlaceholder": "Reconectando la sala…",
+  "room.srNewMessage": "Nuevo mensaje de {author}: {preview}",
+  "room.srNewFile": "{author} compartió un archivo: {name}",
+  "room.files.action.resume": "Reanudar",
+  "error.storage_limit":
+    "Se alcanzó el límite de almacenamiento local del navegador.",
+  "error.transfer_failed":
+    "La transferencia de archivo se interrumpió. Revisa la conexión e inténtalo de nuevo.",
+  "error.file_unavailable":
+    "El archivo aún no está listo. Descárgalo antes de guardarlo.",
+  "error.operation_failed":
+    "No se pudo completar la operación. Inténtalo de nuevo.",
 } satisfies TranslationSchema;

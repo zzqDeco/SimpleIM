@@ -15,7 +15,10 @@ import type {
 } from "@simpleim/peer-core";
 import { Byline, StatusIcon, Subline } from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
-import type { MessageViewModel } from "../../state/message-vm.ts";
+import {
+  truncatePreview,
+  type MessageViewModel,
+} from "../../state/message-vm.ts";
 import {
   isTranscriptNearBottom,
   shouldAutoScrollTranscript,
@@ -86,6 +89,7 @@ export interface MessageTranscriptProps {
   ) => Promise<Blob | null>;
   readonly onActionError?: (err: unknown) => void;
   readonly deliveryStates?: ReadonlyMap<string, ChatDeliveryStatus>;
+  readonly onlinePeerUserIds?: ReadonlySet<string>;
   readonly localPeerId: string;
   readonly currentUserId: string;
   readonly onReply: (msg: ChatMessageEnvelope) => void;
@@ -106,6 +110,7 @@ export function MessageTranscript({
   onReadFileBlob,
   onActionError,
   deliveryStates,
+  onlinePeerUserIds,
   localPeerId,
   currentUserId,
   onReply,
@@ -132,6 +137,7 @@ export function MessageTranscript({
     null,
   );
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [liveAnnouncement, setLiveAnnouncement] = useState("");
   const [floatingDateCreatedAt, setFloatingDateCreatedAt] = useState<
     number | null
   >(null);
@@ -394,12 +400,34 @@ export function MessageTranscript({
       setExpandedItemKey(null);
       setHighlightedItemKey(null);
       setToastMessage(null);
+      setLiveAnnouncement("");
       setLightbox(null);
       clearHideDatePillTimer();
       clearHighlightTimer();
       clearToastTimer();
       setFloatingDateVisible(false);
       setFloatingDateCreatedAt(null);
+    }
+
+    if (
+      !roomChanged &&
+      previousLastItemKey !== null &&
+      latestItemKey !== null &&
+      latestItemKey !== previousLastItemKey &&
+      latestItem &&
+      !latestItem.isSelf
+    ) {
+      setLiveAnnouncement(
+        latestItem.kind === "message"
+          ? t("room.srNewMessage", {
+              author: latestItem.vm.authorDisplayName,
+              preview: truncatePreview(latestItem.vm.body, 80),
+            })
+          : t("room.srNewFile", {
+              author: latestItem.authorDisplayName,
+              name: latestItem.manifest.fileName,
+            }),
+      );
     }
 
     if (roomChanged && latestItemKey === null) {
@@ -425,11 +453,13 @@ export function MessageTranscript({
     clearHideDatePillTimer,
     clearHighlightTimer,
     clearToastTimer,
+    latestItem,
     latestItemIsSelf,
     latestItemKey,
     roomId,
     scrollToBottom,
     setProgrammaticScrollTop,
+    t,
     timeline.length,
   ]);
 
@@ -578,15 +608,19 @@ export function MessageTranscript({
         </div>
       ) : null}
 
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {liveAnnouncement}
+      </div>
+
       <div
         ref={streamRef}
         className="message-stream"
         role="log"
-        aria-live="polite"
         aria-label={t("room.streamAria")}
         onScroll={handleScroll}
       >
-        {timeline.length === 0 ? (
+        <div className="message-stream-inner" data-testid="message-stream-inner">
+          {timeline.length === 0 ? (
           <div className="empty-transcript">{t("room.empty")}</div>
         ) : (
           timeline.map((item) => {
@@ -652,7 +686,15 @@ export function MessageTranscript({
                           </>
                         ) : (
                           <>
-                            <StatusIcon status="online" />
+                            <StatusIcon
+                              status={
+                                onlinePeerUserIds?.has(
+                                  item.manifest.senderCert.payload.userId,
+                                )
+                                  ? "online"
+                                  : "offline"
+                              }
+                            />
                             <span className="msg-author-name">
                               {item.authorDisplayName}
                             </span>
@@ -829,7 +871,15 @@ export function MessageTranscript({
                             </>
                           ) : (
                             <>
-                              <StatusIcon status="online" />
+                              <StatusIcon
+                                status={
+                                  onlinePeerUserIds?.has(
+                                    vm.envelope.authorCert.payload.userId,
+                                  )
+                                    ? "online"
+                                    : "offline"
+                                }
+                              />
                               <span className="msg-author-name">
                                 {vm.authorDisplayName}
                               </span>
@@ -930,6 +980,7 @@ export function MessageTranscript({
             );
           })
         )}
+        </div>
       </div>
 
       {toastMessage ? (

@@ -17,6 +17,7 @@ import type {
   VerifiedPeerInfo,
 } from "@simpleim/peer-core";
 import { NoticeBanner } from "../../design-system/index.ts";
+import { useDocumentUnreadTitle } from "../../hooks/useDocumentUnreadTitle.ts";
 import { useFileDropzone } from "../../hooks/useFileDropzone.ts";
 import { usePromptComposer } from "../../hooks/usePromptComposer.ts";
 import type { JoinPhase, SecurityEvent } from "../../hooks/useRoomSession.ts";
@@ -38,6 +39,16 @@ import { PromptComposer } from "./PromptComposer.tsx";
 import { RoomListRail } from "./RoomListRail.tsx";
 import { RoomSidePane } from "./RoomSidePane.tsx";
 import { RoomTopBar } from "./RoomTopBar.tsx";
+
+const RAIL_OVERLAY_QUERY = "(max-width: 899px)";
+const SIDEBAR_OVERLAY_QUERY = "(max-width: 1279px)";
+
+function readMediaMatch(query: string): boolean {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return false;
+  }
+  return window.matchMedia(query).matches;
+}
 
 export interface RoomScreenProps {
   readonly user: UserProfile;
@@ -121,20 +132,24 @@ export function RoomScreen({
 }: RoomScreenProps): ReactElement {
   const { t } = useI18n();
   const shellRef = useRef<HTMLDivElement | null>(null);
+  const railToggleRef = useRef<HTMLButtonElement | null>(null);
+  const sidebarToggleRef = useRef<HTMLButtonElement | null>(null);
+  const prevRailOpenRef = useRef(false);
+  const prevSidebarOpenRef = useRef(false);
+  const skipRailFocusRestoreRef = useRef(false);
+  const skipSidebarFocusRestoreRef = useRef(false);
   const locateNonceRef = useRef(0);
+
   const [railOpen, setRailOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(true);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-  const [isCompactViewport, setIsCompactViewport] = useState<boolean>(() => {
-    if (
-      typeof window === "undefined" ||
-      typeof window.matchMedia !== "function"
-    ) {
-      return false;
-    }
-    return window.matchMedia("(max-width: 1024px)").matches;
-  });
+  const [isRailOverlay, setIsRailOverlay] = useState<boolean>(() =>
+    readMediaMatch(RAIL_OVERLAY_QUERY),
+  );
+  const [isSidebarOverlay, setIsSidebarOverlay] = useState<boolean>(() =>
+    readMediaMatch(SIDEBAR_OVERLAY_QUERY),
+  );
   const [locateRequest, setLocateRequest] =
     useState<TranscriptLocateRequest | null>(null);
 
@@ -147,18 +162,24 @@ export function RoomScreen({
     ) {
       return;
     }
-    const mq = window.matchMedia("(max-width: 1024px)");
+    const railMq = window.matchMedia(RAIL_OVERLAY_QUERY);
+    const sidebarMq = window.matchMedia(SIDEBAR_OVERLAY_QUERY);
     const sync = (): void => {
-      setIsCompactViewport(mq.matches);
-      if (!mq.matches) {
+      setIsRailOverlay(railMq.matches);
+      setIsSidebarOverlay(sidebarMq.matches);
+      if (!railMq.matches) {
         setRailOpen(false);
+      }
+      if (!sidebarMq.matches) {
         setSidebarOpen(false);
       }
     };
     sync();
-    mq.addEventListener("change", sync);
+    railMq.addEventListener("change", sync);
+    sidebarMq.addEventListener("change", sync);
     return () => {
-      mq.removeEventListener("change", sync);
+      railMq.removeEventListener("change", sync);
+      sidebarMq.removeEventListener("change", sync);
     };
   }, []);
 
@@ -166,13 +187,53 @@ export function RoomScreen({
     setMoreMenuOpen(false);
   }, [selectedRoomId]);
 
+  // Transfer focus into overlay drawers on open and restore to trigger button on close.
+  useEffect(() => {
+    const prev = prevRailOpenRef.current;
+    prevRailOpenRef.current = railOpen;
+    if (!isRailOverlay) {
+      skipRailFocusRestoreRef.current = false;
+      return;
+    }
+    if (!prev && railOpen) {
+      document.getElementById("room-list-rail")?.focus({ preventScroll: true });
+    } else if (prev && !railOpen) {
+      if (skipRailFocusRestoreRef.current) {
+        skipRailFocusRestoreRef.current = false;
+      } else {
+        railToggleRef.current?.focus({ preventScroll: true });
+      }
+    }
+  }, [isRailOverlay, railOpen]);
+
+  useEffect(() => {
+    const prev = prevSidebarOpenRef.current;
+    prevSidebarOpenRef.current = sidebarOpen;
+    if (!isSidebarOverlay) {
+      skipSidebarFocusRestoreRef.current = false;
+      return;
+    }
+    if (!prev && sidebarOpen) {
+      document.getElementById("room-sidebar")?.focus({ preventScroll: true });
+    } else if (prev && !sidebarOpen) {
+      if (skipSidebarFocusRestoreRef.current) {
+        skipSidebarFocusRestoreRef.current = false;
+      } else {
+        sidebarToggleRef.current?.focus({ preventScroll: true });
+      }
+    }
+  }, [isSidebarOverlay, sidebarOpen]);
+
   const closeDrawers = useCallback((): void => {
     setRailOpen(false);
     setSidebarOpen(false);
   }, []);
 
+  const hasOpenOverlayDrawer =
+    (isRailOverlay && railOpen) || (isSidebarOverlay && sidebarOpen);
+
   useEffect(() => {
-    if (!railOpen && !sidebarOpen) {
+    if (!hasOpenOverlayDrawer) {
       return;
     }
     const handleKeyDown = (ev: KeyboardEvent): void => {
@@ -185,15 +246,22 @@ export function RoomScreen({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [closeDrawers, railOpen, sidebarOpen]);
+  }, [closeDrawers, hasOpenOverlayDrawer]);
 
   const totalUnreadCount = useMemo(
     () => rooms.reduce((sum, item) => sum + item.unreadCount, 0),
     [rooms],
   );
+  useDocumentUnreadTitle(t("app.title"), totalUnreadCount);
+
+  const onlinePeerUserIds = useMemo(
+    () => new Set(peers.map((p) => p.userId)),
+    [peers],
+  );
 
   const composer = usePromptComposer({
     roomKey: selectedRoomId,
+    roomInactive: selectedRoomStatus === "standby",
     onSendMessage,
     onShareFiles,
   });
@@ -202,38 +270,62 @@ export function RoomScreen({
     onFilesDropped: composer.stageFiles,
   });
 
-  const handleLocateFile = useCallback((fileId: string): void => {
-    setSidebarOpen(false);
-    setMoreMenuOpen(false);
-    setLocateRequest({
-      itemKey: `file:${fileId}`,
-      nonce: ++locateNonceRef.current,
-    });
-  }, []);
+  const handleLocateFile = useCallback(
+    (fileId: string): void => {
+      if (isSidebarOverlay && sidebarOpen) {
+        skipSidebarFocusRestoreRef.current = true;
+      }
+      setSidebarOpen(false);
+      setMoreMenuOpen(false);
+      setLocateRequest({
+        itemKey: `file:${fileId}`,
+        nonce: ++locateNonceRef.current,
+      });
+    },
+    [isSidebarOverlay, sidebarOpen],
+  );
 
   const handleToggleRail = useCallback((): void => {
+    if (isSidebarOverlay && sidebarOpen) {
+      skipSidebarFocusRestoreRef.current = true;
+    }
     setSidebarOpen(false);
     setMoreMenuOpen(false);
     setRailOpen((v) => !v);
-  }, []);
+  }, [isSidebarOverlay, sidebarOpen]);
 
   const handleToggleSidebar = useCallback((): void => {
     setMoreMenuOpen(false);
-    if (isCompactViewport) {
+    if (isSidebarOverlay) {
+      if (isRailOverlay && railOpen) {
+        skipRailFocusRestoreRef.current = true;
+      }
       setRailOpen(false);
       setSidebarOpen((v) => !v);
     } else {
       setDesktopSidebarOpen((v) => !v);
     }
-  }, [isCompactViewport]);
+  }, [isRailOverlay, isSidebarOverlay, railOpen]);
 
-  const handleMoreMenuOpenChange = useCallback((next: boolean): void => {
-    if (next) {
-      setRailOpen(false);
-      setSidebarOpen(false);
-    }
-    setMoreMenuOpen(next);
-  }, []);
+  const handleMoreMenuOpenChange = useCallback(
+    (next: boolean): void => {
+      if (next) {
+        if (isRailOverlay && railOpen) {
+          skipRailFocusRestoreRef.current = true;
+        }
+        if (isSidebarOverlay && sidebarOpen) {
+          skipSidebarFocusRestoreRef.current = true;
+        }
+        setRailOpen(false);
+        setSidebarOpen(false);
+      }
+      setMoreMenuOpen(next);
+    },
+    [isRailOverlay, isSidebarOverlay, railOpen, sidebarOpen],
+  );
+
+  const railInert = isRailOverlay && !railOpen;
+  const sidebarInert = isSidebarOverlay ? !sidebarOpen : !desktopSidebarOpen;
 
   const securityText =
     securityEvent === null
@@ -258,8 +350,10 @@ export function RoomScreen({
         fileCount={files.length}
         messageCount={messages.length}
         railOpen={railOpen}
-        sidebarExpanded={isCompactViewport ? sidebarOpen : desktopSidebarOpen}
+        sidebarExpanded={isSidebarOverlay ? sidebarOpen : desktopSidebarOpen}
         moreMenuOpen={moreMenuOpen}
+        railToggleRef={railToggleRef}
+        sidebarToggleRef={sidebarToggleRef}
         onMoreMenuOpenChange={handleMoreMenuOpenChange}
         onToggleRail={handleToggleRail}
         onToggleSidebar={handleToggleSidebar}
@@ -272,7 +366,7 @@ export function RoomScreen({
       <div
         className={`room-grid ${!desktopSidebarOpen ? "room-grid-sidebar-collapsed" : ""}`}
       >
-        {railOpen || sidebarOpen ? (
+        {hasOpenOverlayDrawer ? (
           <div
             className="drawer-backdrop"
             data-testid="drawer-backdrop"
@@ -280,8 +374,10 @@ export function RoomScreen({
             onClick={closeDrawers}
           />
         ) : null}
+
         <RoomListRail
           open={railOpen}
+          inert={railInert}
           rooms={rooms}
           selectedRoomId={selectedRoomId}
           joinPhase={joinPhase}
@@ -291,7 +387,12 @@ export function RoomScreen({
           onSelectRoom={onSelectRoom}
           onRenameRoomAlias={onRenameRoomAlias}
           onTogglePinRoom={onTogglePinRoom}
-          onCloseMobileRail={() => setRailOpen(false)}
+          onCloseMobileRail={() => {
+            if (isRailOverlay && railOpen) {
+              skipRailFocusRestoreRef.current = true;
+            }
+            setRailOpen(false);
+          }}
         />
 
         <main
@@ -320,7 +421,11 @@ export function RoomScreen({
               ) : null}
 
               {composer.actionFailure ? (
-                <NoticeBanner tone="error">
+                <NoticeBanner
+                  tone="error"
+                  dismissLabel={t("room.dismiss")}
+                  onDismiss={() => composer.setActionFailure(null)}
+                >
                   {formatAppFailure(composer.actionFailure, t)}
                 </NoticeBanner>
               ) : null}
@@ -339,6 +444,7 @@ export function RoomScreen({
             onReadFileBlob={onReadFileBlob}
             onActionError={composer.reportActionError}
             deliveryStates={deliveryStates}
+            onlinePeerUserIds={onlinePeerUserIds}
             localPeerId={localPeerId}
             currentUserId={user.id}
             onReply={composer.selectReplyTarget}
@@ -353,6 +459,7 @@ export function RoomScreen({
 
         <RoomSidePane
           open={sidebarOpen}
+          inert={sidebarInert}
           peers={peers}
           files={files}
           transfers={transfers}

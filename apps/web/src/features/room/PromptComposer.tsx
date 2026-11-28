@@ -26,126 +26,134 @@ export function PromptComposer({ composer }: PromptComposerProps): ReactElement 
 
   return (
     <form className="composer-dock" onSubmit={composer.handleSubmit}>
-      {composer.replyTarget ? (
-        <div className="composer-reply-bar">
-          <Subline>
-            <span className="msg-quote-author">
-              {t("room.replyingTo", {
-                username: composer.replyTarget.authorCert.payload.username,
-              })}
-            </span>
-            <span>{truncatePreview(composer.replyTarget.body, 72)}</span>
-          </Subline>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={composer.clearReplyTarget}
+      <div className="composer-dock-inner" data-testid="composer-dock-inner">
+        {composer.replyTarget ? (
+          <div className="composer-reply-bar">
+            <Subline>
+              <span className="msg-quote-author">
+                {t("room.replyingTo", {
+                  username: composer.replyTarget.authorCert.payload.username,
+                })}
+              </span>
+              <span>{truncatePreview(composer.replyTarget.body, 72)}</span>
+            </Subline>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={composer.clearReplyTarget}
+            >
+              {t("room.cancelReply")}
+            </Button>
+          </div>
+        ) : null}
+
+        {composer.stagedFiles.length > 0 ? (
+          <div
+            className="composer-staged-bar"
+            data-testid="staged-attachments"
+            aria-label={t("room.composer.stagedAria")}
           >
-            {t("room.cancelReply")}
+            {composer.stagedFiles.map((item) => (
+              <div
+                key={item.id}
+                className="composer-staged-chip"
+                data-testid="staged-attachment-item"
+              >
+                {item.previewUrl ? (
+                  <img
+                    src={item.previewUrl}
+                    alt={item.file.name}
+                    className="composer-staged-thumb"
+                  />
+                ) : (
+                  <span className="composer-staged-ext" aria-hidden="true">
+                    {formatFileExtensionBadge(item.file.name)}
+                  </span>
+                )}
+                <div className="composer-staged-meta">
+                  <span className="composer-staged-name">{item.file.name}</span>
+                  <span className="composer-staged-size">
+                    {formatBytes(item.file.size)}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="composer-staged-remove"
+                  data-testid="remove-staged-attachment"
+                  aria-label={t("room.composer.removeStagedAria", {
+                    name: item.file.name,
+                  })}
+                  disabled={composer.sending}
+                  onClick={() => composer.removeStagedFile(item.id)}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="composer-prompt-frame">
+          <input
+            ref={fileInputRef}
+            data-testid="file-input"
+            type="file"
+            multiple
+            className="sr-only"
+            aria-label={t("room.attachAria")}
+            disabled={composer.sending || composer.roomInactive}
+            onChange={handleFileInputChange}
+          />
+
+          <Button
+            variant="secondary"
+            size="sm"
+            className="composer-attach-btn"
+            testId="attach-file-button"
+            aria-label={t("room.attachAria")}
+            disabled={composer.sending || composer.roomInactive}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <span aria-hidden="true">＋</span>
+            <span className="composer-attach-label">{t("room.attach")}</span>
+          </Button>
+
+          <textarea
+            ref={composer.textareaRef}
+            data-testid="chat-input"
+            className="composer-textarea"
+            rows={1}
+            placeholder={
+              composer.roomInactive
+                ? t("room.inputStandbyPlaceholder")
+                : t("room.inputPlaceholder")
+            }
+            aria-label={t("room.inputAria")}
+            disabled={composer.roomInactive}
+            value={composer.draft}
+            onChange={(ev) => composer.setDraft(ev.target.value)}
+            onKeyDown={composer.handleKeyDown}
+            onPaste={composer.handlePaste}
+          />
+
+          <Button
+            type="submit"
+            variant="primary"
+            size="sm"
+            testId="chat-send"
+            disabled={!composer.canSend}
+          >
+            {t("room.send")}
           </Button>
         </div>
-      ) : null}
 
-      {composer.stagedFiles.length > 0 ? (
-        <div
-          className="composer-staged-bar"
-          data-testid="staged-attachments"
-          aria-label={t("room.composer.stagedAria")}
-        >
-          {composer.stagedFiles.map((item) => (
-            <div
-              key={item.id}
-              className="composer-staged-chip"
-              data-testid="staged-attachment-item"
-            >
-              {item.previewUrl ? (
-                <img
-                  src={item.previewUrl}
-                  alt={item.file.name}
-                  className="composer-staged-thumb"
-                />
-              ) : (
-                <span className="composer-staged-ext" aria-hidden="true">
-                  {formatFileExtensionBadge(item.file.name)}
-                </span>
-              )}
-              <div className="composer-staged-meta">
-                <span className="composer-staged-name">{item.file.name}</span>
-                <span className="composer-staged-size">
-                  {formatBytes(item.file.size)}
-                </span>
-              </div>
-              <button
-                type="button"
-                className="composer-staged-remove"
-                data-testid="remove-staged-attachment"
-                aria-label={t("room.composer.removeStagedAria", {
-                  name: item.file.name,
-                })}
-                disabled={composer.sending}
-                onClick={() => composer.removeStagedFile(item.id)}
-              >
-                ✕
-              </button>
-            </div>
-          ))}
+        <div className="composer-footer">
+          <Byline>
+            <span>{t("room.shortcutSend")}</span>
+            <span>{t("room.shortcutNewline")}</span>
+            <span>{t("room.composer.pasteHint")}</span>
+          </Byline>
         </div>
-      ) : null}
-
-      <div className="composer-prompt-frame">
-        <input
-          ref={fileInputRef}
-          data-testid="file-input"
-          type="file"
-          multiple
-          className="sr-only"
-          aria-label={t("room.attachAria")}
-          onChange={handleFileInputChange}
-        />
-
-        <Button
-          variant="secondary"
-          size="sm"
-          className="composer-attach-btn"
-          testId="attach-file-button"
-          aria-label={t("room.attachAria")}
-          disabled={composer.sending}
-          onClick={() => fileInputRef.current?.click()}
-        >
-          <span aria-hidden="true">＋</span>
-          <span className="composer-attach-label">{t("room.attach")}</span>
-        </Button>
-
-        <textarea
-          ref={composer.textareaRef}
-          data-testid="chat-input"
-          className="composer-textarea"
-          rows={1}
-          placeholder={t("room.inputPlaceholder")}
-          aria-label={t("room.inputAria")}
-          value={composer.draft}
-          onChange={(ev) => composer.setDraft(ev.target.value)}
-          onKeyDown={composer.handleKeyDown}
-          onPaste={composer.handlePaste}
-        />
-
-        <Button
-          type="submit"
-          variant="primary"
-          size="sm"
-          testId="chat-send"
-          disabled={!composer.canSend}
-        >
-          {t("room.send")}
-        </Button>
-      </div>
-
-      <div className="composer-footer">
-        <Byline>
-          <span>{t("room.shortcutSend")}</span>
-          <span>{t("room.shortcutNewline")}</span>
-          <span>{t("room.composer.pasteHint")}</span>
-        </Byline>
       </div>
     </form>
   );

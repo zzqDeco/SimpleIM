@@ -21,6 +21,7 @@ export interface StagedAttachment {
 
 export interface UsePromptComposerParams {
   readonly roomKey?: string | null;
+  readonly roomInactive?: boolean;
   readonly onSendMessage: (
     body: string,
     replyToMsgId: string | null,
@@ -36,6 +37,7 @@ export interface PromptComposerController {
   readonly removeStagedFile: (id: string) => void;
   readonly clearStagedFiles: () => void;
   readonly canSend: boolean;
+  readonly roomInactive: boolean;
   readonly replyTarget: ChatMessageEnvelope | null;
   readonly selectReplyTarget: (msg: ChatMessageEnvelope) => void;
   readonly clearReplyTarget: () => void;
@@ -61,6 +63,7 @@ function revokeAttachmentPreview(item: StagedAttachment): void {
 
 export function usePromptComposer({
   roomKey = null,
+  roomInactive = false,
   onSendMessage,
   onShareFiles,
 }: UsePromptComposerParams): PromptComposerController {
@@ -191,7 +194,11 @@ export function usePromptComposer({
   const submitAll = useCallback(async (): Promise<void> => {
     const trimmed = draftRef.current.trim();
     const filesSnapshot = [...stagedFilesRef.current];
-    if ((trimmed.length === 0 && filesSnapshot.length === 0) || sending) {
+    if (
+      (trimmed.length === 0 && filesSnapshot.length === 0) ||
+      sending ||
+      roomInactive
+    ) {
       return;
     }
 
@@ -236,7 +243,14 @@ export function usePromptComposer({
     } finally {
       setSending(false);
     }
-  }, [onSendMessage, onShareFiles, removeStagedFile, replyTarget, sending]);
+  }, [
+    onSendMessage,
+    onShareFiles,
+    removeStagedFile,
+    replyTarget,
+    roomInactive,
+    sending,
+  ]);
 
   const handleSubmit = useCallback(
     (ev: FormEvent<HTMLFormElement>): void => {
@@ -254,6 +268,14 @@ export function usePromptComposer({
         return;
       }
       if (ev.key === "Enter" && !ev.shiftKey && !ev.nativeEvent.isComposing) {
+        // On touch devices (no physical Shift key), Enter inserts a newline and Send button submits.
+        const isCoarsePointer =
+          typeof window !== "undefined" &&
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(pointer: coarse)").matches;
+        if (isCoarsePointer) {
+          return;
+        }
         ev.preventDefault();
         void submitAll();
       }
@@ -287,7 +309,9 @@ export function usePromptComposer({
   }, []);
 
   const canSend =
-    !sending && (draft.trim().length > 0 || stagedFiles.length > 0);
+    !sending &&
+    !roomInactive &&
+    (draft.trim().length > 0 || stagedFiles.length > 0);
 
   return {
     draft,
@@ -297,6 +321,7 @@ export function usePromptComposer({
     removeStagedFile,
     clearStagedFiles: revokeAllStaged,
     canSend,
+    roomInactive,
     replyTarget,
     selectReplyTarget,
     clearReplyTarget,

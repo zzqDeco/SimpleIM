@@ -91,6 +91,7 @@ export interface TranslationSchema {
   "room.rail.unpin": string;
   "room.rail.rename": string;
   "room.rail.renameSave": string;
+  "room.rail.renameCancel": string;
   "room.rail.renamePlaceholder": string;
   "room.rail.emptyPreview": string;
   "room.rail.filePreview": string;
@@ -108,6 +109,7 @@ export interface TranslationSchema {
   "room.attach": string;
   "room.attachAria": string;
   "room.inputPlaceholder": string;
+  "room.inputStandbyPlaceholder": string;
   "room.inputAria": string;
   "room.send": string;
   "room.shortcutSend": string;
@@ -123,6 +125,8 @@ export interface TranslationSchema {
   "room.date.today": string;
   "room.date.yesterday": string;
   "room.msg.toggleTimeAria": string;
+  "room.srNewMessage": string;
+  "room.srNewFile": string;
 
   // Side Pane (Members & Files)
   "room.sidebarAria": string;
@@ -139,6 +143,7 @@ export interface TranslationSchema {
   "room.files.status.paused": string;
   "room.files.status.error": string;
   "room.files.action.download": string;
+  "room.files.action.resume": string;
   "room.files.action.cancel": string;
   "room.files.action.save": string;
   "room.files.action.locate": string;
@@ -177,6 +182,10 @@ export interface TranslationSchema {
   "error.chunk_hash_mismatch": string;
   "error.network": string;
   "error.room_inactive": string;
+  "error.storage_limit": string;
+  "error.transfer_failed": string;
+  "error.file_unavailable": string;
+  "error.operation_failed": string;
 }
 
 export type TranslationKey = keyof TranslationSchema;

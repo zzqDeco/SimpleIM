@@ -44,6 +44,39 @@ const SIGNALING_ERROR_PREFIX_RE = /^Signaling error \[([a-z0-9_]+)\]:/i;
 const INACTIVE_ROOM_RE = /\b(?:not active|is stopped)\b/i;
 const NETWORK_TRANSPORT_RE =
   /(?:failed to fetch|networkerror|load failed|signaling websocket|websocket closed)/i;
+const STORAGE_LIMIT_RE =
+  /(?:fallback cap|quota|storage|opfs|disk|not enough space)/i;
+const FILE_UNAVAILABLE_RE =
+  /(?:not ready to save|unknown file|no (?:verified )?peer|no seeder)/i;
+const HASH_MISMATCH_RE = /(?:hash mismatch|corrupt|poison)/i;
+const TRANSFER_FAILED_RE =
+  /(?:download|transfer|chunk|seeder|timeout|cancel|abort|relay|eof)/i;
+
+function formatRuntimeDetail(detail: string, t: TranslateFn): string {
+  if (HASH_MISMATCH_RE.test(detail)) {
+    return t("error.chunk_hash_mismatch");
+  }
+  if (STORAGE_LIMIT_RE.test(detail)) {
+    return t("error.storage_limit");
+  }
+  if (FILE_UNAVAILABLE_RE.test(detail)) {
+    return t("error.file_unavailable");
+  }
+  if (NETWORK_TRANSPORT_RE.test(detail)) {
+    return t("error.network");
+  }
+  if (TRANSFER_FAILED_RE.test(detail)) {
+    return t("error.transfer_failed");
+  }
+  return t("error.operation_failed");
+}
+
+export function formatTransferError(
+  rawMessage: string,
+  t: TranslateFn,
+): string {
+  return formatRuntimeDetail(rawMessage, t);
+}
 
 function isKnownErrorCode(value: unknown): value is ErrorCode {
   return (
@@ -123,6 +156,6 @@ export function formatAppFailure(failure: AppFailure, t: TranslateFn): string {
     case "network":
       return t("error.network");
     case "runtime":
-      return failure.detail;
+      return formatRuntimeDetail(failure.detail, t);
   }
 }

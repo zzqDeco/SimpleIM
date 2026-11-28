@@ -1,8 +1,10 @@
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   type FormEvent,
+  type KeyboardEvent,
   type ReactElement,
 } from "react";
 import {
@@ -30,6 +32,7 @@ import {
 
 export interface RoomListRailProps {
   readonly open: boolean;
+  readonly inert?: boolean;
   readonly rooms: readonly RoomSummaryItem[];
   readonly selectedRoomId: string | null;
   readonly joinPhase: JoinPhase;
@@ -47,6 +50,7 @@ export interface RoomListRailProps {
 
 export function RoomListRail({
   open,
+  inert = false,
   rooms,
   selectedRoomId,
   joinPhase,
@@ -59,6 +63,7 @@ export function RoomListRail({
   onCloseMobileRail,
 }: RoomListRailProps): ReactElement {
   const { t } = useI18n();
+  const asideRef = useRef<HTMLElement | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [passphrase, setPassphrase] = useState("");
   const [alias, setAlias] = useState("");
@@ -68,6 +73,12 @@ export function RoomListRail({
   const [editingRoomId, setEditingRoomId] = useState<string | null>(null);
   const [editingAliasValue, setEditingAliasValue] = useState("");
   const [liveNowMs, setLiveNowMs] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    const el = asideRef.current;
+    if (!el) return;
+    el.inert = inert;
+  }, [inert]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -145,11 +156,27 @@ export function RoomListRail({
     setEditingAliasValue("");
   };
 
+  const handleCancelRename = (): void => {
+    setEditingRoomId(null);
+    setEditingAliasValue("");
+  };
+
+  const handleRenameKeyDown = (ev: KeyboardEvent<HTMLInputElement>): void => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      handleCancelRename();
+    }
+  };
+
   return (
     <aside
+      ref={asideRef}
       id="room-list-rail"
       data-testid="room-list-rail"
       aria-label={t("room.railAria")}
+      aria-hidden={inert || undefined}
+      tabIndex={-1}
       className={`room-rail ${open ? "room-rail-open" : ""}`}
     >
       <div className="room-rail-header">
@@ -372,6 +399,8 @@ export function RoomListRail({
                     placeholder={t("room.rail.renamePlaceholder")}
                     value={editingAliasValue}
                     onChange={(ev) => setEditingAliasValue(ev.target.value)}
+                    onKeyDown={handleRenameKeyDown}
+                    autoFocus
                   />
                   <Button
                     type="submit"
@@ -380,6 +409,14 @@ export function RoomListRail({
                     testId="room-alias-save"
                   >
                     {t("room.rail.renameSave")}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    testId="room-alias-cancel"
+                    onClick={handleCancelRename}
+                  >
+                    {t("room.rail.renameCancel")}
                   </Button>
                 </form>
               ) : (

@@ -159,4 +159,16 @@ export const ja = {
   "error.chunk_hash_mismatch": "ファイルチャンクのハッシュ検証に失敗しました。",
   "error.network": "ネットワーク通信に失敗しました。接続を確認してください。",
   "error.room_inactive": "有効なルームセッションがありません。",
+  "room.rail.renameCancel": "キャンセル",
+  "room.inputStandbyPlaceholder": "ルーム接続を復旧中…",
+  "room.srNewMessage": "{author} から新着メッセージ：{preview}",
+  "room.srNewFile": "{author} がファイルを共有しました：{name}",
+  "room.files.action.resume": "再開",
+  "error.storage_limit": "ブラウザのローカル保存容量の上限に達しました。",
+  "error.transfer_failed":
+    "ファイル転送が中断されました。接続を確認して再試行してください。",
+  "error.file_unavailable":
+    "ファイルの準備が完了していません。先にダウンロードしてください。",
+  "error.operation_failed":
+    "操作を完了できませんでした。もう一度お試しください。",
 } satisfies TranslationSchema;

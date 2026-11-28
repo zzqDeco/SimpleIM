@@ -159,4 +159,13 @@ export const en = {
   "error.chunk_hash_mismatch": "File chunk checksum verification failed.",
   "error.network": "Network request failed. Check your connection.",
   "error.room_inactive": "No active room session.",
+  "room.rail.renameCancel": "Cancel",
+  "room.inputStandbyPlaceholder": "Reconnecting live room…",
+  "room.srNewMessage": "New message from {author}: {preview}",
+  "room.srNewFile": "{author} shared a file: {name}",
+  "room.files.action.resume": "Resume",
+  "error.storage_limit": "Browser local storage limit reached for this file.",
+  "error.transfer_failed": "File transfer interrupted. Check connection and retry.",
+  "error.file_unavailable": "File is not ready yet. Download it before saving.",
+  "error.operation_failed": "Operation could not be completed. Please try again.",
 } satisfies TranslationSchema;

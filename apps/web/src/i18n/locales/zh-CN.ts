@@ -157,4 +157,13 @@ export const zhCN = {
   "error.chunk_hash_mismatch": "文件分片校验失败。",
   "error.network": "网络连接失败，请检查网络后重试。",
   "error.room_inactive": "当前未处于活跃房间中。",
+  "room.rail.renameCancel": "取消",
+  "room.inputStandbyPlaceholder": "正在恢复房间实时连接…",
+  "room.srNewMessage": "{author} 发送了新消息：{preview}",
+  "room.srNewFile": "{author} 分享了文件：{name}",
+  "room.files.action.resume": "继续",
+  "error.storage_limit": "本地浏览器存储空间受限，无法缓存该文件。",
+  "error.transfer_failed": "文件传输中断，请检查连接后重试。",
+  "error.file_unavailable": "文件尚未就绪，请先下载后再保存。",
+  "error.operation_failed": "操作未能完成，请稍后重试。",
 } satisfies TranslationSchema;
