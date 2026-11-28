@@ -2614,6 +2614,83 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     expect(wrappedAheadBuf).toContain("\x1b[1A");
     expect(wrappedAheadBuf).toContain("❯ 123456789012345678901234567890");
     wrappedAheadTerm.close();
+
+    // Production wiring: executeJoinInputLine routed through createCommandOutputStream()
+    // on a 20-col TTY with 30 wrapped type-ahead chars clears the wrapped input BEFORE
+    // printing the command result and NEVER emits \x1b[1A after the result!
+    const wiredIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const wiredOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 20,
+    });
+    let wiredBuf = "";
+    wiredOut.on("data", (c) => {
+      wiredBuf += c.toString("utf8");
+    });
+    const wiredWorkDir = await makeTempDir("wired-tty");
+    const wiredFile = join(wiredWorkDir, "wired.txt");
+    await writeFile(wiredFile, "wired-data");
+    let releaseShare!: () => void;
+    const shareGate = new Promise<void>((r) => {
+      releaseShare = r;
+    });
+    const wiredFiles: FileManifest[] = [];
+    const wiredEngine = {
+      roomId: "f".repeat(64),
+      localPeerId: "peer_019a0000000070008000000000000099",
+      getFiles: () => wiredFiles,
+      getMessages: () => [],
+      shareFile: async () => {
+        await shareGate;
+        wiredFiles.push(sampleManifest);
+        return sampleManifest;
+      },
+    } as unknown as RoomPeerEngine;
+    const wiredStorage = new FsChunkStorageAdapter({
+      downloadDir: join(wiredWorkDir, "dl"),
+    });
+    const wiredShared = new LocalSharedFileRegistry();
+    const wiredTerm: InteractiveJoinTerminal = new InteractiveJoinTerminal({
+      stdin: wiredIn,
+      stdout: wiredOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      getFiles: () => wiredFiles,
+      onLine: async (rawLine): Promise<"continue" | "exit"> =>
+        executeJoinInputLine({
+          line: rawLine,
+          engine: wiredEngine,
+          chunkStorage: wiredStorage,
+          sharedFiles: wiredShared,
+          stdout: wiredTerm.createCommandOutputStream("stdout"),
+          cwd: wiredWorkDir,
+        }),
+    });
+    try {
+      wiredTerm.startPrompt();
+      wiredIn.write(`/send ${wiredFile}\r`);
+      await Bun.sleep(10);
+      wiredIn.write("123456789012345678901234567890");
+      await Bun.sleep(10);
+      wiredBuf = "";
+      releaseShare();
+      await Bun.sleep(30);
+      expect(wiredBuf).toContain("[file] Announced 'report.pdf'");
+      const afterAnnouncement = wiredBuf.slice(
+        wiredBuf.indexOf("[file] Announced 'report.pdf'"),
+      );
+      expect(afterAnnouncement).not.toContain("\x1b[1A");
+      expect(afterAnnouncement).toContain("❯ 123456789012345678901234567890");
+    } finally {
+      wiredTerm.close();
+      await wiredShared.closeAll();
+      await wiredStorage.closeAll();
+    }
   });
 
   test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {

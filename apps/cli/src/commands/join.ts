@@ -1057,7 +1057,7 @@ export async function runJoinCommand(
             engine,
             chunkStorage,
             sharedFiles,
-            stdout,
+            stdout: terminal ? terminal.createCommandOutputStream("stdout") : stdout,
             json: cmd.json,
             onBeforeSelfChatPrint: () => {
               terminal?.eraseJustSubmittedSingleLineEcho(rawLine);
@@ -1069,6 +1069,8 @@ export async function runJoinCommand(
           );
           if (cmd.json) {
             writeJsonEvent({ type: "error", message });
+          } else if (terminal) {
+            terminal.writeLine(`[command error] ${message}`, "stderr");
           } else {
             stderr.write(`[command error] ${message}\n`);
           }

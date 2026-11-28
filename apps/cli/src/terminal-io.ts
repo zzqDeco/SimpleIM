@@ -6,6 +6,7 @@ import {
   moveCursor,
   type Interface as ReadlineInterface,
 } from "node:readline";
+import { Writable } from "node:stream";
 import type { FileManifest } from "@simpleim/contracts";
 import { sanitizeTerminalSingleLine } from "./terminal-sanitize.ts";
 
@@ -551,6 +552,17 @@ export class InteractiveJoinTerminal {
    * (prompt will be re-displayed once the line handler resolves).
    */
   writeLine(text: string, stream: "stdout" | "stderr" = "stdout"): void {
+    this.writeCommandChunk(`${text}\n`, stream);
+  }
+
+  /**
+   * Writes raw command output while clearing any visible type-ahead region so
+   * command results are never glued into or erased by subsequent prompt redraws.
+   */
+  writeCommandChunk(
+    chunk: string,
+    stream: "stdout" | "stderr" = "stdout",
+  ): void {
     this.outputEpoch += 1;
     const target = stream === "stderr" ? this.stderr : this.stdout;
     if (
@@ -562,7 +574,28 @@ export class InteractiveJoinTerminal {
     ) {
       this.clearActiveInputRegion(this.promptDrawn);
     }
-    target.write(`${text}\n`);
+    target.write(chunk);
+  }
+
+  /**
+   * Returns a WritableStream adapter that routes command writes through
+   * `writeCommandChunk()`, keeping type-ahead clearing & echo epochs in sync.
+   */
+  createCommandOutputStream(
+    stream: "stdout" | "stderr" = "stdout",
+  ): NodeJS.WritableStream {
+    return new Writable({
+      write: (chunk, _encoding, callback) => {
+        const text =
+          typeof chunk === "string"
+            ? chunk
+            : Buffer.isBuffer(chunk)
+              ? chunk.toString("utf8")
+              : Buffer.from(chunk as Uint8Array).toString("utf8");
+        this.writeCommandChunk(text, stream);
+        callback();
+      },
+    });
   }
 
   close(): void {
