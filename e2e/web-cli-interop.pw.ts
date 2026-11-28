@@ -1277,11 +1277,18 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       // Reply to message #1, verify right-aligned self bubble vs left-aligned peer bubble,
       // and click quote jump button to scroll back to & highlight message #1!
       await page.locator(".msg-entry").first().locator(".msg-reply-trigger").click();
-      await page.getByTestId("chat-input").fill("Jumping back to entry #1!");
+      // On coarse-pointer touch devices, pressing Enter inserts a newline instead of sending!
+      await page.getByTestId("chat-input").focus();
+      await page.keyboard.type("Jumping back");
+      await page.keyboard.press("Enter");
+      await page.keyboard.type("to entry #1!");
+      await expect(page.getByTestId("chat-input")).toHaveValue(
+        "Jumping back\nto entry #1!",
+      );
       await page.getByTestId("chat-send").click();
 
       const selfReplyEntry = page.locator(".msg-entry-self", {
-        hasText: "Jumping back to entry #1!",
+        hasText: "Jumping back",
       });
       await expect(selfReplyEntry).toBeVisible();
 
@@ -1319,6 +1326,433 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
       expect(bottomMetrics.distanceFromBottom).toBeLessThanOrEqual(4);
     } finally {
       await context.close();
+    }
+  });
+
+  test("enforces 6-viewport responsive constraints, inert closed drawers with focus management, ultrawide alignment, and document title unread count", async ({
+    browser,
+  }) => {
+    const cluster = await harness.call<{
+      webOrigin: string;
+      apiUrl: string;
+      sqlitePath: string;
+    }>("startCluster");
+
+    const room1Passphrase = "responsive-audit-room-one-2026";
+    const room2Passphrase = "responsive-audit-room-two-2026";
+
+    const contextAlice = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+    });
+    const contextBob = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+    });
+    const pageAlice = await contextAlice.newPage();
+    const pageBob = await contextBob.newPage();
+
+    try {
+      // Verify AuthScreen & JoinRoomScreen headers wrap cleanly without horizontal overflow at 320x568
+      await pageAlice.setViewportSize({ width: 320, height: 568 });
+      await pageAlice.goto(cluster.webOrigin);
+      await expect(pageAlice.getByTestId("auth-tab-register")).toBeVisible();
+      expect(
+        await pageAlice.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(320);
+
+      await pageAlice.getByTestId("auth-tab-register").click();
+      await pageAlice.getByTestId("auth-username").fill("resp_alice");
+      await pageAlice.getByTestId("auth-display-name").fill("Resp Alice");
+      await pageAlice.getByTestId("auth-password").fill("Password-RespAlice-123!");
+      await pageAlice.getByTestId("auth-submit").click();
+      await expect(pageAlice.getByTestId("room-passphrase")).toBeVisible();
+      expect(
+        await pageAlice.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(320);
+
+      // Return Alice to 1280x720 and join Room 1 alongside Bob
+      await pageAlice.setViewportSize({ width: 1280, height: 720 });
+      await pageAlice.getByTestId("room-passphrase").fill(room1Passphrase);
+      await pageAlice.getByTestId("room-join-submit").click();
+      await expect(pageAlice.getByTestId("connection-badge")).toHaveAttribute(
+        "data-connection-state",
+        "connected",
+        { timeout: 25_000 },
+      );
+
+      await registerAndJoinRoomOnWeb({
+        page: pageBob,
+        webOrigin: cluster.webOrigin,
+        username: "resp_bob",
+        displayName: "Resp Bob",
+        password: "Password-RespBob-123!",
+        passphrase: room1Passphrase,
+      });
+
+      await expect(pageAlice.getByTestId("peer-list")).toContainText(
+        "@resp_bob",
+        { timeout: 20_000 },
+      );
+
+      // First incoming remote message in an empty room must trigger the dedicated polite SR announcer
+      await pageBob
+        .getByTestId("chat-input")
+        .fill("First live arrival in empty room");
+      await pageBob.getByTestId("chat-send").click();
+      await expect(
+        pageAlice.locator('.transcript-scroll-host .sr-only[aria-live="polite"]'),
+      ).toContainText("First live arrival in empty room", { timeout: 15_000 });
+
+      // Give Room 1 a long alias to stress narrow-viewport topbar truncation, and verify Rename Cancel + Escape
+      const renameBtn = pageAlice
+        .locator('[data-testid^="room-rename-"]')
+        .first();
+      await renameBtn.click();
+      await expect(pageAlice.getByTestId("room-alias-input")).toBeVisible();
+      await pageAlice.getByTestId("room-alias-input").fill("Temporary Cancelled");
+      await pageAlice.getByTestId("room-alias-cancel").click();
+      await expect(pageAlice.getByTestId("room-alias-input")).toHaveCount(0);
+
+      await renameBtn.click();
+      await pageAlice.getByTestId("room-alias-input").fill("Escape Cancelled");
+      await pageAlice.getByTestId("room-alias-input").press("Escape");
+      await expect(pageAlice.getByTestId("room-alias-input")).toHaveCount(0);
+
+      await renameBtn.click();
+      await pageAlice
+        .getByTestId("room-alias-input")
+        .fill("Production Incident War Room");
+      await pageAlice.getByTestId("room-alias-save").click();
+      await expect(pageAlice.locator(".room-chip-title")).toContainText(
+        "Production Incident War Room",
+      );
+
+      // Join Room 2 so Alice has multiple rooms + unread badge + background document.title update
+      await pageAlice.getByTestId("open-join-room-drawer").click();
+      await pageAlice.getByTestId("rail-join-passphrase").fill(room2Passphrase);
+      await pageAlice.getByTestId("rail-join-alias").fill("Secondary Ops");
+      await pageAlice.getByTestId("rail-join-submit").click();
+      await expect(pageAlice.locator(".room-chip-title")).toContainText(
+        "Secondary Ops",
+      );
+
+      const room1Item = pageAlice
+        .getByTestId("room-list-rail")
+        .locator(".room-item", { hasText: "Production Incident War Room" });
+
+      // Bob sends a Markdown message in Room 1 while Alice is viewing Room 2
+      await pageBob
+        .getByTestId("chat-input")
+        .fill(
+          "**Alert**: inspect `deploy.sh` and [runbook](https://example.com/ops)",
+        );
+      await pageBob.getByTestId("chat-send").click();
+
+      // Verify Markdown syntax is stripped in room-list preview AND unread updates document.title
+      await expect(room1Item.locator(".room-item-preview")).toContainText(
+        "Alert: inspect deploy.sh and runbook",
+        { timeout: 15_000 },
+      );
+      const room1Preview =
+        (await room1Item.locator(".room-item-preview").textContent()) ?? "";
+      expect(room1Preview).not.toContain("**");
+      expect(room1Preview).not.toContain("`");
+      await expect
+        .poll(async () => pageAlice.title(), { timeout: 10_000 })
+        .toMatch(/^\(1\) /);
+
+      // Bob also shares a file -> unread increments to (2)
+      const auditFile = makeDeterministicBuffer(12_345, 0x42);
+      await pageBob.getByTestId("file-input").setInputFiles({
+        name: "audit-bundle.bin",
+        mimeType: "application/octet-stream",
+        buffer: auditFile,
+      });
+      await pageBob.getByTestId("chat-send").click();
+
+      await expect
+        .poll(async () => pageAlice.title(), { timeout: 15_000 })
+        .toMatch(/^\(2\) /);
+
+      // Switch to Room 1 -> clears unread badge & restores clean document.title
+      await room1Item.locator(".room-item-select").click();
+
+      await expect(pageAlice.locator(".message-stream")).toContainText(
+        "Alert: inspect deploy.sh and runbook",
+      );
+      await expect
+        .poll(async () => pageAlice.title(), { timeout: 5_000 })
+        .not.toMatch(/^\(\d+\)/);
+
+      // Alice sends a message in Room 1 so both peer (left) and self (right) bubbles are present
+      await pageAlice
+        .getByTestId("chat-input")
+        .fill("Acknowledged from Alice on responsive audit!");
+      await pageAlice.getByTestId("chat-send").click();
+      await expect(pageAlice.locator(".msg-entry-self")).toContainText(
+        "Acknowledged from Alice on responsive audit!",
+      );
+
+      // Audit all 6 target viewports required by Issue #37
+      const viewports = [
+        {
+          name: "320x568",
+          width: 320,
+          height: 568,
+          railOverlay: true,
+          sidebarOverlay: true,
+          expectCompactFooterHidden: true,
+        },
+        {
+          name: "390x844",
+          width: 390,
+          height: 844,
+          railOverlay: true,
+          sidebarOverlay: true,
+          expectCompactFooterHidden: true,
+        },
+        {
+          name: "844x390",
+          width: 844,
+          height: 390,
+          railOverlay: true,
+          sidebarOverlay: true,
+          expectCompactFooterHidden: true,
+        },
+        {
+          name: "1024x768",
+          width: 1024,
+          height: 768,
+          railOverlay: false,
+          sidebarOverlay: true,
+          expectCompactFooterHidden: false,
+        },
+        {
+          name: "1280x720",
+          width: 1280,
+          height: 720,
+          railOverlay: false,
+          sidebarOverlay: false,
+          expectCompactFooterHidden: false,
+        },
+        {
+          name: "2560x1080",
+          width: 2560,
+          height: 1080,
+          railOverlay: false,
+          sidebarOverlay: false,
+          expectCompactFooterHidden: false,
+        },
+      ] as const;
+
+      for (const vp of viewports) {
+        await pageAlice.setViewportSize({ width: vp.width, height: vp.height });
+        // Allow media-query change listeners & CSS transitions to settle
+        await pageAlice.waitForTimeout(260);
+
+        const metrics = await pageAlice.evaluate(() => {
+          const topBar = document.querySelector(".top-bar") as HTMLElement;
+          const topBarRect = topBar.getBoundingClientRect();
+          const visibleTopControls = Array.from(
+            topBar.querySelectorAll<HTMLElement>("button, .room-chip"),
+          ).filter((el) => {
+            const style = getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return (
+              style.display !== "none" &&
+              style.visibility !== "hidden" &&
+              r.width > 0 &&
+              r.height > 0
+            );
+          });
+          const controlCenters = visibleTopControls.map((el) => {
+            const r = el.getBoundingClientRect();
+            return r.top + r.height / 2;
+          });
+          const centerSpread =
+            controlCenters.length > 1
+              ? Math.max(...controlCenters) - Math.min(...controlCenters)
+              : 0;
+
+          const countFocusableInside = (root: HTMLElement): number => {
+            if (root.inert || getComputedStyle(root).visibility === "hidden") {
+              return 0;
+            }
+            const candidates = root.querySelectorAll<HTMLElement>(
+              'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+            );
+            return Array.from(candidates).filter((el) => {
+              const s = getComputedStyle(el);
+              return s.display !== "none" && s.visibility !== "hidden";
+            }).length;
+          };
+
+          const rail = document.getElementById("room-list-rail") as HTMLElement;
+          const sidebar = document.getElementById("room-sidebar") as HTMLElement;
+          const railStyle = getComputedStyle(rail);
+          const sidebarStyle = getComputedStyle(sidebar);
+
+          const streamInner = document.querySelector(
+            '[data-testid="message-stream-inner"]',
+          ) as HTMLElement;
+          const composerInner = document.querySelector(
+            '[data-testid="composer-dock-inner"]',
+          ) as HTMLElement;
+          const streamRect = streamInner.getBoundingClientRect();
+          const composerRect = composerInner.getBoundingClientRect();
+
+          const footer = document.querySelector(
+            ".composer-footer",
+          ) as HTMLElement | null;
+
+          return {
+            viewportW: window.innerWidth,
+            viewportH: window.innerHeight,
+            docScrollWidth: document.documentElement.scrollWidth,
+            topBarHeight: Math.round(topBarRect.height),
+            topBarControlCount: visibleTopControls.length,
+            topBarCenterSpread: Math.round(centerSpread),
+            railInert: rail.inert,
+            railVisibility: railStyle.visibility,
+            railBoxShadow: railStyle.boxShadow,
+            railFocusableCount: countFocusableInside(rail),
+            sidebarInert: sidebar.inert,
+            sidebarVisibility: sidebarStyle.visibility,
+            sidebarBoxShadow: sidebarStyle.boxShadow,
+            sidebarFocusableCount: countFocusableInside(sidebar),
+            streamInnerLeft: streamRect.left,
+            streamInnerRight: streamRect.right,
+            streamInnerWidth: streamRect.width,
+            composerInnerLeft: composerRect.left,
+            composerInnerRight: composerRect.right,
+            composerInnerWidth: composerRect.width,
+            footerDisplay: footer ? getComputedStyle(footer).display : "none",
+          };
+        });
+
+        // 1. Topbar height <= 10% of viewport height AND strictly single-row
+        expect(
+          metrics.topBarHeight,
+          `[${vp.name}] topBarHeight=${metrics.topBarHeight}px exceeds 10% of ${vp.height}px`,
+        ).toBeLessThanOrEqual(vp.height * 0.1);
+        expect(
+          metrics.topBarCenterSpread,
+          `[${vp.name}] topbar controls wrapped across rows`,
+        ).toBeLessThanOrEqual(6);
+
+        // 2. Zero horizontal overflow
+        expect(
+          metrics.docScrollWidth,
+          `[${vp.name}] horizontal overflow detected`,
+        ).toBeLessThanOrEqual(vp.width);
+
+        // 3. Closed overlay drawers must be inert, hidden, shadowless, and have 0 focusable elements
+        if (vp.railOverlay) {
+          expect(metrics.railInert, `[${vp.name}] rail should be inert`).toBe(true);
+          expect(metrics.railVisibility, `[${vp.name}] rail should be hidden`).toBe(
+            "hidden",
+          );
+          expect(metrics.railBoxShadow, `[${vp.name}] rail boxShadow leak`).toBe(
+            "none",
+          );
+          expect(metrics.railFocusableCount, `[${vp.name}] rail focusables`).toBe(0);
+        } else {
+          expect(metrics.railInert, `[${vp.name}] inline rail should not be inert`).toBe(
+            false,
+          );
+          expect(metrics.railFocusableCount).toBeGreaterThan(0);
+        }
+
+        if (vp.sidebarOverlay) {
+          expect(metrics.sidebarInert, `[${vp.name}] sidebar should be inert`).toBe(
+            true,
+          );
+          expect(
+            metrics.sidebarVisibility,
+            `[${vp.name}] sidebar should be hidden`,
+          ).toBe("hidden");
+          expect(
+            metrics.sidebarBoxShadow,
+            `[${vp.name}] sidebar boxShadow leak`,
+          ).toBe("none");
+          expect(
+            metrics.sidebarFocusableCount,
+            `[${vp.name}] sidebar focusables`,
+          ).toBe(0);
+        } else {
+          expect(
+            metrics.sidebarInert,
+            `[${vp.name}] inline sidebar should not be inert`,
+          ).toBe(false);
+        }
+
+        // 4. Compact footer hidden on mobile portrait & short landscape (844x390)
+        if (vp.expectCompactFooterHidden) {
+          expect(metrics.footerDisplay, `[${vp.name}] footer should be hidden`).toBe(
+            "none",
+          );
+        }
+
+        // 5. Ultrawide (2560x1080): message stream and composer share centered max-width column
+        if (vp.width === 2560) {
+          expect(metrics.streamInnerWidth).toBeLessThanOrEqual(1041);
+          expect(metrics.composerInnerWidth).toBeLessThanOrEqual(1041);
+          expect(
+            Math.abs(metrics.streamInnerLeft - metrics.composerInnerLeft),
+          ).toBeLessThanOrEqual(2);
+          expect(
+            Math.abs(metrics.streamInnerRight - metrics.composerInnerRight),
+          ).toBeLessThanOrEqual(2);
+        }
+      }
+
+      // 6. Overlay drawer focus transfer & restoration on 390x844
+      await pageAlice.setViewportSize({ width: 390, height: 844 });
+      await pageAlice.waitForTimeout(260);
+
+      await pageAlice.getByTestId("rooms-drawer-toggle").click();
+      await expect
+        .poll(() =>
+          pageAlice.evaluate(() => ({
+            activeId: document.activeElement?.id ?? null,
+            inert: (document.getElementById("room-list-rail") as HTMLElement).inert,
+          })),
+        )
+        .toEqual({ activeId: "room-list-rail", inert: false });
+
+      await pageAlice.keyboard.press("Escape");
+      await expect
+        .poll(() =>
+          pageAlice.evaluate(() => ({
+            activeTestId:
+              document.activeElement?.getAttribute("data-testid") ?? null,
+            inert: (document.getElementById("room-list-rail") as HTMLElement).inert,
+          })),
+        )
+        .toEqual({ activeTestId: "rooms-drawer-toggle", inert: true });
+
+      await pageAlice.getByTestId("sidebar-drawer-toggle").click();
+      await expect
+        .poll(() =>
+          pageAlice.evaluate(() => ({
+            activeId: document.activeElement?.id ?? null,
+            inert: (document.getElementById("room-sidebar") as HTMLElement).inert,
+          })),
+        )
+        .toEqual({ activeId: "room-sidebar", inert: false });
+
+      await pageAlice.keyboard.press("Escape");
+      await expect
+        .poll(() =>
+          pageAlice.evaluate(() => ({
+            activeTestId:
+              document.activeElement?.getAttribute("data-testid") ?? null,
+            inert: (document.getElementById("room-sidebar") as HTMLElement).inert,
+          })),
+        )
+        .toEqual({ activeTestId: "sidebar-drawer-toggle", inert: true });
+    } finally {
+      await contextAlice.close();
+      await contextBob.close();
     }
   });
 });

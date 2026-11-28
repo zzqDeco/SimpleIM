@@ -159,4 +159,15 @@ export const ko = {
   "error.chunk_hash_mismatch": "파일 조각 해시 검증에 실패했습니다.",
   "error.network": "네트워크 연결에 실패했습니다. 연결 상태를 확인해 주세요.",
   "error.room_inactive": "활성화된 대화방 세션이 없습니다.",
+  "room.rail.renameCancel": "취소",
+  "room.inputStandbyPlaceholder": "방 실시간 연결을 복구하는 중…",
+  "room.srNewMessage": "{author} 님의 새 메시지: {preview}",
+  "room.srNewFile": "{author} 님이 파일을 공유했습니다: {name}",
+  "room.files.action.resume": "계속",
+  "error.storage_limit": "브라우저 로컬 저장 용량 제한에 도달했습니다.",
+  "error.transfer_failed":
+    "파일 전송이 중단되었습니다. 연결을 확인하고 다시 시도하세요.",
+  "error.file_unavailable":
+    "파일이 아직 준비되지 않았습니다. 먼저 다운로드해 주세요.",
+  "error.operation_failed": "작업을 완료하지 못했습니다. 다시 시도해 주세요.",
 } satisfies TranslationSchema;

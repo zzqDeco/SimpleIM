@@ -1,4 +1,4 @@
-import type { ReactElement } from "react";
+import type { ReactElement, RefObject } from "react";
 import { Button, StatusIcon } from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import type { RoomMeshConnectionStatus } from "../../state/room-list-vm.ts";
@@ -19,6 +19,8 @@ export interface RoomTopBarProps {
   readonly railOpen: boolean;
   readonly sidebarExpanded: boolean;
   readonly moreMenuOpen: boolean;
+  readonly railToggleRef?: RefObject<HTMLButtonElement | null>;
+  readonly sidebarToggleRef?: RefObject<HTMLButtonElement | null>;
   readonly onMoreMenuOpenChange: (next: boolean) => void;
   readonly onToggleRail: () => void;
   readonly onToggleSidebar: () => void;
@@ -42,6 +44,8 @@ export function RoomTopBar({
   railOpen,
   sidebarExpanded,
   moreMenuOpen,
+  railToggleRef,
+  sidebarToggleRef,
   onMoreMenuOpenChange,
   onToggleRail,
   onToggleSidebar,
@@ -74,6 +78,12 @@ export function RoomTopBar({
         ? t("room.status.standby")
         : t("room.status.detached");
 
+  const roomsLabel = t("room.roomsToggle", { count: roomCount });
+  const drawerLabel = t("room.drawerToggle", {
+    peers: peerCount,
+    files: fileCount,
+  });
+
   return (
     <header className="top-bar">
       <div className="top-bar-group top-bar-left">
@@ -85,15 +95,20 @@ export function RoomTopBar({
         </div>
 
         <Button
+          ref={railToggleRef}
           variant="secondary"
           size="sm"
           className="drawer-toggle-btn rooms-toggle-btn"
           testId="rooms-drawer-toggle"
+          aria-label={roomsLabel}
           aria-expanded={railOpen}
           aria-controls="room-list-rail"
           onClick={onToggleRail}
         >
-          <span>{t("room.roomsToggle", { count: roomCount })}</span>
+          <span className="top-bar-btn-icon" aria-hidden="true">
+            ☰
+          </span>
+          <span className="top-bar-btn-text">{roomsLabel}</span>
           {totalUnreadCount > 0 ? (
             <span
               className="top-bar-unread-dot"
@@ -116,7 +131,7 @@ export function RoomTopBar({
           aria-live="polite"
           data-testid="connection-badge"
           data-connection-state={badgeState}
-          className="room-chip"
+          className="room-chip connection-badge-chip"
           title={badgeHint}
         >
           <StatusIcon
@@ -128,15 +143,23 @@ export function RoomTopBar({
 
       <div className="top-bar-group top-bar-right">
         <Button
+          ref={sidebarToggleRef}
           variant="secondary"
           size="sm"
           className="sidebar-toggle-btn"
           testId="sidebar-drawer-toggle"
+          aria-label={drawerLabel}
           aria-expanded={sidebarExpanded}
           aria-controls="room-sidebar"
           onClick={onToggleSidebar}
         >
-          {t("room.drawerToggle", { peers: peerCount, files: fileCount })}
+          <span className="top-bar-btn-icon" aria-hidden="true">
+            👥
+          </span>
+          <span className="top-bar-btn-count" aria-hidden="true">
+            {peerCount}
+          </span>
+          <span className="top-bar-btn-text">{drawerLabel}</span>
         </Button>
 
         <RoomMoreMenu

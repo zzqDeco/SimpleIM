@@ -65,8 +65,21 @@ export function computeUnreadCount(
   return count;
 }
 
+export function stripMarkdownForPreview(body: string): string {
+  return body
+    .replace(/```[a-zA-Z0-9_-]*\s*([\s\S]*?)```/g, " $1 ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/(\*\*|__|~~)(.*?)\1/g, "$2")
+    .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?]|$)/g, "$1$2")
+    .replace(/^\s{0,3}(?:#{1,6}|>|[-*+])\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function summarizeMessagePreview(body: string, maxChars = 48): string {
-  const collapsed = body.replace(/\s+/g, " ").trim();
+  const collapsed = stripMarkdownForPreview(body);
   if (collapsed.length <= maxChars) {
     return collapsed;
   }

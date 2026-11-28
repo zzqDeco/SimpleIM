@@ -157,4 +157,13 @@ export const zhTW = {
   "error.chunk_hash_mismatch": "檔案分片雜湊驗證失敗。",
   "error.network": "網路連線失敗，請檢查網路後再試。",
   "error.room_inactive": "目前未處於活躍房間中。",
+  "room.rail.renameCancel": "取消",
+  "room.inputStandbyPlaceholder": "正在恢復房間即時連線…",
+  "room.srNewMessage": "{author} 傳送了新訊息：{preview}",
+  "room.srNewFile": "{author} 分享了檔案：{name}",
+  "room.files.action.resume": "繼續",
+  "error.storage_limit": "本機瀏覽器儲存空間受限，無法快取此檔案。",
+  "error.transfer_failed": "檔案傳輸中斷，請檢查連線後重試。",
+  "error.file_unavailable": "檔案尚未就緒，請先下載後再儲存。",
+  "error.operation_failed": "操作未能完成，請稍後重試。",
 } satisfies TranslationSchema;

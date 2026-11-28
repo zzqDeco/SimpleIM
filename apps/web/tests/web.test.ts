@@ -33,7 +33,11 @@ import {
   Subline,
   TextField,
 } from "../src/design-system/index.ts";
-import { formatAppFailure, toAppFailure } from "../src/i18n/error-catalog.ts";
+import {
+  formatAppFailure,
+  formatTransferError,
+  toAppFailure,
+} from "../src/i18n/error-catalog.ts";
 import {
   detectBrowserLocale,
   LOCALE_OPTIONS,
@@ -70,6 +74,7 @@ import {
   computeUnreadCount,
   MAX_ACTIVE_MESH_ROOMS,
   selectActiveMeshRoomIds,
+  stripMarkdownForPreview,
 } from "../src/state/room-list-vm.ts";
 import { RoomRuntimeSlot } from "../src/state/runtime-slot.ts";
 import {
@@ -3148,5 +3153,187 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(openTopBarHtml).toContain('data-testid="leave-room-button"');
     expect(openTopBarHtml).toContain('data-testid="sign-out-button"');
     expect(openTopBarHtml).toContain('data-testid="wipe-vault-button"');
+  });
+
+  test("Issue #37 Web UX: strips markdown in room previews, localizes runtime/transfer errors, and renders accurate peer presence & polite SR live region", () => {
+    // 1. Markdown stripping for sidebar room previews
+    expect(
+      stripMarkdownForPreview(
+        "## **Deploy** `v0.1.15` — see [Runbook](https://example.com/ops) and *notes* ~~old~~",
+      ),
+    ).toBe("Deploy v0.1.15 — see Runbook and notes old");
+    expect(
+      stripMarkdownForPreview("```ts\nconst x = 1;\n```\n> Quoted line"),
+    ).toBe("const x = 1; Quoted line");
+
+    // 2. Runtime & file-transfer error localization (no raw English leakage in zh-CN)
+    const tZh = (key: TranslationKey, vars?: Record<string, string | number>) =>
+      translate("zh-CN", key, vars);
+    const tEn = (key: TranslationKey, vars?: Record<string, string | number>) =>
+      translate("en", key, vars);
+
+    expect(
+      formatAppFailure(
+        toAppFailure(new Error("Failed to fetch from relay")),
+        tZh,
+      ),
+    ).toBe(tZh("error.network"));
+    expect(
+      formatAppFailure(
+        toAppFailure(new Error("exceeds in-memory fallback cap of 32 MiB")),
+        tZh,
+      ),
+    ).toBe(tZh("error.storage_limit"));
+    expect(
+      formatAppFailure(
+        toAppFailure(new Error("Chunk hash mismatch on peer 019a")),
+        tZh,
+      ),
+    ).toBe(tZh("error.chunk_hash_mismatch"));
+    expect(
+      formatAppFailure(
+        toAppFailure(new Error("Download request timed out")),
+        tZh,
+      ),
+    ).toBe(tZh("error.transfer_failed"));
+    expect(
+      formatAppFailure(
+        toAppFailure(new Error("Some unexpected internal boom")),
+        tZh,
+      ),
+    ).toBe(tZh("error.operation_failed"));
+    expect(formatTransferError("Failed to fetch", tEn)).toBe(
+      tEn("error.network"),
+    );
+    expect(formatTransferError("quota exceeded", tEn)).toBe(
+      tEn("error.storage_limit"),
+    );
+    expect(formatTransferError("no verified peer has file", tEn)).toBe(
+      tEn("error.file_unavailable"),
+    );
+    expect(formatTransferError("hash mismatch", tZh)).toBe(
+      tZh("error.chunk_hash_mismatch"),
+    );
+    expect(formatTransferError("transfer aborted", tZh)).toBe(
+      tZh("error.transfer_failed"),
+    );
+
+    // 3. MessageTranscript accurate online/offline peer dots & dedicated SR announcer
+    const serverKeys = generateEd25519KeyPair();
+    const aliceKeys = generateEd25519KeyPair();
+    const bobKeys = generateEd25519KeyPair();
+    const carolKeys = generateEd25519KeyPair();
+    const roomId = "f".repeat(64);
+    const t0 = new Date(2026, 10, 28, 12, 0, 0).getTime();
+
+    const aliceCert = issuePeerIdentityCert({
+      serverKeyId: "srvk_p",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000a01",
+      username: "alice",
+      displayName: "Alice",
+      peerId: "peer_019a0000000070008000000000000a01",
+      peerSignPubKey: aliceKeys.publicKeyBase64Url,
+      clientKind: "web",
+    });
+    const bobCert = issuePeerIdentityCert({
+      serverKeyId: "srvk_p",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000b02",
+      username: "bob",
+      displayName: "Bob",
+      peerId: "peer_019a0000000070008000000000000b02",
+      peerSignPubKey: bobKeys.publicKeyBase64Url,
+      clientKind: "cli",
+    });
+    const carolCert = issuePeerIdentityCert({
+      serverKeyId: "srvk_p",
+      serverSignPrivKey: serverKeys.privateKeyBytes,
+      userId: "usr_019a0000000070008000000000000c03",
+      username: "carol",
+      displayName: "Carol",
+      peerId: "peer_019a0000000070008000000000000c03",
+      peerSignPubKey: carolKeys.publicKeyBase64Url,
+      clientKind: "web",
+    });
+
+    const bobMsg = signChatMessage({
+      msgId: generateUuidV7(t0),
+      roomId,
+      body: "Online bob",
+      createdAt: t0,
+      authorCert: bobCert,
+      peerSignPrivKey: bobKeys.privateKeyBytes,
+    });
+    const carolMsg = signChatMessage({
+      msgId: generateUuidV7(t0 + 1000),
+      roomId,
+      body: "Offline carol",
+      createdAt: t0 + 1000,
+      authorCert: carolCert,
+      peerSignPrivKey: carolKeys.privateKeyBytes,
+    });
+
+    const html = renderToStaticMarkup(
+      createElement(
+        I18nProvider,
+        null,
+        createElement(MessageTranscript, {
+          roomId,
+          messages: [bobMsg, carolMsg],
+          onlinePeerUserIds: new Set([bobCert.payload.userId]),
+          localPeerId: aliceCert.payload.peerId,
+          currentUserId: aliceCert.payload.userId,
+          onReply: () => {},
+          nowMs: t0 + 2000,
+        }),
+      ),
+    );
+
+    // Dedicated .sr-only announcer handles polite announcements; role="log" transcript explicitly sets aria-live="off"
+    expect(html).toContain(
+      '<div class="sr-only" aria-live="polite" aria-atomic="true">',
+    );
+    expect(html).toMatch(/class="message-stream"[^>]*aria-live="off"/);
+    expect(html).toContain('data-testid="message-stream-inner"');
+    // Bob is online (success dot), Carol is offline (muted dot)
+    expect(html).toContain("ds-status-icon-success");
+    expect(html).toContain("ds-status-icon-muted");
+
+    // 4. Compact RoomTopBar carries icon spans & aria-labels
+    const barHtml = renderToStaticMarkup(
+      createElement(
+        ThemeProvider,
+        null,
+        createElement(
+          I18nProvider,
+          null,
+          createElement(RoomTopBar, {
+            roomIdPrefix: "a1b2c3d4e5f60718",
+            roomAlias: "Incident War Room",
+            connectionStatus: "connected",
+            centerConnected: true,
+            username: "alice",
+            roomCount: 2,
+            totalUnreadCount: 3,
+            peerCount: 1,
+            fileCount: 1,
+            messageCount: 2,
+            railOpen: false,
+            sidebarExpanded: false,
+            moreMenuOpen: false,
+            onMoreMenuOpenChange: () => {},
+            onToggleRail: () => {},
+            onToggleSidebar: () => {},
+            onLeaveRoom: async () => {},
+            onSignOut: async () => {},
+            onWipeAndSignOut: async () => {},
+          }),
+        ),
+      ),
+    );
+    expect(barHtml).toContain("top-bar-btn-icon");
+    expect(barHtml).toContain("top-bar-btn-count");
+    expect(barHtml).toContain('aria-label="');
   });
 });

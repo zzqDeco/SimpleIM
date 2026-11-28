@@ -15,7 +15,10 @@ import type {
 } from "@simpleim/peer-core";
 import { Byline, StatusIcon, Subline } from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
-import type { MessageViewModel } from "../../state/message-vm.ts";
+import {
+  truncatePreview,
+  type MessageViewModel,
+} from "../../state/message-vm.ts";
 import {
   isTranscriptNearBottom,
   shouldAutoScrollTranscript,
@@ -86,6 +89,7 @@ export interface MessageTranscriptProps {
   ) => Promise<Blob | null>;
   readonly onActionError?: (err: unknown) => void;
   readonly deliveryStates?: ReadonlyMap<string, ChatDeliveryStatus>;
+  readonly onlinePeerUserIds?: ReadonlySet<string>;
   readonly localPeerId: string;
   readonly currentUserId: string;
   readonly onReply: (msg: ChatMessageEnvelope) => void;
@@ -106,6 +110,7 @@ export function MessageTranscript({
   onReadFileBlob,
   onActionError,
   deliveryStates,
+  onlinePeerUserIds,
   localPeerId,
   currentUserId,
   onReply,
@@ -120,10 +125,13 @@ export function MessageTranscript({
   const lastClientHeightRef = useRef(0);
   const prevRoomIdRef = useRef<string | null>(roomId);
   const prevLastItemKeyRef = useRef<string | null>(null);
+  const hasInitializedRoomRef = useRef(false);
   const programmaticScrollTopRef = useRef<number | null>(null);
   const hideDatePillTimerRef = useRef<number | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const liveAnnounceTimerRef = useRef<number | null>(null);
+  const liveAnnounceSeqRef = useRef(0);
 
   const [liveNowMs, setLiveNowMs] = useState<number>(() => nowMs ?? Date.now());
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
@@ -132,6 +140,10 @@ export function MessageTranscript({
     null,
   );
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [liveAnnouncement, setLiveAnnouncement] = useState<{
+    readonly seq: number;
+    readonly text: string;
+  }>({ seq: 0, text: "" });
   const [floatingDateCreatedAt, setFloatingDateCreatedAt] = useState<
     number | null
   >(null);
@@ -185,13 +197,26 @@ export function MessageTranscript({
     }
   }, []);
 
+  const clearLiveAnnounceTimer = useCallback((): void => {
+    if (liveAnnounceTimerRef.current !== null) {
+      window.clearTimeout(liveAnnounceTimerRef.current);
+      liveAnnounceTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     return () => {
       clearHideDatePillTimer();
       clearHighlightTimer();
       clearToastTimer();
+      clearLiveAnnounceTimer();
     };
-  }, [clearHideDatePillTimer, clearHighlightTimer, clearToastTimer]);
+  }, [
+    clearHideDatePillTimer,
+    clearHighlightTimer,
+    clearLiveAnnounceTimer,
+    clearToastTimer,
+  ]);
 
   // Close lightbox automatically if the referenced file is no longer in the active room.
   useEffect(() => {
@@ -379,6 +404,7 @@ export function MessageTranscript({
   useEffect(() => {
     const roomChanged = prevRoomIdRef.current !== roomId;
     const previousLastItemKey = prevLastItemKeyRef.current;
+    const wasInitialized = hasInitializedRoomRef.current;
     const shouldScroll = shouldAutoScrollTranscript({
       roomChanged,
       previousLastMsgId: previousLastItemKey,
@@ -389,17 +415,49 @@ export function MessageTranscript({
 
     prevRoomIdRef.current = roomId;
     prevLastItemKeyRef.current = latestItemKey;
+    hasInitializedRoomRef.current = true;
 
     if (roomChanged) {
       setExpandedItemKey(null);
       setHighlightedItemKey(null);
       setToastMessage(null);
+      clearLiveAnnounceTimer();
+      setLiveAnnouncement({ seq: 0, text: "" });
       setLightbox(null);
       clearHideDatePillTimer();
       clearHighlightTimer();
       clearToastTimer();
       setFloatingDateVisible(false);
       setFloatingDateCreatedAt(null);
+    }
+
+    if (
+      !roomChanged &&
+      wasInitialized &&
+      latestItemKey !== null &&
+      latestItemKey !== previousLastItemKey &&
+      latestItem &&
+      !latestItem.isSelf
+    ) {
+      const nextText =
+        latestItem.kind === "message"
+          ? t("room.srNewMessage", {
+              author: latestItem.vm.authorDisplayName,
+              preview: truncatePreview(latestItem.vm.body, 80),
+            })
+          : t("room.srNewFile", {
+              author: latestItem.authorDisplayName,
+              name: latestItem.manifest.fileName,
+            });
+      const nextSeq = ++liveAnnounceSeqRef.current;
+      clearLiveAnnounceTimer();
+      // Clear first, then repopulate on the next task so repeated identical summaries
+      // still mutate the static aria-live region and trigger a screen-reader announcement.
+      setLiveAnnouncement({ seq: nextSeq, text: "" });
+      liveAnnounceTimerRef.current = window.setTimeout(() => {
+        liveAnnounceTimerRef.current = null;
+        setLiveAnnouncement({ seq: nextSeq, text: nextText });
+      }, 0);
     }
 
     if (roomChanged && latestItemKey === null) {
@@ -424,12 +482,15 @@ export function MessageTranscript({
   }, [
     clearHideDatePillTimer,
     clearHighlightTimer,
+    clearLiveAnnounceTimer,
     clearToastTimer,
+    latestItem,
     latestItemIsSelf,
     latestItemKey,
     roomId,
     scrollToBottom,
     setProgrammaticScrollTop,
+    t,
     timeline.length,
   ]);
 
@@ -578,15 +639,22 @@ export function MessageTranscript({
         </div>
       ) : null}
 
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {liveAnnouncement.text ? (
+          <span key={liveAnnouncement.seq}>{liveAnnouncement.text}</span>
+        ) : null}
+      </div>
+
       <div
         ref={streamRef}
         className="message-stream"
         role="log"
-        aria-live="polite"
+        aria-live="off"
         aria-label={t("room.streamAria")}
         onScroll={handleScroll}
       >
-        {timeline.length === 0 ? (
+        <div className="message-stream-inner" data-testid="message-stream-inner">
+          {timeline.length === 0 ? (
           <div className="empty-transcript">{t("room.empty")}</div>
         ) : (
           timeline.map((item) => {
@@ -652,7 +720,15 @@ export function MessageTranscript({
                           </>
                         ) : (
                           <>
-                            <StatusIcon status="online" />
+                            <StatusIcon
+                              status={
+                                onlinePeerUserIds?.has(
+                                  item.manifest.senderCert.payload.userId,
+                                )
+                                  ? "online"
+                                  : "offline"
+                              }
+                            />
                             <span className="msg-author-name">
                               {item.authorDisplayName}
                             </span>
@@ -829,7 +905,15 @@ export function MessageTranscript({
                             </>
                           ) : (
                             <>
-                              <StatusIcon status="online" />
+                              <StatusIcon
+                                status={
+                                  onlinePeerUserIds?.has(
+                                    vm.envelope.authorCert.payload.userId,
+                                  )
+                                    ? "online"
+                                    : "offline"
+                                }
+                              />
                               <span className="msg-author-name">
                                 {vm.authorDisplayName}
                               </span>
@@ -930,6 +1014,7 @@ export function MessageTranscript({
             );
           })
         )}
+        </div>
       </div>
 
       {toastMessage ? (

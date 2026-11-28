@@ -7,6 +7,7 @@ import {
   NoticeBanner,
   ProgressBar,
 } from "../../design-system/index.ts";
+import { formatTransferError } from "../../i18n/error-catalog.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import {
   countActiveDownloads,
@@ -87,26 +88,36 @@ export function FileListSection({
                   </span>
                 </div>
 
-                <ProgressBar
-                  percent={vm.percent}
-                  complete={vm.status === "seeding"}
-                  ariaLabel={t("room.files.progressAria", {
-                    name: vm.fileName,
-                  })}
-                />
+                {vm.status === "downloading" ||
+                (vm.status === "paused" && vm.percent > 0) ? (
+                  <ProgressBar
+                    percent={vm.percent}
+                    complete={false}
+                    ariaLabel={t("room.files.progressAria", {
+                      name: vm.fileName,
+                    })}
+                  />
+                ) : null}
 
                 <div className="file-row-meta">
                   <Byline>
                     <span>{vm.formattedSize}</span>
-                    <span>
-                      {t("room.files.peersRatio", {
-                        seeds: vm.seedCount,
-                        peers: vm.peerChunkCount,
-                      })}
-                    </span>
+                    {vm.peerChunkCount > 0 ||
+                    vm.status === "downloading" ||
+                    vm.status === "seeding" ? (
+                      <span>
+                        {t("room.files.peersRatio", {
+                          seeds: vm.seedCount,
+                          peers: vm.peerChunkCount,
+                        })}
+                      </span>
+                    ) : null}
                     {vm.showSpeed ? <span>{vm.formattedSpeed}</span> : null}
                   </Byline>
-                  <span>{vm.percent}%</span>
+                  {vm.status === "downloading" ||
+                  (vm.status === "paused" && vm.percent > 0) ? (
+                    <span>{vm.percent}%</span>
+                  ) : null}
                 </div>
 
                 {vm.relayBadgeKey ? (
@@ -119,7 +130,9 @@ export function FileListSection({
                 ) : null}
 
                 {vm.errorMessage ? (
-                  <NoticeBanner tone="error">{vm.errorMessage}</NoticeBanner>
+                  <NoticeBanner tone="error">
+                    {formatTransferError(vm.errorMessage, t)}
+                  </NoticeBanner>
                 ) : null}
 
                 <div className="file-row-actions">
@@ -148,7 +161,9 @@ export function FileListSection({
                         );
                       }}
                     >
-                      {t("room.files.action.download")}
+                      {vm.status === "paused"
+                        ? t("room.files.action.resume")
+                        : t("room.files.action.download")}
                     </Button>
                   ) : null}
 

@@ -15,7 +15,10 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
-  padding: 8px var(--space-4);
+  padding: calc(8px + env(safe-area-inset-top, 0px))
+    max(var(--space-4), env(safe-area-inset-right, 0px))
+    8px
+    max(var(--space-4), env(safe-area-inset-left, 0px));
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
@@ -30,12 +33,26 @@
   min-width: 0;
 }
 
+.room-shell .top-bar,
+.room-shell .top-bar-group {
+  flex-wrap: nowrap;
+}
+
 .top-bar-left {
   flex: 1 1 auto;
 }
 
 .top-bar-right {
   flex-shrink: 0;
+}
+
+.top-bar-btn-icon,
+.top-bar-btn-count {
+  display: none;
+}
+
+.top-bar-btn-text {
+  display: inline;
 }
 
 .top-bar-unread-dot {
@@ -54,6 +71,8 @@
 }
 
 .room-chip-title {
+  min-width: 0;
+  flex: 0 1 auto;
   max-width: min(260px, 48vw);
   overflow: hidden;
 }
@@ -280,7 +299,11 @@ body.room-viewport-locked {
   flex: 1 1 0%;
   min-height: 0;
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr) 300px;
+  grid-template-columns: clamp(220px, 18vw, 280px) minmax(0, 1fr) clamp(
+      260px,
+      22vw,
+      320px
+    );
   grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
   position: relative;
@@ -290,6 +313,8 @@ body.room-viewport-locked {
 .room-rail {
   background: var(--bg-panel);
   border-right: 1px solid var(--border-subtle);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -514,7 +539,13 @@ body.room-viewport-locked {
 }
 
 .transcript-alerts {
-  padding: var(--space-2) var(--space-4) 0;
+  width: 100%;
+  max-width: calc(1040px + var(--space-5) * 2);
+  margin: 0 auto;
+  padding: var(--space-2)
+    max(var(--space-5), env(safe-area-inset-right, 0px))
+    0
+    max(var(--space-5), env(safe-area-inset-left, 0px));
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -589,7 +620,19 @@ body.room-viewport-locked {
   -webkit-overflow-scrolling: touch;
   overscroll-behavior-y: contain;
   touch-action: pan-y pinch-zoom;
-  padding: var(--space-4) var(--space-5);
+  padding: var(--space-4)
+    max(var(--space-5), env(safe-area-inset-right, 0px))
+    var(--space-4)
+    max(var(--space-5), env(safe-area-inset-left, 0px));
+  display: flex;
+  flex-direction: column;
+}
+
+.message-stream-inner {
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
+  flex: 1 0 auto;
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
@@ -1186,10 +1229,20 @@ body.room-viewport-locked {
 /* Prompt Composer (cc PromptInput style) */
 .composer-dock {
   flex-shrink: 0;
-  padding: var(--space-3) var(--space-5)
-    calc(var(--space-4) + env(safe-area-inset-bottom, 0px));
+  padding: var(--space-3)
+    max(var(--space-5), env(safe-area-inset-right, 0px))
+    calc(var(--space-4) + env(safe-area-inset-bottom, 0px))
+    max(var(--space-5), env(safe-area-inset-left, 0px));
   background: var(--bg-canvas);
   border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+}
+
+.composer-dock-inner {
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -1557,9 +1610,10 @@ body.room-viewport-locked {
   display: none;
 }
 
-@media (min-width: 1025px) {
+/* Tier 1 (>= 1280px): 3-column layout with collapsible right side pane */
+@media (min-width: 1280px) {
   .room-grid.room-grid-sidebar-collapsed {
-    grid-template-columns: 248px minmax(0, 1fr);
+    grid-template-columns: clamp(220px, 18vw, 280px) minmax(0, 1fr);
   }
 
   .room-grid.room-grid-sidebar-collapsed .side-pane {
@@ -1567,14 +1621,11 @@ body.room-viewport-locked {
   }
 }
 
-@media (max-width: 1024px) {
+/* Tier 2 (900px – 1279px): Left rail inline + right side pane overlay drawer */
+@media (max-width: 1279px) {
   .room-grid {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: clamp(210px, 24vw, 250px) minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
-  }
-
-  .drawer-toggle-btn {
-    display: inline-flex;
   }
 
   .drawer-backdrop {
@@ -1585,12 +1636,42 @@ body.room-viewport-locked {
     background: var(--bg-backdrop);
   }
 
-  /* Prevent iOS Safari automatic pinch-zoom when focusing form inputs */
-  .composer-textarea,
-  .room-alias-input,
-  .ds-field-input,
-  .ds-select {
-    font-size: 16px;
+  .side-pane {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(320px, 90vw);
+    padding-right: env(safe-area-inset-right, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    z-index: var(--z-drawer);
+    box-shadow: none;
+    visibility: hidden;
+    transform: translateX(100%);
+    transition:
+      transform 180ms ease,
+      visibility 0s linear 180ms;
+  }
+
+  .side-pane.side-pane-open {
+    box-shadow: var(--shadow-drawer);
+    visibility: visible;
+    transform: translateX(0);
+    transition:
+      transform 180ms ease,
+      visibility 0s linear 0s;
+  }
+}
+
+/* Tier 3 (< 900px): Single-column chat with both left & right overlay drawers */
+@media (max-width: 899px) {
+  .room-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .drawer-toggle-btn {
+    display: inline-flex;
   }
 
   .room-rail {
@@ -1600,51 +1681,106 @@ body.room-viewport-locked {
     bottom: 0;
     width: min(280px, 88vw);
     z-index: var(--z-drawer);
-    box-shadow: var(--shadow-panel);
+    box-shadow: none;
+    visibility: hidden;
     transform: translateX(-100%);
-    transition: transform 180ms ease;
+    transition:
+      transform 180ms ease,
+      visibility 0s linear 180ms;
   }
 
   .room-rail.room-rail-open {
+    box-shadow: var(--shadow-panel);
+    visibility: visible;
     transform: translateX(0);
-  }
-
-  .side-pane {
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: min(320px, 90vw);
-    z-index: var(--z-drawer);
-    box-shadow: var(--shadow-drawer);
-    transform: translateX(100%);
-    transition: transform 180ms ease;
-  }
-
-  .side-pane.side-pane-open {
-    transform: translateX(0);
+    transition:
+      transform 180ms ease,
+      visibility 0s linear 0s;
   }
 }
 
-@media (max-width: 768px) {
-  .top-bar {
-    padding: calc(6px + env(safe-area-inset-top, 0px)) var(--space-2) 6px;
-    gap: 4px 6px;
+/* Prevent iOS Safari automatic pinch-zoom & enlarge touch targets on coarse-pointer devices */
+@media (pointer: coarse) {
+  .composer-textarea,
+  .room-alias-input,
+  .ds-field-input,
+  .ds-select {
+    font-size: 16px;
   }
 
-  .top-bar-group {
+  .composer-dock .ds-btn-sm,
+  .msg-file-actions .ds-btn-sm,
+  .file-row-actions .ds-btn-sm,
+  .more-menu-popover .ds-btn-sm {
+    min-height: 36px;
+  }
+
+  .msg-reply-trigger,
+  .room-item-action-btn {
+    min-height: 32px;
+    padding: 4px 8px;
+  }
+}
+
+/* Compact single-row topbar on mobile portrait and short landscape viewports */
+@media (max-width: 768px), (max-height: 500px) {
+  .room-shell .top-bar {
+    padding: calc(4px + env(safe-area-inset-top, 0px))
+      max(8px, env(safe-area-inset-right, 0px))
+      4px
+      max(8px, env(safe-area-inset-left, 0px));
+    gap: 6px;
+    flex-wrap: nowrap;
+  }
+
+  .room-shell .top-bar-group {
     gap: 4px;
+    flex-wrap: nowrap;
   }
 
+  .room-shell .top-bar .ds-btn-sm {
+    padding: 3px 7px;
+    min-height: 28px;
+    font-size: 12px;
+  }
+
+  .top-bar-btn-icon,
+  .top-bar-btn-count {
+    display: inline;
+  }
+
+  .top-bar-btn-text,
   .room-shell .brand-prompt,
   .room-shell .user-handle,
   .room-chip-hash,
+  .connection-badge-label,
   .more-menu-btn-label,
   .composer-footer,
   .composer-attach-label {
     display: none;
   }
 
+  .connection-badge-chip {
+    padding: 2px 6px;
+  }
+
+  .room-chip-title {
+    max-width: min(170px, 42vw);
+    padding: 2px 6px;
+  }
+}
+
+@media (max-width: 360px) {
+  .room-chip-title {
+    max-width: 108px;
+  }
+
+  .room-shell .top-bar .ds-btn-sm {
+    padding: 3px 6px;
+  }
+}
+
+@media (max-width: 768px) {
   .msg-entry {
     max-width: 90%;
     min-width: min(160px, 90%);
@@ -1664,8 +1800,10 @@ body.room-viewport-locked {
   }
 
   .message-stream {
-    padding: var(--space-3);
-    gap: var(--space-1);
+    padding: var(--space-3)
+      max(var(--space-3), env(safe-area-inset-right, 0px))
+      var(--space-3)
+      max(var(--space-3), env(safe-area-inset-left, 0px));
   }
 
   .msg-entry {
@@ -1678,7 +1816,21 @@ body.room-viewport-locked {
   }
 
   .composer-dock {
-    padding: var(--space-2) var(--space-3)
-      calc(var(--space-2) + env(safe-area-inset-bottom, 0px));
+    padding: var(--space-2)
+      max(var(--space-3), env(safe-area-inset-right, 0px))
+      calc(var(--space-2) + env(safe-area-inset-bottom, 0px))
+      max(var(--space-3), env(safe-area-inset-left, 0px));
+  }
+}
+
+@media (max-height: 500px) {
+  .message-stream {
+    padding-top: var(--space-2);
+    padding-bottom: var(--space-2);
+  }
+
+  .composer-dock {
+    padding-top: 6px;
+    padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
   }
 }

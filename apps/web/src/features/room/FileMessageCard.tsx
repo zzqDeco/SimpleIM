@@ -6,6 +6,7 @@ import {
   NoticeBanner,
   ProgressBar,
 } from "../../design-system/index.ts";
+import { formatTransferError } from "../../i18n/error-catalog.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import type { TransferViewModel } from "../../state/transfer-vm.ts";
 import {
@@ -138,12 +139,16 @@ export function FileMessageCard({
           <div className="msg-file-meta">
             <Byline>
               <span>{transfer.formattedSize}</span>
-              <span>
-                {t("room.files.peersRatio", {
-                  seeds: transfer.seedCount,
-                  peers: transfer.peerChunkCount,
-                })}
-              </span>
+              {transfer.peerChunkCount > 0 ||
+              transfer.status === "downloading" ||
+              transfer.status === "seeding" ? (
+                <span>
+                  {t("room.files.peersRatio", {
+                    seeds: transfer.seedCount,
+                    peers: transfer.peerChunkCount,
+                  })}
+                </span>
+              ) : null}
               {transfer.showSpeed ? <span>{transfer.formattedSpeed}</span> : null}
               {transfer.status === "downloading" ? (
                 <span>{transfer.percent}%</span>
@@ -179,7 +184,9 @@ export function FileMessageCard({
       ) : null}
 
       {transfer.errorMessage ? (
-        <NoticeBanner tone="error">{transfer.errorMessage}</NoticeBanner>
+        <NoticeBanner tone="error">
+          {formatTransferError(transfer.errorMessage, t)}
+        </NoticeBanner>
       ) : null}
 
       {transfer.canDownload || transfer.canCancel || transfer.canSave ? (
@@ -195,7 +202,9 @@ export function FileMessageCard({
                 });
               }}
             >
-              {t("room.files.action.download")}
+              {transfer.status === "paused"
+                ? t("room.files.action.resume")
+                : t("room.files.action.download")}
             </Button>
           ) : null}
 
