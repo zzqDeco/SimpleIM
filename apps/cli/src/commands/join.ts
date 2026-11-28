@@ -612,6 +612,26 @@ export async function executeJoinInputLine(params: {
         return "continue";
       }
       const target = resolveTargetManifest(engine.getFiles(), rest);
+      const progress = engine.getTransferProgress(target.fileId);
+      if (progress?.status !== "downloading") {
+        const status = progress?.status ?? "announced";
+        const safeName = sanitizeTerminalSingleLine(target.fileName);
+        const msg =
+          status === "seeding"
+            ? `Cannot cancel '${safeName}': file is already completed/seeding`
+            : `No active download for '${safeName}' (status: ${status})`;
+        if (json) {
+          emitJson({
+            type: "error",
+            fileId: target.fileId,
+            status,
+            message: msg,
+          });
+        } else {
+          stdout.write(`[file] ${msg}\n`);
+        }
+        return "continue";
+      }
       await engine.cancelDownload(target.fileId);
       if (json) {
         emitJson({

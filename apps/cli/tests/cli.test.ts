@@ -2572,6 +2572,48 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     await aheadDone;
     expect(aheadLines).toEqual(["one", "partialX"]);
     aheadTerm.close();
+
+    // Wrapped type-ahead (30 chars on 20-col TTY) during an async command retains
+    // readline's wrapped-row tracking so prompt restoration moves up before redrawing!
+    const wrappedAheadIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const wrappedAheadOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 20,
+    });
+    let wrappedAheadBuf = "";
+    wrappedAheadOut.on("data", (c) => {
+      wrappedAheadBuf += c.toString("utf8");
+    });
+    let resolveWrappedCmd!: () => void;
+    const wrappedCmdGate = new Promise<void>((r) => {
+      resolveWrappedCmd = r;
+    });
+    const wrappedAheadTerm = new InteractiveJoinTerminal({
+      stdin: wrappedAheadIn,
+      stdout: wrappedAheadOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async () => {
+        await wrappedCmdGate;
+        return "continue";
+      },
+    });
+    wrappedAheadTerm.startPrompt();
+    wrappedAheadIn.write("first\r");
+    await Bun.sleep(10);
+    wrappedAheadIn.write("123456789012345678901234567890");
+    await Bun.sleep(10);
+    wrappedAheadBuf = "";
+    resolveWrappedCmd();
+    await Bun.sleep(20);
+    expect(wrappedAheadBuf).toContain("\x1b[1A");
+    expect(wrappedAheadBuf).toContain("❯ 123456789012345678901234567890");
+    wrappedAheadTerm.close();
   });
 
   test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {
@@ -2632,6 +2674,10 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     const messages: ChatMessageEnvelope[] = [];
     const downloadedIds: string[] = [];
     const cancelledIds: string[] = [];
+    const transferStatuses = new Map<
+      string,
+      "announced" | "downloading" | "seeding" | "paused" | "error"
+    >();
     let retryCount = 0;
 
     const mockEngine: RoomPeerEngine = {
@@ -2646,7 +2692,23 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       getMessages: () => messages,
       getChatDeliveryStates: () => new Map(),
       getFiles: () => files,
-      getTransferProgress: () => undefined,
+      getTransferProgress: (fileId) => {
+        const manifest = files.find((f) => f.fileId === fileId);
+        const status = transferStatuses.get(fileId);
+        if (!manifest || !status) return undefined;
+        return {
+          fileId,
+          fileName: manifest.fileName,
+          fileSize: manifest.fileSize,
+          totalChunks: manifest.totalChunks,
+          completedChunks: status === "seeding" ? manifest.totalChunks : 0,
+          bytesCompleted: status === "seeding" ? manifest.fileSize : 0,
+          downloadSpeedBytesPerSec: 0,
+          availableSeeders: 1,
+          availablePeersWithChunks: 1,
+          status,
+        };
+      },
       sendChatMessage: async (body, replyToMsgId) => {
         const msg = signChatMessage({
           roomId,
@@ -2674,13 +2736,16 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
           peerSignPrivKey: peerKeys.privateKeyBytes,
         });
         files.push(m);
+        transferStatuses.set(m.fileId, "seeding");
         return m;
       },
       downloadFile: async (fileId) => {
         downloadedIds.push(fileId);
+        transferStatuses.set(fileId, "downloading");
       },
       cancelDownload: async (fileId) => {
         cancelledIds.push(fileId);
+        transferStatuses.set(fileId, "paused");
       },
     };
 
@@ -2730,7 +2795,7 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
         }),
       ).rejects.toThrow("File not found: /nonexistent/Ghost File.pdf");
 
-      // /cancel resolves by index and calls engine.cancelDownload
+      // /cancel refuses to destroy a locally shared (seeding) file
       await executeJoinInputLine({
         line: "/cancel 1",
         engine: mockEngine,
@@ -2739,8 +2804,8 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
         stdout: humanStdout,
         cwd: workDir,
       });
-      expect(cancelledIds).toEqual([files[0]!.fileId]);
-      expect(humanOut).toContain("Cancelled download for 'My Report (Final).pdf'");
+      expect(cancelledIds).toEqual([]);
+      expect(humanOut).toContain("already completed/seeding");
 
       // Two files sharing the exact same 65-second UUIDv7 timestamp prefix get unambiguous
       // random-tail selectors (and numeric-only tails like "00000002" resolve by ID, not list index!)
@@ -2776,6 +2841,17 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
         cwd: workDir,
       });
       expect(downloadedIds).toEqual([sameBucketB.fileId]);
+      // Now that sameBucketB is actively downloading, /cancel succeeds!
+      await executeJoinInputLine({
+        line: `/cancel ${selB}`,
+        engine: mockEngine,
+        chunkStorage,
+        sharedFiles,
+        stdout: humanStdout,
+        cwd: workDir,
+      });
+      expect(cancelledIds).toEqual([sameBucketB.fileId]);
+      expect(humanOut).toContain("Cancelled download for 'same-minute-b.bin'");
       // Shared 8-char timestamp prefix is correctly flagged as ambiguous
       await expect(
         executeJoinInputLine({

@@ -354,17 +354,22 @@ type InternalReadline = ReadlineInterface & {
 export class InteractiveJoinTerminal {
   readonly isInteractive: boolean;
   readonly palette: CliPalette;
+  private readonly stdin: NodeJS.ReadableStream;
   private readonly stdout: NodeJS.WritableStream;
   private readonly stderr: NodeJS.WritableStream;
   private readonly rl: InternalReadline;
   private readonly promptVisualWidth = 2; // "❯ "
+  private readonly onStdinData?: () => void;
   private inputClosed = false;
   private exited = false;
+  private promptDrawn = false;
+  private typeAheadVisibleOnScreen = false;
   private outputEpoch = 0;
   private activeLineEpoch: number | null = null;
   private lineQueue: Promise<void> = Promise.resolve();
 
   constructor(options: InteractiveJoinTerminalOptions) {
+    this.stdin = options.stdin;
     this.stdout = options.stdout;
     this.stderr = options.stderr;
     this.isInteractive =
@@ -393,6 +398,15 @@ export class InteractiveJoinTerminal {
         : {}),
     }) as InternalReadline;
 
+    if (this.isInteractive) {
+      this.onStdinData = () => {
+        if (this.rl.line.length > 0) {
+          this.typeAheadVisibleOnScreen = true;
+        }
+      };
+      this.stdin.on("data", this.onStdinData);
+    }
+
     this.rl.on("SIGINT", () => {
       if (this.exited) return;
       this.exited = true;
@@ -401,6 +415,8 @@ export class InteractiveJoinTerminal {
     });
 
     this.rl.on("line", (rawLine) => {
+      this.promptDrawn = false;
+      this.typeAheadVisibleOnScreen = false;
       const submittedEpoch = ++this.outputEpoch;
       this.lineQueue = this.lineQueue
         .then(async () => {
@@ -421,6 +437,9 @@ export class InteractiveJoinTerminal {
             this.outputEpoch += 1;
           }
           if (!this.exited && !this.inputClosed && this.isInteractive) {
+            if (this.typeAheadVisibleOnScreen && this.rl.line.length > 0) {
+              this.clearActiveInputRegion(this.promptDrawn);
+            }
             this.redrawPromptPreservingCursor();
           }
         })
@@ -429,6 +448,9 @@ export class InteractiveJoinTerminal {
 
     this.rl.on("close", () => {
       this.inputClosed = true;
+      if (this.onStdinData) {
+        this.stdin.removeListener("data", this.onStdinData);
+      }
       // Drain all already-accepted queued lines before signaling EOF so piped
       // commands (e.g. `one\ntwo\n/quit\n`) are never discarded on immediate EOF.
       void this.lineQueue.then(() => {
@@ -442,6 +464,7 @@ export class InteractiveJoinTerminal {
   startPrompt(): void {
     if (!this.exited && !this.inputClosed && this.isInteractive) {
       this.rl.prompt();
+      this.promptDrawn = true;
     }
   }
 
@@ -470,16 +493,41 @@ export class InteractiveJoinTerminal {
     }
   }
 
+  private clearActiveInputRegion(includePromptWidth: boolean): void {
+    const cols = Math.max(
+      1,
+      (this.stdout as TtyCapableStream).columns ?? 80,
+    );
+    let cursorRow: number;
+    if (includePromptWidth && typeof this.rl.getCursorPos === "function") {
+      cursorRow = this.rl.getCursorPos().rows;
+    } else {
+      const prefixWidth = includePromptWidth ? this.promptVisualWidth : 0;
+      const beforeCursor = this.rl.line.slice(0, this.rl.cursor);
+      cursorRow = Math.floor(
+        (prefixWidth + estimateVisualColumns(beforeCursor)) / cols,
+      );
+    }
+    const rowsUp = Math.max(cursorRow, this.rl.prevRows ?? 0);
+    if (rowsUp > 0) {
+      moveCursor(this.stdout, 0, -rowsUp);
+    }
+    cursorTo(this.stdout, 0);
+    clearScreenDown(this.stdout);
+    this.rl.prevRows = 0;
+    this.promptDrawn = false;
+    this.typeAheadVisibleOnScreen = false;
+  }
+
   private redrawPromptPreservingCursor(): void {
-    // Reset tracked wrapped-row offset and redraw via _refreshLine() (falling
-    // back to prompt(true)) so buffered input and cursor position stay intact
-    // when the user starts typing while an async command is still running.
     this.rl.prevRows = 0;
     if (typeof this.rl._refreshLine === "function") {
       this.rl._refreshLine();
     } else {
       this.rl.prompt(true);
     }
+    this.promptDrawn = true;
+    this.typeAheadVisibleOnScreen = this.rl.line.length > 0;
   }
 
   /**
@@ -490,16 +538,7 @@ export class InteractiveJoinTerminal {
     this.outputEpoch += 1;
     const target = stream === "stderr" ? this.stderr : this.stdout;
     if (this.isInteractive && !this.exited && !this.inputClosed) {
-      const pos =
-        typeof this.rl.getCursorPos === "function"
-          ? this.rl.getCursorPos()
-          : { rows: 0, cols: 0 };
-      if (pos.rows > 0) {
-        moveCursor(this.stdout, 0, -pos.rows);
-      }
-      cursorTo(this.stdout, 0);
-      clearScreenDown(this.stdout);
-
+      this.clearActiveInputRegion(this.promptDrawn);
       target.write(`${text}\n`);
       this.redrawPromptPreservingCursor();
       return;
@@ -514,23 +553,27 @@ export class InteractiveJoinTerminal {
   writeLine(text: string, stream: "stdout" | "stderr" = "stdout"): void {
     this.outputEpoch += 1;
     const target = stream === "stderr" ? this.stderr : this.stdout;
+    if (
+      this.isInteractive &&
+      !this.exited &&
+      !this.inputClosed &&
+      this.typeAheadVisibleOnScreen &&
+      this.rl.line.length > 0
+    ) {
+      this.clearActiveInputRegion(this.promptDrawn);
+    }
     target.write(`${text}\n`);
   }
 
   close(): void {
     this.exited = true;
+    if (this.onStdinData) {
+      this.stdin.removeListener("data", this.onStdinData);
+    }
     if (this.inputClosed) return;
     this.inputClosed = true;
     if (this.isInteractive) {
-      const pos =
-        typeof this.rl.getCursorPos === "function"
-          ? this.rl.getCursorPos()
-          : { rows: 0, cols: 0 };
-      if (pos.rows > 0) {
-        moveCursor(this.stdout, 0, -pos.rows);
-      }
-      cursorTo(this.stdout, 0);
-      clearScreenDown(this.stdout);
+      this.clearActiveInputRegion(this.promptDrawn);
     }
     this.rl.close();
   }
