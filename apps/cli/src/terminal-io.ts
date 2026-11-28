@@ -434,9 +434,14 @@ export class InteractiveJoinTerminal {
             this.activeLineEpoch = null;
             this.outputEpoch += 1;
           }
-          if (!this.exited && !this.inputClosed && this.isInteractive) {
+          if (
+            !this.exited &&
+            !this.inputClosed &&
+            this.isInteractive &&
+            !this.promptDrawn
+          ) {
             if (this.typeAheadVisibleOnScreen && this.rl.line.length > 0) {
-              this.clearActiveInputRegion(this.promptDrawn);
+              this.clearActiveInputRegion(false);
             }
             this.redrawPromptPreservingCursor();
           }
@@ -537,7 +542,9 @@ export class InteractiveJoinTerminal {
     this.outputEpoch += 1;
     const target = stream === "stderr" ? this.stderr : this.stdout;
     if (this.isInteractive && !this.exited && !this.inputClosed) {
-      this.clearActiveInputRegion(this.promptDrawn);
+      if (this.promptDrawn || this.typeAheadVisibleOnScreen) {
+        this.clearActiveInputRegion(this.promptDrawn);
+      }
       target.write(`${text}\n`);
       this.redrawPromptPreservingCursor();
       return;
@@ -603,7 +610,10 @@ export class InteractiveJoinTerminal {
     }
     if (this.inputClosed) return;
     this.inputClosed = true;
-    if (this.isInteractive) {
+    if (
+      this.isInteractive &&
+      (this.promptDrawn || this.typeAheadVisibleOnScreen)
+    ) {
       this.clearActiveInputRegion(this.promptDrawn);
     }
     this.rl.close();

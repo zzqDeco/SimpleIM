@@ -2696,6 +2696,68 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
       await wiredShared.closeAll();
       await wiredStorage.closeAll();
     }
+
+    // /get 1 + 30 wrapped type-ahead chars in one chunk + mid-command async progress:
+    // writeAsyncLine MUST NOT move upward after command output already hid the type-ahead!
+    const dlIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const dlOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 20,
+    });
+    let dlBuf = "";
+    dlOut.on("data", (c) => {
+      dlBuf += c.toString("utf8");
+    });
+    const dlStorage = new FsChunkStorageAdapter({
+      downloadDir: join(wiredWorkDir, "dl2"),
+    });
+    const dlShared = new LocalSharedFileRegistry();
+    const dlEngine = {
+      roomId: "f".repeat(64),
+      localPeerId: "peer_019a0000000070008000000000000099",
+      getFiles: () => [sampleManifest],
+      getMessages: () => [],
+      downloadFile: async () => {
+        dlTerm.writeAsyncLine("[file] Downloading 'report.pdf' 25%");
+      },
+    } as unknown as RoomPeerEngine;
+    const dlTerm: InteractiveJoinTerminal = new InteractiveJoinTerminal({
+      stdin: dlIn,
+      stdout: dlOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      getFiles: () => [sampleManifest],
+      onLine: async (rawLine): Promise<"continue" | "exit"> =>
+        executeJoinInputLine({
+          line: rawLine,
+          engine: dlEngine,
+          chunkStorage: dlStorage,
+          sharedFiles: dlShared,
+          stdout: dlTerm.createCommandOutputStream("stdout"),
+          cwd: wiredWorkDir,
+        }),
+    });
+    try {
+      dlTerm.startPrompt();
+      dlBuf = "";
+      dlIn.write(`/get 1\r${"a".repeat(30)}`);
+      await Bun.sleep(30);
+      const startIdx = dlBuf.indexOf("[file] Starting Swarm download");
+      expect(startIdx).toBeGreaterThanOrEqual(0);
+      const afterStart = dlBuf.slice(startIdx);
+      expect(afterStart).not.toContain("\x1b[1A");
+      expect(afterStart).toContain("[file] Downloading 'report.pdf' 25%\n");
+      expect(afterStart).toContain(`❯ ${"a".repeat(30)}`);
+    } finally {
+      dlTerm.close();
+      await dlShared.closeAll();
+      await dlStorage.closeAll();
+    }
   });
 
   test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {
