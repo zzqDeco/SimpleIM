@@ -2486,6 +2486,49 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     expect(pipedExited).toBe(true);
     expect(pipedEof).toBe(false);
     pipedTerm.close();
+
+    // Pasting multiple lines ("one\rtwo\r") onto a TTY must NOT emit \x1b[1A and erase
+    // the formatted first message when rendering the second message!
+    const pasteIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const pasteOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 80,
+    });
+    let pasteBuf = "";
+    pasteOut.on("data", (c) => {
+      pasteBuf += c.toString("utf8");
+    });
+    let pasteCount = 0;
+    let resolvePasteDone!: () => void;
+    const pasteDone = new Promise<void>((r) => {
+      resolvePasteDone = r;
+    });
+    const pasteTerm = new InteractiveJoinTerminal({
+      stdin: pasteIn,
+      stdout: pasteOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async (line) => {
+        await Bun.sleep(10);
+        pasteTerm.eraseJustSubmittedSingleLineEcho(line);
+        pasteTerm.writeLine(`[12:00:10] @alice: ${line}`);
+        pasteCount += 1;
+        if (pasteCount === 2) resolvePasteDone();
+        return "continue";
+      },
+    });
+    pasteTerm.startPrompt();
+    pasteIn.write("one\rtwo\r");
+    await pasteDone;
+    expect(pasteBuf).toContain("[12:00:10] @alice: one\n");
+    expect(pasteBuf).toContain("[12:00:10] @alice: two\n");
+    expect(pasteBuf).not.toContain("\x1b[1A");
+    pasteTerm.close();
   });
 
   test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {

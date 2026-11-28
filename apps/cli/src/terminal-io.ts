@@ -347,6 +347,8 @@ export class InteractiveJoinTerminal {
   private readonly promptVisualWidth = 2; // "❯ "
   private inputClosed = false;
   private exited = false;
+  private outputEpoch = 0;
+  private activeLineEpoch: number | null = null;
   private lineQueue: Promise<void> = Promise.resolve();
 
   constructor(options: InteractiveJoinTerminalOptions) {
@@ -386,9 +388,11 @@ export class InteractiveJoinTerminal {
     });
 
     this.rl.on("line", (rawLine) => {
+      const submittedEpoch = ++this.outputEpoch;
       this.lineQueue = this.lineQueue
         .then(async () => {
           if (this.exited) return;
+          this.activeLineEpoch = submittedEpoch;
           try {
             const action = await options.onLine(rawLine);
             if (action === "exit") {
@@ -399,6 +403,9 @@ export class InteractiveJoinTerminal {
             }
           } catch (err) {
             options.onLineError?.(err);
+          } finally {
+            this.activeLineEpoch = null;
+            this.outputEpoch += 1;
           }
           if (!this.exited && !this.inputClosed && this.isInteractive) {
             this.rl.prompt();
@@ -427,10 +434,17 @@ export class InteractiveJoinTerminal {
 
   /**
    * Erases the single-row TTY echo of the line just submitted by the user so
-   * formatted self-messages are not displayed twice.
+   * formatted self-messages are not displayed twice — ONLY when no subsequent
+   * pasted lines or asynchronous output have advanced the terminal below it.
    */
   eraseJustSubmittedSingleLineEcho(rawLine: string): void {
-    if (!this.isInteractive || this.exited || this.inputClosed) {
+    if (
+      !this.isInteractive ||
+      this.exited ||
+      this.inputClosed ||
+      this.activeLineEpoch === null ||
+      this.activeLineEpoch !== this.outputEpoch
+    ) {
       return;
     }
     const cols = Math.max(
@@ -438,6 +452,7 @@ export class InteractiveJoinTerminal {
       (this.stdout as TtyCapableStream).columns ?? 80,
     );
     if (this.promptVisualWidth + estimateVisualColumns(rawLine) < cols) {
+      this.outputEpoch += 1;
       this.stdout.write("\x1b[1A\r\x1b[2K");
     }
   }
@@ -447,6 +462,7 @@ export class InteractiveJoinTerminal {
    * without corrupting single- or multi-row wrapped input at the TTY prompt.
    */
   writeAsyncLine(text: string, stream: "stdout" | "stderr" = "stdout"): void {
+    this.outputEpoch += 1;
     const target = stream === "stderr" ? this.stderr : this.stdout;
     if (this.isInteractive && !this.exited && !this.inputClosed) {
       const pos =
@@ -478,6 +494,7 @@ export class InteractiveJoinTerminal {
    * (prompt will be re-displayed once the line handler resolves).
    */
   writeLine(text: string, stream: "stdout" | "stderr" = "stdout"): void {
+    this.outputEpoch += 1;
     const target = stream === "stderr" ? this.stderr : this.stdout;
     target.write(`${text}\n`);
   }
