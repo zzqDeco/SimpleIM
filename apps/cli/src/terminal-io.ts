@@ -421,7 +421,7 @@ export class InteractiveJoinTerminal {
             this.outputEpoch += 1;
           }
           if (!this.exited && !this.inputClosed && this.isInteractive) {
-            this.rl.prompt();
+            this.redrawPromptPreservingCursor();
           }
         })
         .catch(() => {});
@@ -470,6 +470,18 @@ export class InteractiveJoinTerminal {
     }
   }
 
+  private redrawPromptPreservingCursor(): void {
+    // Reset tracked wrapped-row offset and redraw via _refreshLine() (falling
+    // back to prompt(true)) so buffered input and cursor position stay intact
+    // when the user starts typing while an async command is still running.
+    this.rl.prevRows = 0;
+    if (typeof this.rl._refreshLine === "function") {
+      this.rl._refreshLine();
+    } else {
+      this.rl.prompt(true);
+    }
+  }
+
   /**
    * Safely prints an asynchronous line (incoming message, peer join, file event)
    * without corrupting single- or multi-row wrapped input at the TTY prompt.
@@ -487,16 +499,9 @@ export class InteractiveJoinTerminal {
       }
       cursorTo(this.stdout, 0);
       clearScreenDown(this.stdout);
-      // Reset readline's tracked wrapped-row offset so redrawing starts below
-      // the newly printed event instead of moving upward and erasing it.
-      this.rl.prevRows = 0;
 
       target.write(`${text}\n`);
-      if (typeof this.rl._refreshLine === "function") {
-        this.rl._refreshLine();
-      } else {
-        this.rl.prompt(true);
-      }
+      this.redrawPromptPreservingCursor();
       return;
     }
     target.write(`${text}\n`);

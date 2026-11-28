@@ -2529,6 +2529,49 @@ describe("Issue #37 CLI P1/P2 Interactive UX", () => {
     expect(pasteBuf).toContain("[12:00:10] @alice: two\n");
     expect(pasteBuf).not.toContain("\x1b[1A");
     pasteTerm.close();
+
+    // Typing ahead while an async command handler is still running preserves cursor position
+    // (submitting "one", typing "partial" mid-flight, then "X\r" must yield "partialX", not "Xpartial")
+    const aheadIn = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode() {
+        return this;
+      },
+    });
+    const aheadOut = Object.assign(new PassThrough(), {
+      isTTY: true,
+      columns: 80,
+    });
+    const aheadLines: string[] = [];
+    let resolveAheadDone!: () => void;
+    const aheadDone = new Promise<void>((r) => {
+      resolveAheadDone = r;
+    });
+    const aheadTerm = new InteractiveJoinTerminal({
+      stdin: aheadIn,
+      stdout: aheadOut,
+      stderr: new PassThrough(),
+      env: { NO_COLOR: "1" },
+      onLine: async (line) => {
+        aheadLines.push(line);
+        if (aheadLines.length === 1) {
+          await Bun.sleep(25);
+          aheadTerm.writeLine("[done] one");
+        } else {
+          resolveAheadDone();
+        }
+        return "continue";
+      },
+    });
+    aheadTerm.startPrompt();
+    aheadIn.write("one\r");
+    await Bun.sleep(5);
+    aheadIn.write("partial");
+    await Bun.sleep(35);
+    aheadIn.write("X\r");
+    await aheadDone;
+    expect(aheadLines).toEqual(["one", "partialX"]);
+    aheadTerm.close();
   });
 
   test("parses /send paths (~, quotes, Finder escaped spaces), formats friendly FS errors, supports /cancel, /reply, /retry, and join --json NDJSON", async () => {
