@@ -1351,29 +1351,56 @@ test.describe("Web (Chromium WebRTC + OPFS) <-> CLI (werift + Disk) Full-Stack E
     const pageBob = await contextBob.newPage();
 
     try {
-      await Promise.all([
-        registerAndJoinRoomOnWeb({
-          page: pageAlice,
-          webOrigin: cluster.webOrigin,
-          username: "resp_alice",
-          displayName: "Resp Alice",
-          password: "Password-RespAlice-123!",
-          passphrase: room1Passphrase,
-        }),
-        registerAndJoinRoomOnWeb({
-          page: pageBob,
-          webOrigin: cluster.webOrigin,
-          username: "resp_bob",
-          displayName: "Resp Bob",
-          password: "Password-RespBob-123!",
-          passphrase: room1Passphrase,
-        }),
-      ]);
+      // Verify AuthScreen & JoinRoomScreen headers wrap cleanly without horizontal overflow at 320x568
+      await pageAlice.setViewportSize({ width: 320, height: 568 });
+      await pageAlice.goto(cluster.webOrigin);
+      await expect(pageAlice.getByTestId("auth-tab-register")).toBeVisible();
+      expect(
+        await pageAlice.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(320);
+
+      await pageAlice.getByTestId("auth-tab-register").click();
+      await pageAlice.getByTestId("auth-username").fill("resp_alice");
+      await pageAlice.getByTestId("auth-display-name").fill("Resp Alice");
+      await pageAlice.getByTestId("auth-password").fill("Password-RespAlice-123!");
+      await pageAlice.getByTestId("auth-submit").click();
+      await expect(pageAlice.getByTestId("room-passphrase")).toBeVisible();
+      expect(
+        await pageAlice.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(320);
+
+      // Return Alice to 1280x720 and join Room 1 alongside Bob
+      await pageAlice.setViewportSize({ width: 1280, height: 720 });
+      await pageAlice.getByTestId("room-passphrase").fill(room1Passphrase);
+      await pageAlice.getByTestId("room-join-submit").click();
+      await expect(pageAlice.getByTestId("connection-badge")).toHaveAttribute(
+        "data-connection-state",
+        "connected",
+        { timeout: 25_000 },
+      );
+
+      await registerAndJoinRoomOnWeb({
+        page: pageBob,
+        webOrigin: cluster.webOrigin,
+        username: "resp_bob",
+        displayName: "Resp Bob",
+        password: "Password-RespBob-123!",
+        passphrase: room1Passphrase,
+      });
 
       await expect(pageAlice.getByTestId("peer-list")).toContainText(
         "@resp_bob",
         { timeout: 20_000 },
       );
+
+      // First incoming remote message in an empty room must trigger the dedicated polite SR announcer
+      await pageBob
+        .getByTestId("chat-input")
+        .fill("First live arrival in empty room");
+      await pageBob.getByTestId("chat-send").click();
+      await expect(
+        pageAlice.locator('.transcript-scroll-host .sr-only[aria-live="polite"]'),
+      ).toContainText("First live arrival in empty room", { timeout: 15_000 });
 
       // Give Room 1 a long alias to stress narrow-viewport topbar truncation, and verify Rename Cancel + Escape
       const renameBtn = pageAlice

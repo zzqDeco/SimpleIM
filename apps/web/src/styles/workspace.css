@@ -22,15 +22,20 @@
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
 }
 
 .top-bar-group {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   min-width: 0;
+}
+
+.room-shell .top-bar,
+.room-shell .top-bar-group {
+  flex-wrap: nowrap;
 }
 
 .top-bar-left {
@@ -1719,7 +1724,7 @@ body.room-viewport-locked {
 
 /* Compact single-row topbar on mobile portrait and short landscape viewports */
 @media (max-width: 768px), (max-height: 500px) {
-  .top-bar {
+  .room-shell .top-bar {
     padding: calc(4px + env(safe-area-inset-top, 0px))
       max(8px, env(safe-area-inset-right, 0px))
       4px
@@ -1728,12 +1733,12 @@ body.room-viewport-locked {
     flex-wrap: nowrap;
   }
 
-  .top-bar-group {
+  .room-shell .top-bar-group {
     gap: 4px;
     flex-wrap: nowrap;
   }
 
-  .top-bar .ds-btn-sm {
+  .room-shell .top-bar .ds-btn-sm {
     padding: 3px 7px;
     min-height: 28px;
     font-size: 12px;
@@ -1770,7 +1775,7 @@ body.room-viewport-locked {
     max-width: 108px;
   }
 
-  .top-bar .ds-btn-sm {
+  .room-shell .top-bar .ds-btn-sm {
     padding: 3px 6px;
   }
 }

@@ -125,6 +125,7 @@ export function MessageTranscript({
   const lastClientHeightRef = useRef(0);
   const prevRoomIdRef = useRef<string | null>(roomId);
   const prevLastItemKeyRef = useRef<string | null>(null);
+  const hasInitializedRoomRef = useRef(false);
   const programmaticScrollTopRef = useRef<number | null>(null);
   const hideDatePillTimerRef = useRef<number | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
@@ -385,6 +386,7 @@ export function MessageTranscript({
   useEffect(() => {
     const roomChanged = prevRoomIdRef.current !== roomId;
     const previousLastItemKey = prevLastItemKeyRef.current;
+    const wasInitialized = hasInitializedRoomRef.current;
     const shouldScroll = shouldAutoScrollTranscript({
       roomChanged,
       previousLastMsgId: previousLastItemKey,
@@ -395,6 +397,7 @@ export function MessageTranscript({
 
     prevRoomIdRef.current = roomId;
     prevLastItemKeyRef.current = latestItemKey;
+    hasInitializedRoomRef.current = true;
 
     if (roomChanged) {
       setExpandedItemKey(null);
@@ -411,7 +414,7 @@ export function MessageTranscript({
 
     if (
       !roomChanged &&
-      previousLastItemKey !== null &&
+      wasInitialized &&
       latestItemKey !== null &&
       latestItemKey !== previousLastItemKey &&
       latestItem &&
