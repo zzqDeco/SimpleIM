@@ -1,4 +1,6 @@
 import type { ReactElement } from "react";
+import { Icon, type IconName } from "./Icon.tsx";
+import { StatusDot } from "./StatusDot.tsx";
 
 export type StatusKind =
   | "success"
@@ -14,14 +16,14 @@ export interface StatusIconProps {
   readonly className?: string;
 }
 
-const GLYPH_BY_STATUS: Readonly<Record<StatusKind, string>> = {
-  success: "✓",
-  error: "✗",
-  warning: "⚠",
-  info: "●",
-  online: "●",
-  offline: "○",
-  loading: "…",
+const ICON_BY_STATUS: Readonly<
+  Record<Exclude<StatusKind, "online" | "offline">, IconName>
+> = {
+  success: "check",
+  error: "x",
+  warning: "triangle-alert",
+  info: "info",
+  loading: "loader-circle",
 };
 
 const TONE_CLASS_BY_STATUS: Readonly<Record<StatusKind, string>> = {
@@ -40,9 +42,21 @@ export function StatusIcon({ status, className }: StatusIconProps): ReactElement
     ? `ds-status-icon ${toneCls} ${className}`
     : `ds-status-icon ${toneCls}`;
 
+  if (status === "online" || status === "offline") {
+    return (
+      <span className={cls} aria-hidden="true">
+        <StatusDot status={status} />
+      </span>
+    );
+  }
+
   return (
     <span className={cls} aria-hidden="true">
-      {GLYPH_BY_STATUS[status]}
+      <Icon
+        name={ICON_BY_STATUS[status]}
+        size={16}
+        spin={status === "loading"}
+      />
     </span>
   );
 }

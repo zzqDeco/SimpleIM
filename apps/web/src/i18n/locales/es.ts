@@ -99,7 +99,7 @@ export const es = {
   "room.composer.removeStagedAria": "Quitar adjunto {name}",
   "room.composer.pasteHint": "Pega imagen o archivo",
   "room.msg.delivery.pending": "Enviando…",
-  "room.msg.delivery.relayed": "✓ En caché",
+  "room.msg.delivery.relayed": "En caché",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "Reintentar",
   "room.jumpToLatest": "Últimos",
@@ -128,8 +128,8 @@ export const es = {
   "room.files.previewAria": "Ver imagen {name}",
   "room.files.lightboxClose": "Cerrar vista previa",
   "room.files.relay.uploading":
-    "☁️ Guardando copia cifrada {percent}% (puedes cerrar al terminar)",
-  "room.files.relay.cached": "☁️ Copia cifrada lista (24h sin conexión)",
+    "Guardando copia cifrada {percent}% (puedes cerrar al terminar)",
+  "room.files.relay.cached": "Copia cifrada lista (24h sin conexión)",
   "room.files.relay.tooLarge": "> 100 MB · Solo P2P en línea",
   "room.files.relay.error": "Caché no disponible · Solo P2P en línea",
 

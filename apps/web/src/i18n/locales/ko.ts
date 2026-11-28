@@ -98,7 +98,7 @@ export const ko = {
   "room.composer.removeStagedAria": "첨부파일 {name} 제거",
   "room.composer.pasteHint": "이미지·파일 붙여넣기 가능",
   "room.msg.delivery.pending": "전송 중…",
-  "room.msg.delivery.relayed": "✓ 임시보관됨",
+  "room.msg.delivery.relayed": "임시보관됨",
   "room.msg.delivery.p2pOnly": "P2P",
   "room.msg.delivery.failed": "재시도",
   "room.jumpToLatest": "최신으로",
@@ -127,8 +127,8 @@ export const ko = {
   "room.files.previewAria": "이미지 {name} 크게 보기",
   "room.files.lightboxClose": "미리보기 닫기",
   "room.files.relay.uploading":
-    "☁️ 암호화 임시 보관 중 {percent}% (완료 후 창을 닫아도 가능)",
-  "room.files.relay.cached": "☁️ 암호화 임시 보관 완료 (24시간 오프라인 다운로드 가능)",
+    "암호화 임시 보관 중 {percent}% (완료 후 창을 닫아도 가능)",
+  "room.files.relay.cached": "암호화 임시 보관 완료 (24시간 오프라인 다운로드 가능)",
   "room.files.relay.tooLarge": "100 MB 초과 · 온라인 P2P 전용",
   "room.files.relay.error": "임시 보관 미완료 · 온라인 P2P 전용",
 

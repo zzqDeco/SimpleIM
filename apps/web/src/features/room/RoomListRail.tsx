@@ -9,8 +9,12 @@ import {
 } from "react";
 import {
   Button,
+  CountBadge,
+  Icon,
+  IconButton,
   NoticeBanner,
-  StatusIcon,
+  StatusDot,
+  Tag,
   TextField,
 } from "../../design-system/index.ts";
 import type { JoinPhase } from "../../hooks/useRoomSession.ts";
@@ -235,22 +239,19 @@ export function RoomListRail({
               disabled={busy}
               required
               trailingSlot={
-                <Button
-                  variant="ghost"
+                <IconButton
+                  icon={showPassphrase ? "eye-off" : "eye"}
                   size="sm"
-                  aria-label={
+                  variant="ghost"
+                  label={
                     showPassphrase
                       ? t("lobby.passphrase.hideAria")
                       : t("lobby.passphrase.showAria")
                   }
-                  aria-pressed={showPassphrase}
+                  pressed={showPassphrase}
                   onClick={() => setShowPassphrase((v) => !v)}
                   disabled={busy}
-                >
-                  {showPassphrase
-                    ? t("lobby.passphrase.hide")
-                    : t("lobby.passphrase.show")}
-                </Button>
+                />
               }
             />
 
@@ -272,6 +273,8 @@ export function RoomListRail({
               type="submit"
               variant="primary"
               size="sm"
+              block
+              loading={busy}
               testId="rail-join-submit"
               disabled={busy}
             >
@@ -309,8 +312,9 @@ export function RoomListRail({
               data-room-selected={isSelected ? "true" : "false"}
               className={`room-item ${isSelected ? "room-item-active" : ""}`}
             >
-              <button
-                type="button"
+              <Button
+                variant="ghost"
+                size="sm"
                 className="room-item-select"
                 aria-current={isSelected ? "true" : undefined}
                 onClick={() => {
@@ -320,11 +324,13 @@ export function RoomListRail({
               >
                 <div className="room-item-top">
                   <div className="room-item-title-group">
-                    <StatusIcon status={statusKind} />
+                    <StatusDot status={statusKind} />
                     {item.pinned ? (
-                      <span className="room-pin-glyph" aria-hidden="true">
-                        ★
-                      </span>
+                      <Icon
+                        name="pin"
+                        size={16}
+                        className="room-pin-glyph"
+                      />
                     ) : null}
                     <span className="room-item-name">
                       {item.alias ?? fingerprint}
@@ -346,16 +352,14 @@ export function RoomListRail({
                       </span>
                     ) : null}
                     {item.unreadCount > 0 ? (
-                      <span
+                      <CountBadge
+                        value={item.unreadCount}
+                        label={`${item.unreadCount}`}
+                        testId="room-unread-badge"
                         className="room-unread-badge"
-                        data-testid="room-unread-badge"
-                      >
-                        {item.unreadCount > 99 ? "99+" : item.unreadCount}
-                      </span>
+                      />
                     ) : item.connectionStatus === "standby" ? (
-                      <span className="room-standby-tag">
-                        {t("room.status.standby")}
-                      </span>
+                      <Tag tone="neutral">{t("room.status.standby")}</Tag>
                     ) : null}
                   </div>
                 </div>
@@ -384,7 +388,7 @@ export function RoomListRail({
                     <span>{t("room.rail.emptyPreview")}</span>
                   )}
                 </div>
-              </button>
+              </Button>
 
               {editingRoomId === item.roomId ? (
                 <form
@@ -421,25 +425,27 @@ export function RoomListRail({
                 </form>
               ) : (
                 <div className="room-item-actions">
-                  <button
-                    type="button"
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     className="room-item-action-btn"
-                    data-testid={`room-pin-${item.roomIdPrefix}`}
+                    testId={`room-pin-${item.roomIdPrefix}`}
                     onClick={() => void onTogglePinRoom(item.roomId)}
                   >
                     {item.pinned ? t("room.rail.unpin") : t("room.rail.pin")}
-                  </button>
-                  <button
-                    type="button"
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     className="room-item-action-btn"
-                    data-testid={`room-rename-${item.roomIdPrefix}`}
+                    testId={`room-rename-${item.roomIdPrefix}`}
                     onClick={() => {
                       setEditingRoomId(item.roomId);
                       setEditingAliasValue(item.alias ?? "");
                     }}
                   >
                     {t("room.rail.rename")}
-                  </button>
+                  </Button>
                 </div>
               )}
             </div>

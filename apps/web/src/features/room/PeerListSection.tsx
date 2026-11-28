@@ -1,6 +1,6 @@
 import type { ReactElement } from "react";
 import type { VerifiedPeerInfo } from "@simpleim/peer-core";
-import { StatusIcon } from "../../design-system/index.ts";
+import { StatusDot, Tag } from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 
 export interface PeerListSectionProps {
@@ -29,11 +29,9 @@ export function PeerListSection({ peers }: PeerListSectionProps): ReactElement {
             <div key={peer.peerId} className="peer-row">
               <div className="peer-row-main">
                 <div className="peer-row-title">
-                  <StatusIcon status="online" />
+                  <StatusDot status="online" />
                   <span className="peer-row-name">{peer.displayName}</span>
-                  <span className="msg-runtime-tag">
-                    {peer.clientKind.toUpperCase()}
-                  </span>
+                  <Tag tone="neutral">{peer.clientKind.toUpperCase()}</Tag>
                 </div>
                 <span className="peer-row-handle">@{peer.username}</span>
               </div>

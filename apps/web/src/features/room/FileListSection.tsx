@@ -6,12 +6,16 @@ import {
   Byline,
   NoticeBanner,
   ProgressBar,
+  Tag,
+  type IconName,
+  type TagTone,
 } from "../../design-system/index.ts";
 import { formatTransferError } from "../../i18n/error-catalog.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import {
   countActiveDownloads,
   deriveTransferViewModel,
+  type TransferViewModel,
 } from "../../state/transfer-vm.ts";
 
 export interface FileListSectionProps {
@@ -24,6 +28,35 @@ export interface FileListSectionProps {
   readonly onSaveFile: (manifest: FileManifest) => Promise<void>;
   readonly onLocateFile?: (fileId: string) => void;
   readonly onActionError: (err: unknown) => void;
+}
+
+function transferStatusTone(status: TransferViewModel["status"]): TagTone {
+  switch (status) {
+    case "downloading":
+      return "accent";
+    case "seeding":
+      return "success";
+    case "error":
+      return "danger";
+    default:
+      return "neutral";
+  }
+}
+
+function relayBadgeProps(state: TransferViewModel["relayCacheState"]): {
+  tone: TagTone;
+  icon?: IconName;
+} {
+  switch (state) {
+    case "uploading":
+      return { tone: "accent", icon: "cloud-upload" };
+    case "cached":
+      return { tone: "success", icon: "cloud-check" };
+    case "error":
+      return { tone: "danger", icon: "triangle-alert" };
+    default:
+      return { tone: "neutral" };
+  }
 }
 
 export function FileListSection({
@@ -71,6 +104,7 @@ export function FileListSection({
               localPeerId,
               canSaveFile(manifest.fileId),
             );
+            const relayMeta = relayBadgeProps(vm.relayCacheState);
 
             return (
               <div
@@ -81,11 +115,9 @@ export function FileListSection({
               >
                 <div className="file-row-top">
                   <span className="file-row-name">{vm.fileName}</span>
-                  <span
-                    className={`file-status-tag file-status-tag-${vm.status}`}
-                  >
+                  <Tag tone={transferStatusTone(vm.status)}>
                     {t(vm.statusKey)}
-                  </span>
+                  </Tag>
                 </div>
 
                 {vm.status === "downloading" ||
@@ -121,12 +153,14 @@ export function FileListSection({
                 </div>
 
                 {vm.relayBadgeKey ? (
-                  <div
-                    className={`file-relay-badge file-relay-badge-${vm.relayCacheState}`}
-                    data-testid="file-relay-badge"
+                  <Tag
+                    tone={relayMeta.tone}
+                    icon={relayMeta.icon}
+                    testId="file-relay-badge"
+                    className="file-relay-tag"
                   >
                     {t(vm.relayBadgeKey, { percent: vm.relayCachePercent })}
-                  </div>
+                  </Tag>
                 ) : null}
 
                 {vm.errorMessage ? (
@@ -140,6 +174,7 @@ export function FileListSection({
                     <Button
                       variant="ghost"
                       size="sm"
+                      leadingIcon="locate"
                       testId="file-locate-button"
                       aria-label={t("room.files.action.locateAria", {
                         name: vm.fileName,
@@ -154,6 +189,7 @@ export function FileListSection({
                     <Button
                       variant="primary"
                       size="sm"
+                      leadingIcon="download"
                       testId="file-download-button"
                       onClick={() => {
                         void onDownloadFile(manifest.fileId).catch(
@@ -171,6 +207,7 @@ export function FileListSection({
                     <Button
                       variant="danger"
                       size="sm"
+                      leadingIcon="x"
                       testId="file-cancel-button"
                       onClick={() => {
                         void onCancelDownload(manifest.fileId).catch(
@@ -186,6 +223,7 @@ export function FileListSection({
                     <Button
                       variant="secondary"
                       size="sm"
+                      leadingIcon="hard-drive-download"
                       testId="file-save-button"
                       onClick={() => {
                         void onSaveFile(manifest).catch(onActionError);

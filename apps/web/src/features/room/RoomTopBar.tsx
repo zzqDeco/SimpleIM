@@ -1,9 +1,14 @@
 import type { ReactElement, RefObject } from "react";
-import { Button, StatusIcon } from "../../design-system/index.ts";
+import {
+  Button,
+  CountBadge,
+  Icon,
+  StatusDot,
+} from "../../design-system/index.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import type { RoomMeshConnectionStatus } from "../../state/room-list-vm.ts";
 import { formatRoomFingerprint } from "../../utils/format.ts";
-import { RoomMoreMenu } from "./RoomMoreMenu.tsx";
+import { AppTopBar } from "../shell/AppTopBar.tsx";
 
 export interface RoomTopBarProps {
   readonly roomIdPrefix: string;
@@ -78,101 +83,98 @@ export function RoomTopBar({
         ? t("room.status.standby")
         : t("room.status.detached");
 
+  const dotStatus =
+    badgeState === "connected"
+      ? "online"
+      : badgeState === "detached"
+        ? "warning"
+        : "offline";
+
   const roomsLabel = t("room.roomsToggle", { count: roomCount });
   const drawerLabel = t("room.drawerToggle", {
     peers: peerCount,
     files: fileCount,
   });
 
+  const sidebarToggle = (
+    <Button
+      ref={sidebarToggleRef}
+      variant="secondary"
+      size="sm"
+      className="sidebar-toggle-btn"
+      testId="sidebar-drawer-toggle"
+      aria-label={drawerLabel}
+      aria-expanded={sidebarExpanded}
+      aria-controls="room-sidebar"
+      onClick={onToggleSidebar}
+    >
+      <span className="top-bar-btn-icon" aria-hidden="true">
+        <Icon name="users" size={16} />
+      </span>
+      <span className="top-bar-btn-count" aria-hidden="true">
+        {peerCount}
+      </span>
+      <span className="top-bar-btn-text">{drawerLabel}</span>
+    </Button>
+  );
+
   return (
-    <header className="top-bar">
-      <div className="top-bar-group top-bar-left">
-        <div className="brand-prompt">
-          <span className="brand-prompt-sigil" aria-hidden="true">
-            ❯
-          </span>
-          <span>{t("app.title")}</span>
-        </div>
-
-        <Button
-          ref={railToggleRef}
-          variant="secondary"
-          size="sm"
-          className="drawer-toggle-btn rooms-toggle-btn"
-          testId="rooms-drawer-toggle"
-          aria-label={roomsLabel}
-          aria-expanded={railOpen}
-          aria-controls="room-list-rail"
-          onClick={onToggleRail}
-        >
-          <span className="top-bar-btn-icon" aria-hidden="true">
-            ☰
-          </span>
-          <span className="top-bar-btn-text">{roomsLabel}</span>
-          {totalUnreadCount > 0 ? (
-            <span
-              className="top-bar-unread-dot"
-              data-testid="rooms-total-unread"
-            >
-              {totalUnreadCount > 99 ? "99+" : totalUnreadCount}
-            </span>
-          ) : null}
-        </Button>
-
-        <span className="room-chip room-chip-title">
-          <span className="room-chip-strong">{roomAlias ?? fingerprint}</span>
-          {roomAlias ? (
-            <span className="room-chip-hash">{fingerprint}</span>
-          ) : null}
+    <AppTopBar
+      username={username}
+      menuOpen={moreMenuOpen}
+      onMenuOpenChange={onMoreMenuOpenChange}
+      onLeaveRoom={onLeaveRoom}
+      leaveRoomMessageCount={messageCount}
+      onSignOut={onSignOut}
+      onWipeAndSignOut={onWipeAndSignOut}
+      onActionError={onActionError}
+      menuToggleTestId="room-more-menu-toggle"
+      menuTestId="room-more-menu"
+      rightSlot={sidebarToggle}
+    >
+      <Button
+        ref={railToggleRef}
+        variant="secondary"
+        size="sm"
+        className="drawer-toggle-btn rooms-toggle-btn"
+        testId="rooms-drawer-toggle"
+        aria-label={roomsLabel}
+        aria-expanded={railOpen}
+        aria-controls="room-list-rail"
+        onClick={onToggleRail}
+      >
+        <span className="top-bar-btn-icon" aria-hidden="true">
+          <Icon name="menu" size={16} />
         </span>
-
-        <div
-          role="status"
-          aria-live="polite"
-          data-testid="connection-badge"
-          data-connection-state={badgeState}
-          className="room-chip connection-badge-chip"
-          title={badgeHint}
-        >
-          <StatusIcon
-            status={badgeState === "connected" ? "online" : "offline"}
+        <span className="top-bar-btn-text">{roomsLabel}</span>
+        {totalUnreadCount > 0 ? (
+          <CountBadge
+            value={totalUnreadCount}
+            label={`${totalUnreadCount}`}
+            testId="rooms-total-unread"
+            className="top-bar-unread-dot"
           />
-          <span className="connection-badge-label">{badgeLabel}</span>
-        </div>
-      </div>
+        ) : null}
+      </Button>
 
-      <div className="top-bar-group top-bar-right">
-        <Button
-          ref={sidebarToggleRef}
-          variant="secondary"
-          size="sm"
-          className="sidebar-toggle-btn"
-          testId="sidebar-drawer-toggle"
-          aria-label={drawerLabel}
-          aria-expanded={sidebarExpanded}
-          aria-controls="room-sidebar"
-          onClick={onToggleSidebar}
-        >
-          <span className="top-bar-btn-icon" aria-hidden="true">
-            👥
-          </span>
-          <span className="top-bar-btn-count" aria-hidden="true">
-            {peerCount}
-          </span>
-          <span className="top-bar-btn-text">{drawerLabel}</span>
-        </Button>
+      <span className="room-chip room-chip-title">
+        <span className="room-chip-strong">{roomAlias ?? fingerprint}</span>
+        {roomAlias ? (
+          <span className="room-chip-hash">{fingerprint}</span>
+        ) : null}
+      </span>
 
-        <RoomMoreMenu
-          open={moreMenuOpen}
-          username={username}
-          messageCount={messageCount}
-          onOpenChange={onMoreMenuOpenChange}
-          onLeaveRoom={onLeaveRoom}
-          onSignOut={onSignOut}
-          onWipeAndSignOut={onWipeAndSignOut}
-          onActionError={onActionError}
-        />
+      <div
+        role="status"
+        aria-live="polite"
+        data-testid="connection-badge"
+        data-connection-state={badgeState}
+        className="room-chip connection-badge-chip"
+        title={badgeHint}
+      >
+        <StatusDot status={dotStatus} />
+        <span className="connection-badge-label">{badgeLabel}</span>
       </div>
-    </header>
+    </AppTopBar>
   );
 }

@@ -1,5 +1,10 @@
 import { useRef, type ChangeEvent, type ReactElement } from "react";
-import { Button, Byline, Subline } from "../../design-system/index.ts";
+import {
+  Button,
+  Byline,
+  IconButton,
+  Subline,
+} from "../../design-system/index.ts";
 import type { PromptComposerController } from "../../hooks/usePromptComposer.ts";
 import { useI18n } from "../../i18n/I18nProvider.tsx";
 import { truncatePreview } from "../../state/message-vm.ts";
@@ -40,6 +45,7 @@ export function PromptComposer({ composer }: PromptComposerProps): ReactElement 
             <Button
               variant="ghost"
               size="sm"
+              leadingIcon="x"
               onClick={composer.clearReplyTarget}
             >
               {t("room.cancelReply")}
@@ -76,18 +82,18 @@ export function PromptComposer({ composer }: PromptComposerProps): ReactElement 
                     {formatBytes(item.file.size)}
                   </span>
                 </div>
-                <button
-                  type="button"
+                <IconButton
+                  icon="x"
+                  size="sm"
+                  variant="ghost"
                   className="composer-staged-remove"
-                  data-testid="remove-staged-attachment"
-                  aria-label={t("room.composer.removeStagedAria", {
+                  testId="remove-staged-attachment"
+                  label={t("room.composer.removeStagedAria", {
                     name: item.file.name,
                   })}
                   disabled={composer.sending}
                   onClick={() => composer.removeStagedFile(item.id)}
-                >
-                  ✕
-                </button>
+                />
               </div>
             ))}
           </div>
@@ -108,13 +114,13 @@ export function PromptComposer({ composer }: PromptComposerProps): ReactElement 
           <Button
             variant="secondary"
             size="sm"
+            leadingIcon="paperclip"
             className="composer-attach-btn"
             testId="attach-file-button"
             aria-label={t("room.attachAria")}
             disabled={composer.sending || composer.roomInactive}
             onClick={() => fileInputRef.current?.click()}
           >
-            <span aria-hidden="true">＋</span>
             <span className="composer-attach-label">{t("room.attach")}</span>
           </Button>
 
@@ -140,6 +146,7 @@ export function PromptComposer({ composer }: PromptComposerProps): ReactElement 
             type="submit"
             variant="primary"
             size="sm"
+            leadingIcon="send"
             testId="chat-send"
             disabled={!composer.canSend}
           >

@@ -58,6 +58,7 @@
   --duration-fast: 120ms;
   --duration-base: 180ms;
   --duration-slow: 240ms;
+  --duration-spin: 900ms;
   --ease-standard: cubic-bezier(0.2, 0, 0, 1);
 
   /* Touch Target Metrics */
@@ -70,6 +71,7 @@
     --duration-fast: 0ms;
     --duration-base: 0ms;
     --duration-slow: 0ms;
+    --duration-spin: 0ms;
   }
 }
 

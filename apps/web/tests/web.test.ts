@@ -26,12 +26,25 @@ import { SignalingServerError, type ChatDeliveryStatus } from "@simpleim/peer-co
 import { HttpApiError, HttpAuthClient } from "../src/api/http-client.ts";
 import { deriveRoomKeysOffThread } from "../src/crypto/kdf-client.ts";
 import {
+  BrandMark,
+  Button,
   Byline,
+  ConfirmPanel,
+  CountBadge,
+  Dialog,
+  Icon,
+  IconButton,
+  Menu,
+  MenuItem,
   NoticeBanner,
   ProgressBar,
+  StatusDot,
   StatusIcon,
   Subline,
+  Tag,
   TextField,
+  Toast,
+  ToastRegion,
 } from "../src/design-system/index.ts";
 import {
   formatAppFailure,
@@ -1315,13 +1328,61 @@ describe("Theme Engine, Pure State ViewModels & CSS Token Purity", () => {
           label: "Passphrase",
           showPromptSigil: true,
         }),
+        createElement(BrandMark, null),
+        createElement(StatusDot, { status: "online" }),
+        createElement(Icon, { name: "users", size: 16 }),
+        createElement(IconButton, { icon: "ellipsis", label: "More" }),
+        createElement(CountBadge, { value: 120, label: "120 unread" }),
+        createElement(Tag, { tone: "success", icon: "cloud-check" }, "Cached"),
+        createElement(ConfirmPanel, {
+          title: "Confirm action?",
+          confirmLabel: "Confirm",
+          cancelLabel: "Cancel",
+          onConfirm: () => {},
+          onCancel: () => {},
+        }),
+        createElement(
+          Menu,
+          {
+            open: true,
+            onOpenChange: () => {},
+            label: "Options",
+            trigger: (props) =>
+              createElement(Button, { onClick: props.onClick }, "Open"),
+          },
+          createElement(MenuItem, { icon: "log-out", onSelect: () => {} }, "Sign out"),
+        ),
+        createElement(
+          Dialog,
+          { open: true, onClose: () => {}, title: "Preview", size: "sm" },
+          "Dialog body",
+        ),
+        createElement(
+          ToastRegion,
+          null,
+          createElement(Toast, {
+            tone: "info",
+            message: "Saved",
+            onDismiss: () => {},
+          }),
+        ),
       ),
     );
 
     expect(html).toContain(" · ");
-    expect(html).toContain("⎿");
+    expect(html).toContain('data-icon="corner-down-right"');
     expect(html).toContain("❯");
     expect(html).toContain('aria-valuenow="65"');
+    expect(html).toContain('data-status-dot="online"');
+    expect(html).toContain('data-icon="users"');
+    expect(html).toContain('data-icon="cloud-check"');
+    expect(html).toContain("99+");
+    expect(html).toContain('role="menu"');
+    expect(html).toContain('role="dialog"');
+    expect(html).toContain('aria-modal="true"');
+    expect(html).toContain('class="ds-confirm-panel');
+    expect(html).toContain('class="ds-toast');
+    expect(html).not.toMatch(/\p{Extended_Pictographic}/u);
 
     const stylesDir = join(import.meta.dir, "../src/styles");
     for (const cssFile of ["base.css", "design-system.css", "workspace.css"]) {
@@ -3297,9 +3358,9 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     );
     expect(html).toMatch(/class="message-stream"[^>]*aria-live="off"/);
     expect(html).toContain('data-testid="message-stream-inner"');
-    // Bob is online (success dot), Carol is offline (muted dot)
-    expect(html).toContain("ds-status-icon-success");
-    expect(html).toContain("ds-status-icon-muted");
+    // Bob is online (online status dot), Carol is offline (offline status dot)
+    expect(html).toContain("ds-status-dot-online");
+    expect(html).toContain("ds-status-dot-offline");
 
     // 4. Compact RoomTopBar carries icon spans & aria-labels
     const barHtml = renderToStaticMarkup(

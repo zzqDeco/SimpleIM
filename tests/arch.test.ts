@@ -292,14 +292,71 @@ describe("Workspace & Clean Architecture Import Boundaries", () => {
               spec.includes("/auth") ||
                 spec.includes("/lobby") ||
                 spec.includes("/room") ||
+                spec.includes("/shell") ||
                 spec.includes("/hooks") ||
                 spec.includes("/state"),
               `features/preferences must stay self-contained (${rel}: '${spec}')`,
+            ).toBe(false);
+          } else if (featureName === "shell") {
+            expect(
+              spec.includes("/auth") ||
+                spec.includes("/lobby") ||
+                spec.includes("/room") ||
+                spec.includes("/hooks") ||
+                spec.includes("/state"),
+              `features/shell must stay decoupled from auth/lobby/room/hooks/state (${rel}: '${spec}')`,
             ).toBe(false);
           }
         }
       }
     }
+  });
+
+  test("apps/web/src/features/**/*.tsx forbids native <button> elements (must use design-system Button/IconButton/Tag)", () => {
+    const featuresDir = join(REPO_ROOT, "apps/web/src/features");
+    const files = collectSourceFiles(featuresDir).filter((f) =>
+      f.endsWith(".tsx"),
+    );
+    expect(files.length).toBeGreaterThan(0);
+
+    const violations: string[] = [];
+    for (const file of files) {
+      const sourceText = readFileSync(file, "utf8");
+      const lines = sourceText.split("\n");
+      const sf = ts.createSourceFile(
+        file,
+        sourceText,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TSX,
+      );
+
+      const visit = (node: ts.Node): void => {
+        if (
+          (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) &&
+          ts.isIdentifier(node.tagName) &&
+          node.tagName.text === "button"
+        ) {
+          const { line } = sf.getLineAndCharacterOfPosition(
+            node.getStart(sf),
+          );
+          const lineText = lines[line] ?? "";
+          if (!/\/\/\s*ds-allow-raw-button:\s*\S+/.test(lineText)) {
+            violations.push(
+              `${relative(REPO_ROOT, file)}:${line + 1}: raw <button> (use Button/IconButton/Tag or annotate with // ds-allow-raw-button: <reason>)`,
+            );
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+
+      visit(sf);
+    }
+
+    expect(
+      violations,
+      `Native <button> found in features:\n${violations.join("\n")}`,
+    ).toEqual([]);
   });
 
   test("apps/cli never imports server or web", () => {
