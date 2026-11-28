@@ -92,6 +92,7 @@ import {
   resolveEffectiveTheme,
   writeStoredThemeMode,
 } from "../src/theme/theme-engine.ts";
+import { THEME_STORAGE_KEY } from "../src/theme/types.ts";
 import {
   createBrowserFileChunkReader,
   OpfsChunkStorageAdapter,
@@ -3335,5 +3336,26 @@ describe("HttpAuthClient BlindRelayClient & TransferViewModel Relay Badge", () =
     expect(barHtml).toContain("top-bar-btn-icon");
     expect(barHtml).toContain("top-bar-btn-count");
     expect(barHtml).toContain('aria-label="');
+  });
+});
+
+describe("Issue #41 Pre-Paint Theme Init Parity", () => {
+  test("public/theme-init.js reads THEME_STORAGE_KEY without writing localStorage and index.html loads it synchronously", () => {
+    const themeInitJs = readFileSync(
+      join(import.meta.dir, "../public/theme-init.js"),
+      "utf8",
+    );
+    expect(themeInitJs).toContain(`localStorage.getItem("${THEME_STORAGE_KEY}")`);
+    expect(themeInitJs).toContain("dataset.theme");
+    expect(themeInitJs).not.toContain("setItem");
+
+    const indexHtml = readFileSync(
+      join(import.meta.dir, "../index.html"),
+      "utf8",
+    );
+    expect(indexHtml).toContain('<script src="/theme-init.js"></script>');
+    expect(
+      indexHtml.indexOf('<script src="/theme-init.js"></script>'),
+    ).toBeLessThan(indexHtml.indexOf('<script type="module"'));
   });
 });

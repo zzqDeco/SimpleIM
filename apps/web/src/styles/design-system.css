@@ -1,4 +1,4 @@
-/* Atomic Design-System Primitives (cc terminal idiom, zero hardcoded colors) */
+/* Atomic Design-System Primitives (cc terminal idiom, tokenized) */
 
 /* Byline */
 .ds-byline {
@@ -9,7 +9,7 @@
 }
 
 .ds-byline-sep {
-  color: var(--text-dim);
+  color: var(--text-decorative);
   user-select: none;
   white-space: pre;
 }
@@ -18,8 +18,8 @@
 .ds-status-icon {
   display: inline-block;
   font-family: var(--font-mono);
-  font-weight: 700;
-  line-height: 1;
+  font-weight: var(--font-weight-bold);
+  line-height: var(--line-none);
   user-select: none;
 }
 
@@ -52,12 +52,12 @@
   display: flex;
   align-items: baseline;
   gap: var(--space-2);
-  font-size: 12.5px;
+  font-size: var(--font-size-sm);
   color: var(--text-muted);
 }
 
 .ds-subline-glyph {
-  color: var(--text-dim);
+  color: var(--text-decorative);
   user-select: none;
   flex-shrink: 0;
 }
@@ -92,21 +92,21 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: var(--space-1-5);
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
-  padding: 7px 13px;
-  font-size: 12.5px;
-  font-weight: 600;
-  line-height: 1.2;
+  padding: var(--space-1-5) var(--space-3);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-tight);
   cursor: pointer;
   white-space: nowrap;
   background: transparent;
   transition:
-    background-color var(--ease-fast),
-    border-color var(--ease-fast),
-    color var(--ease-fast),
-    opacity var(--ease-fast);
+    background-color var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard),
+    opacity var(--duration-fast) var(--ease-standard);
 }
 
 .ds-btn:disabled {
@@ -115,14 +115,14 @@
 }
 
 .ds-btn-primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-fill);
+  border-color: var(--accent-fill);
   color: var(--text-inverse);
 }
 
 .ds-btn-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: var(--accent-fill-hover);
+  border-color: var(--accent-fill-hover);
 }
 
 .ds-btn-secondary {
@@ -160,8 +160,8 @@
 }
 
 .ds-btn-sm {
-  padding: 4px 9px;
-  font-size: 12px;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-sm);
   border-radius: var(--radius-xs);
 }
 
@@ -171,7 +171,7 @@
   grid-auto-flow: column;
   grid-auto-columns: 1fr;
   gap: var(--space-1);
-  padding: 3px;
+  padding: var(--space-0-5);
   background: var(--bg-canvas);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
@@ -181,15 +181,15 @@
   border: 1px solid transparent;
   background: transparent;
   color: var(--text-muted);
-  padding: 6px 10px;
+  padding: var(--space-1-5) var(--space-2-5);
   border-radius: var(--radius-xs);
-  font-size: 12.5px;
-  font-weight: 600;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
   cursor: pointer;
   transition:
-    background-color var(--ease-fast),
-    color var(--ease-fast),
-    border-color var(--ease-fast);
+    background-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard);
 }
 
 .ds-tab:hover:not([aria-selected="true"]) {
@@ -206,7 +206,7 @@
 .ds-field {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: var(--space-1);
 }
 
 .ds-field-header {
@@ -217,14 +217,14 @@
 }
 
 .ds-field-label {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
   color: var(--text-secondary);
 }
 
 .ds-field-hint {
-  font-size: 11.5px;
-  color: var(--text-dim);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
 }
 
 .ds-field-control {
@@ -235,7 +235,7 @@
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   padding: 0 var(--space-2);
-  transition: border-color var(--ease-fast);
+  transition: border-color var(--duration-fast) var(--ease-standard);
 }
 
 .ds-field-control:focus-within {
@@ -244,7 +244,7 @@
 
 .ds-field-prompt {
   color: var(--accent);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   user-select: none;
   flex-shrink: 0;
 }
@@ -254,14 +254,14 @@
   min-width: 0;
   border: 0;
   background: transparent;
-  padding: 8px 2px;
+  padding: var(--space-2) var(--space-0-5);
   color: var(--text-primary);
-  font-size: 13.5px;
+  font-size: var(--font-size-md);
   outline: none;
 }
 
 .ds-field-input::placeholder {
-  color: var(--text-dim);
+  color: var(--text-muted);
 }
 
 /* NoticeBanner */
@@ -270,10 +270,10 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  padding: 8px 11px;
+  padding: var(--space-2) var(--space-2-5);
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-subtle);
-  font-size: 12.5px;
+  font-size: var(--font-size-md);
 }
 
 .ds-notice-main {
@@ -315,7 +315,7 @@
   height: 100%;
   width: var(--ds-progress-pct, 0%);
   background: var(--accent);
-  transition: width 160ms ease;
+  transition: width var(--duration-base) var(--ease-standard);
 }
 
 .ds-progress-fill-complete {
@@ -328,8 +328,8 @@
   background: var(--bg-elevated);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-xs);
-  padding: 4px 8px;
-  font-size: 12px;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-sm);
   color: var(--text-secondary);
   cursor: pointer;
 }
